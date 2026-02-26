@@ -1,0 +1,165 @@
+Vocabulary size: 287
+
+=== Memorization Tier Summary ===
+Model   Text PPL  Text h@5    KG PPL    KG h@5
+----------------------------------------------
+A           8.95     0.005      8.37     0.009
+A'          8.34     0.008      8.04     0.009
+B           8.09     0.008       n/a       n/a
+B'          7.90     0.008       n/a       n/a
+C           8.03     0.007       n/a       n/a
+C'          7.90     0.009       n/a       n/a
+D           9.29     0.005      9.46     0.003
+D'          8.63     0.006      8.39     0.008
+E           8.67     0.006     11.15     0.008
+E'          8.31     0.009      8.77     0.010
+F           8.90     0.007      8.48     0.006
+F'          8.50     0.009      8.08     0.009
+
+=== All Tiers (Text Eval) ===
+Model  Tier                                    PPL     h@1     h@5      n
+------------------------------------------------------------------------
+A      memorization                           8.95   0.000   0.005   6000
+A      transfer                               9.21   0.022   0.022     90
+A      generalization                         9.01   0.000   0.000     90
+A      kg_exclusive_memorization              9.90   0.000   0.000     60
+A      kg_exclusive_generalization            9.04   0.000   0.033     60
+A      text_exclusive_memorization            8.97   0.000   0.000     60
+A      text_exclusive_generalization          8.52   0.000   0.050     60
+A'     memorization                           8.34   0.000   0.008   6000
+A'     transfer                               8.20   0.000   0.000     90
+A'     generalization                         8.45   0.000   0.000     90
+A'     kg_exclusive_memorization              8.95   0.000   0.000     60
+A'     kg_exclusive_generalization            8.56   0.000   0.000     60
+A'     text_exclusive_memorization            8.25   0.000   0.000     60
+A'     text_exclusive_generalization          8.28   0.000   0.000     60
+B      memorization                           8.09   0.000   0.008   6000
+B      transfer                               7.87   0.022   0.044     90
+B      generalization                         8.51   0.000   0.000     90
+B      kg_exclusive_memorization              9.46   0.000   0.000     60
+B      kg_exclusive_generalization            9.48   0.000   0.000     60
+B      text_exclusive_memorization            8.77   0.000   0.000     60
+B      text_exclusive_generalization          8.80   0.000   0.000     60
+B'     memorization                           7.90   0.000   0.008   6000
+B'     transfer                               7.57   0.000   0.044     90
+B'     generalization                         8.41   0.000   0.000     90
+B'     kg_exclusive_memorization              9.37   0.000   0.000     60
+B'     kg_exclusive_generalization            8.96   0.000   0.017     60
+B'     text_exclusive_memorization            8.22   0.000   0.000     60
+B'     text_exclusive_generalization          8.58   0.000   0.000     60
+C      memorization                           8.03   0.000   0.007   6000
+C      transfer                               7.95   0.000   0.022     90
+C      generalization                         8.29   0.000   0.000     90
+C      kg_exclusive_memorization              9.18   0.000   0.000     60
+C      kg_exclusive_generalization            8.95   0.000   0.000     60
+C      text_exclusive_memorization            8.02   0.000   0.000     60
+C      text_exclusive_generalization          8.79   0.000   0.000     60
+C'     memorization                           7.90   0.000   0.009   6000
+C'     transfer                               7.77   0.000   0.022     90
+C'     generalization                         8.49   0.000   0.000     90
+C'     kg_exclusive_memorization              9.01   0.000   0.000     60
+C'     kg_exclusive_generalization            8.57   0.000   0.000     60
+C'     text_exclusive_memorization            7.78   0.000   0.000     60
+C'     text_exclusive_generalization          8.58   0.000   0.000     60
+D      memorization                           9.29   0.000   0.005   6000
+D      transfer                               9.40   0.000   0.011     90
+D      generalization                         9.46   0.000   0.000     90
+D      kg_exclusive_memorization              9.71   0.000   0.017     60
+D      kg_exclusive_generalization            9.12   0.000   0.000     60
+D      text_exclusive_memorization            9.94   0.000   0.000     60
+D      text_exclusive_generalization          9.85   0.000   0.017     60
+D'     memorization                           8.63   0.000   0.006   6000
+D'     transfer                               8.39   0.011   0.022     90
+D'     generalization                         9.11   0.000   0.000     90
+D'     kg_exclusive_memorization              8.51   0.000   0.000     60
+D'     kg_exclusive_generalization            8.93   0.000   0.000     60
+D'     text_exclusive_memorization            8.47   0.000   0.000     60
+D'     text_exclusive_generalization          8.86   0.000   0.000     60
+E      memorization                           8.67   0.000   0.006   6000
+E      transfer                               8.96   0.000   0.011     90
+E      generalization                         8.68   0.000   0.011     90
+E      kg_exclusive_memorization              8.60   0.000   0.000     60
+E      kg_exclusive_generalization            9.06   0.000   0.000     60
+E      text_exclusive_memorization            9.15   0.000   0.000     60
+E      text_exclusive_generalization          8.81   0.000   0.000     60
+E'     memorization                           8.31   0.001   0.009   6000
+E'     transfer                               8.31   0.000   0.011     90
+E'     generalization                         8.66   0.000   0.000     90
+E'     kg_exclusive_memorization              8.76   0.000   0.000     60
+E'     kg_exclusive_generalization            8.26   0.000   0.000     60
+E'     text_exclusive_memorization            8.29   0.000   0.017     60
+E'     text_exclusive_generalization          8.80   0.000   0.000     60
+F      memorization                           8.90   0.000   0.007   6000
+F      transfer                               8.70   0.000   0.011     90
+F      generalization                         9.30   0.000   0.000     90
+F      kg_exclusive_memorization              9.29   0.000   0.000     60
+F      kg_exclusive_generalization            9.38   0.000   0.000     60
+F      text_exclusive_memorization            8.59   0.000   0.000     60
+F      text_exclusive_generalization          8.91   0.000   0.000     60
+F'     memorization                           8.50   0.001   0.009   6000
+F'     transfer                               8.15   0.000   0.022     90
+F'     generalization                         8.80   0.000   0.011     90
+F'     kg_exclusive_memorization              8.65   0.000   0.000     60
+F'     kg_exclusive_generalization            8.31   0.000   0.017     60
+F'     text_exclusive_memorization            8.50   0.017   0.017     60
+F'     text_exclusive_generalization          8.63   0.000   0.000     60
+
+=== All Tiers (KG Eval) ===
+Model  Tier                                    PPL     h@1     h@5      n
+------------------------------------------------------------------------
+A      memorization                           8.37   0.000   0.009   6000
+A      transfer                               8.12   0.000   0.000     90
+A      generalization                         8.06   0.000   0.000     90
+A      kg_exclusive_memorization              8.32   0.000   0.000     60
+A      kg_exclusive_generalization            8.06   0.000   0.000     60
+A      text_exclusive_memorization            7.90   0.000   0.033     60
+A      text_exclusive_generalization          8.38   0.000   0.000     60
+A'     memorization                           8.04   0.000   0.009   6000
+A'     transfer                               7.99   0.000   0.022     90
+A'     generalization                         8.19   0.000   0.000     90
+A'     kg_exclusive_memorization              7.99   0.000   0.000     60
+A'     kg_exclusive_generalization            7.93   0.000   0.000     60
+A'     text_exclusive_memorization            7.79   0.000   0.017     60
+A'     text_exclusive_generalization          7.96   0.000   0.017     60
+D      memorization                           9.46   0.000   0.003   6000
+D      transfer                               9.15   0.000   0.000     90
+D      generalization                         9.93   0.000   0.000     90
+D      kg_exclusive_memorization              9.34   0.000   0.000     60
+D      kg_exclusive_generalization            9.94   0.000   0.000     60
+D      text_exclusive_memorization            9.97   0.000   0.000     60
+D      text_exclusive_generalization         10.01   0.000   0.000     60
+D'     memorization                           8.39   0.000   0.008   6000
+D'     transfer                               8.59   0.000   0.000     90
+D'     generalization                         8.61   0.000   0.000     90
+D'     kg_exclusive_memorization              8.38   0.000   0.000     60
+D'     kg_exclusive_generalization            8.38   0.000   0.000     60
+D'     text_exclusive_memorization            8.59   0.000   0.000     60
+D'     text_exclusive_generalization          8.91   0.000   0.000     60
+E      memorization                          11.15   0.000   0.008   6000
+E      transfer                              11.88   0.000   0.000     90
+E      generalization                        11.26   0.000   0.011     90
+E      kg_exclusive_memorization             12.02   0.000   0.000     60
+E      kg_exclusive_generalization           11.29   0.000   0.017     60
+E      text_exclusive_memorization           10.71   0.000   0.000     60
+E      text_exclusive_generalization         12.87   0.000   0.000     60
+E'     memorization                           8.77   0.001   0.010   6000
+E'     transfer                               8.98   0.000   0.011     90
+E'     generalization                         8.80   0.000   0.033     90
+E'     kg_exclusive_memorization              8.96   0.000   0.000     60
+E'     kg_exclusive_generalization            8.69   0.000   0.000     60
+E'     text_exclusive_memorization            8.43   0.000   0.017     60
+E'     text_exclusive_generalization          9.87   0.000   0.000     60
+F      memorization                           8.48   0.001   0.006   6000
+F      transfer                               8.06   0.000   0.000     90
+F      generalization                         8.51   0.000   0.000     90
+F      kg_exclusive_memorization              8.45   0.000   0.017     60
+F      kg_exclusive_generalization            8.42   0.000   0.000     60
+F      text_exclusive_memorization            8.40   0.000   0.000     60
+F      text_exclusive_generalization          8.79   0.000   0.000     60
+F'     memorization                           8.08   0.000   0.009   6000
+F'     transfer                               7.82   0.000   0.022     90
+F'     generalization                         7.98   0.000   0.011     90
+F'     kg_exclusive_memorization              7.87   0.000   0.000     60
+F'     kg_exclusive_generalization            7.81   0.000   0.000     60
+F'     text_exclusive_memorization            8.41   0.000   0.000     60
+F'     text_exclusive_generalization          8.22   0.000   0.000     60

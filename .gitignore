@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Checkpoints
+experiments/checkpoints/
+
+# Logs (large output files)
+*.log
+
+# JSON result dumps
+experiments/exp7_results_*.json
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.out
+*.pdf
+
+# Temp files
+~$*
+.DS_Store
+
+# Raw log copies
+*_raw.log
+
+# Embedded repos
+experiments/joformer_src/
+
+# Misc
+*.log.bak
