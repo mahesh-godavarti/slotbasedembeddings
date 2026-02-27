@@ -497,7 +497,7 @@ class TextDataset:
 class KGDataset:
     """Dataset for KG training with MLM or tail-prediction."""
 
-    def __init__(self, triples, vocab, device):
+    def __init__(self, triples, vocab, device, inverse_kg=False):
         self.triples = triples
         self.vocab = vocab
         self.device = device
@@ -505,7 +505,14 @@ class KGDataset:
         self.encoded = []
         for head, rel, tail in triples:
             enc = vocab.encode_kg_triple(head, rel, tail)
+            enc["inverse"] = False
             self.encoded.append(enc)
+
+        if inverse_kg:
+            for head, rel, tail in triples:
+                enc = vocab.encode_kg_triple(tail, rel, head)
+                enc["inverse"] = True
+                self.encoded.append(enc)
 
     def get_mlm_batch_flat(self, batch_size, device, mask_prob=0.15):
         """Get a batch for flat KG models (D/D'): relation is a token in the sequence.
@@ -597,6 +604,7 @@ class KGDataset:
             targets: (B, T) original token ids (-100 for non-masked)
             head_lens: list of int, length of head part for each sample
             rel_names: list of relation name strings
+            negate_angles: list of bool, True if relation angle should be negated
         """
         indices = torch.randint(0, len(self.encoded), (batch_size,))
         batch = [self.encoded[i] for i in indices]
@@ -629,7 +637,51 @@ class KGDataset:
                     char_tokens[i, j] = self.vocab.MASK
 
         rel_names = [batch[i]["rel"] for i in range(batch_size)]
-        return char_tokens.to(device), targets.to(device), head_lens, rel_names
+        negate_angles = [batch[i].get("inverse", False) for i in range(batch_size)]
+        return char_tokens.to(device), targets.to(device), head_lens, rel_names, negate_angles
+
+    def get_causal_batch_native(self, batch_size, device):
+        """Get a causal (next-token prediction) batch for E/E'.
+
+        50% of the time flips direction: (H, R, T) -> (T, R, H) with negated angle.
+
+        Returns:
+            char_tokens: (B, T) input token ids (head + tail)
+            targets: (B, T) shifted targets (-100 for padding)
+            head_lens: list of int, length of head part
+            rel_names: list of relation name strings
+            negate_angles: list of bool, True if angles should be negated
+        """
+        indices = torch.randint(0, len(self.encoded), (batch_size,))
+        batch = [self.encoded[i] for i in indices]
+
+        seqs = []
+        head_lens = []
+        negate_angles = []
+        for b in batch:
+            flip = random.random() < 0.5
+            if flip:
+                seq = b["tail"] + b["head"]
+                head_lens.append(len(b["tail"]))
+            else:
+                seq = b["head"] + b["tail"]
+                head_lens.append(len(b["head"]))
+            seqs.append(seq)
+            negate_angles.append(flip)
+
+        max_len = max(len(s) for s in seqs)
+
+        char_tokens = torch.full((batch_size, max_len), self.vocab.PAD, dtype=torch.long)
+        targets = torch.full((batch_size, max_len), -100, dtype=torch.long)
+
+        for i, seq in enumerate(seqs):
+            seq_t = torch.tensor(seq, dtype=torch.long)
+            char_tokens[i, :len(seq)] = seq_t
+            # Next-token prediction: target is shifted by 1
+            targets[i, :len(seq) - 1] = seq_t[1:]
+
+        rel_names = [batch[i]["rel"] for i in range(batch_size)]
+        return char_tokens.to(device), targets.to(device), head_lens, rel_names, negate_angles
 
 
 # ============================================================================
@@ -1203,7 +1255,8 @@ class ModelE(nn.Module):
         angles = torch.flip(angles, dims=(1,))
         return angles
 
-    def _cumsum_angles_kg(self, char_tokens, head_lens, rel_names, device):
+    def _cumsum_angles_kg(self, char_tokens, head_lens, rel_names, device,
+                          negate_angles=None):
         """Cumsum angles for KG with relation angle inserted between head and tail.
 
         The cumsum sequence has len(chars)+1 entries (one extra for the relation angle),
@@ -1218,6 +1271,10 @@ class ModelE(nn.Module):
         - Position h_len: relation angle (this is the "gap")
         - Positions h_len+1..h_len+t_len: tail char angles
         After cumsum, we extract indices [0..h_len-1] + [h_len+1..h_len+t_len] for the char tokens.
+
+        Args:
+            negate_angles: optional list of bool. If True for sample i,
+                           negate the relation angle (for inverse direction).
         """
         B, T = char_tokens.shape
 
@@ -1235,8 +1292,11 @@ class ModelE(nn.Module):
             # Head char angles: positions 0..h_len-1
             ext_angles[i, :h_len] = raw_char_angles[i, :h_len]
 
-            # Relation angle: position h_len
-            ext_angles[i, h_len] = self.relation_angles[rel_idx]
+            # Relation angle: position h_len (negated if inverse direction)
+            rel_angle = self.relation_angles[rel_idx]
+            if negate_angles is not None and negate_angles[i]:
+                rel_angle = -rel_angle
+            ext_angles[i, h_len] = rel_angle
 
             # Tail char angles: positions h_len+1..
             t_len = T - h_len
@@ -1278,7 +1338,7 @@ class ModelE(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
-    def forward_kg(self, char_tokens, targets, head_lens, rel_names):
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
         """KG mode: bidirectional on char tokens only, MLM.
         Relation angle is only in the cumsum, not in the attention sequence.
 
@@ -1287,15 +1347,45 @@ class ModelE(nn.Module):
             targets: (B, T) original tokens, -100 for non-masked
             head_lens: list of head lengths
             rel_names: list of relation strings
+            negate_angles: optional list of bool, True to negate relation angle
         """
         B, T = char_tokens.shape
         pad_mask = (char_tokens != 0)  # PAD = 0
 
         x = self.expander(self.token_embedding(char_tokens))
-        angles = self._cumsum_angles_kg(char_tokens, head_lens, rel_names, char_tokens.device)
+        angles = self._cumsum_angles_kg(char_tokens, head_lens, rel_names, char_tokens.device,
+                                        negate_angles=negate_angles)
 
         for block in self.blocks:
             x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
+        """KG mode with causal masking and next-token prediction.
+        Randomly flipped direction is handled by the batch function;
+        negate_angles tells us to negate the relation angle for flipped triples.
+
+        Args:
+            char_tokens: (B, T) character tokens (head + tail)
+            targets: (B, T) next-token targets, -100 for padding
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            negate_angles: list of bool, True if relation angle should be negated
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+
+        x = self.expander(self.token_embedding(char_tokens))
+        angles = self._cumsum_angles_kg(char_tokens, head_lens, rel_names,
+                                        char_tokens.device, negate_angles=negate_angles)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=True, pad_mask=pad_mask)
 
         logits = self.lm_head(x)
 
@@ -1588,7 +1678,7 @@ class ModelH(nn.Module):
 # Data Preparation
 # ============================================================================
 
-def prepare_data(generous_linearization=True, expanded_names=False):
+def prepare_data(generous_linearization=True, expanded_names=False, one_to_one=False, inverse_kg=False):
     """Prepare train data for all models.
 
     Returns:
@@ -1602,13 +1692,14 @@ def prepare_data(generous_linearization=True, expanded_names=False):
     # ---- Base text (all models see this) ----
     # KG-exclusive chains get NO text at all
     # Text-exclusive chains get text but NO KG
-    base_teaching = generate_text_sentences(teaching, include_derived=True, all_variations=True)
-    base_transfer = generate_text_sentences(transfer, include_derived=False, all_variations=True)
-    base_generalization = generate_text_sentences(generalization, include_derived=False, all_variations=True)
-    base_geo = generate_geo_sentences(geo_facts, all_variations=True)
+    use_variations = not one_to_one
+    base_teaching = generate_text_sentences(teaching, include_derived=True, all_variations=use_variations)
+    base_transfer = generate_text_sentences(transfer, include_derived=False, all_variations=use_variations)
+    base_generalization = generate_text_sentences(generalization, include_derived=False, all_variations=use_variations)
+    base_geo = generate_geo_sentences(geo_facts, all_variations=use_variations)
     # Text-exclusive: text only, never KG
-    text_excl_mem_text = generate_text_sentences(text_excl_mem, include_derived=True, all_variations=True)
-    text_excl_gen_text = generate_text_sentences(text_excl_gen, include_derived=False, all_variations=True)
+    text_excl_mem_text = generate_text_sentences(text_excl_mem, include_derived=True, all_variations=use_variations)
+    text_excl_gen_text = generate_text_sentences(text_excl_gen, include_derived=False, all_variations=use_variations)
     base_text = (base_teaching + base_transfer + base_generalization + base_geo
                  + text_excl_mem_text + text_excl_gen_text)
 
@@ -1626,7 +1717,7 @@ def prepare_data(generous_linearization=True, expanded_names=False):
 
     # ---- Extra linearized text for B/C (derived facts from transfer chains) ----
     extra_transfer_text = generate_text_sentences(
-        transfer, include_derived=True, all_variations=generous_linearization
+        transfer, include_derived=True, all_variations=(generous_linearization and use_variations)
     )
     extra_derived_only = [s for s in extra_transfer_text if s not in base_transfer]
     linearized_extra_text = extra_derived_only
@@ -1644,7 +1735,7 @@ def prepare_data(generous_linearization=True, expanded_names=False):
     text_dataset_base = TextDataset(base_text, vocab, cfg.block_size)
     text_linearized = base_text + linearized_extra_text
     text_dataset_linearized = TextDataset(text_linearized, vocab, cfg.block_size)
-    kg_dataset = KGDataset(all_kg_triples, vocab, cfg.device)
+    kg_dataset = KGDataset(all_kg_triples, vocab, cfg.device, inverse_kg=inverse_kg)
 
     # ---- Build evaluation prompts ----
     eval_prompts = build_eval_prompts(
@@ -1759,6 +1850,8 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
     Uses pseudo-perplexity (mask one tail position at a time) and hit@1/hit@5.
     Also reports simultaneous-mask hit@1 (mask all tail positions at once).
 
+    Batched: groups prompts by (head_len, tail_len) for efficient GPU utilization.
+
     Args:
         model: the trained model
         kg_eval_prompts: list of dicts with head, rel, tail, tier, relation
@@ -1770,83 +1863,157 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
     model.eval()
     model.to(config.device)
 
+    # Pre-encode all prompts
+    encoded_prompts = []
+    for p in kg_eval_prompts:
+        head_tokens = vocab.encode_entity(p["head"])
+        tail_tokens = vocab.encode_entity(p["tail"])
+        encoded_prompts.append({
+            "head_tokens": head_tokens,
+            "tail_tokens": tail_tokens,
+            "head_len": len(head_tokens),
+            "tail_len": len(tail_tokens),
+            "rel_name": p["rel"],
+            "tier": p["tier"],
+            "relation": p["relation"],
+            "head": p["head"],
+            "tail": p["tail"],
+        })
+
+    # Group by (head_len, tail_len) so all prompts in a group have identical seq_len
+    groups = defaultdict(list)
+    for idx, ep in enumerate(encoded_prompts):
+        groups[(ep["head_len"], ep["tail_len"])].append(idx)
+
+    # Per-prompt accumulators
+    total_log_probs = [0.0] * len(encoded_prompts)
+    log_prob_firsts = [None] * len(encoded_prompts)
+    log_prob_lasts = [None] * len(encoded_prompts)
+    all_in_top5s = [True] * len(encoded_prompts)
+    hit1s = [1] * len(encoded_prompts)
+
     results = defaultdict(lambda: defaultdict(list))
+    batch_size = config.batch_size
 
     with torch.no_grad():
-        for p in kg_eval_prompts:
-            tier = p["tier"]
-            relation = p["relation"]
-            head_name = p["head"]
-            rel_name = p["rel"]
-            tail_name = p["tail"]
-
-            head_tokens = vocab.encode_entity(head_name)
-            tail_tokens = vocab.encode_entity(tail_name)
-            head_len = len(head_tokens)
-            tail_len = len(tail_tokens)
+        for (head_len, tail_len), prompt_indices in groups.items():
+            # Determine sequence length for this group
+            if model_type in ("E", "H"):
+                seq_len = head_len + tail_len
+            else:
+                seq_len = head_len + 1 + tail_len  # +1 for relation token
 
             # --- Pseudo-perplexity: mask one tail position at a time ---
-            total_log_prob = 0.0
-            log_prob_first = None
-            log_prob_last = None
-            all_in_top5 = True
-
             for t_idx in range(tail_len):
-                tokens, targets, head_lens, rel_names = _build_kg_eval_batch(
-                    head_tokens, rel_name, tail_tokens, [head_len + t_idx],
-                    vocab, model_type)
+                # Process in sub-batches
+                for sb_start in range(0, len(prompt_indices), batch_size):
+                    sb_indices = prompt_indices[sb_start:sb_start + batch_size]
+                    B = len(sb_indices)
+
+                    tokens = torch.full((B, seq_len), vocab.PAD, dtype=torch.long)
+                    targets = torch.full((B, seq_len), -100, dtype=torch.long)
+                    head_lens_list = []
+                    rel_names_list = []
+
+                    for bi, pi in enumerate(sb_indices):
+                        ep = encoded_prompts[pi]
+                        if model_type in ("E", "H"):
+                            seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
+                            mask_pos = head_len + t_idx
+                        else:
+                            rel_token = vocab.kg_relations[ep["rel_name"]]
+                            seq = list(ep["head_tokens"]) + [rel_token] + list(ep["tail_tokens"])
+                            mask_pos = head_len + 1 + t_idx
+
+                        tokens[bi, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+                        targets[bi, mask_pos] = tokens[bi, mask_pos].item()
+                        tokens[bi, mask_pos] = vocab.MASK
+                        head_lens_list.append(head_len)
+                        rel_names_list.append(ep["rel_name"])
+
+                    tokens = tokens.to(config.device)
+                    targets = targets.to(config.device)
+
+                    logits = _forward_kg_eval(model, tokens, targets, head_lens_list, rel_names_list, model_type)
+
+                    # Extract results per prompt
+                    mask_pos = head_len + t_idx if model_type in ("E", "H") else head_len + 1 + t_idx
+                    for bi, pi in enumerate(sb_indices):
+                        ep = encoded_prompts[pi]
+                        step_logits = logits[bi, mask_pos, :]
+                        log_probs = F.log_softmax(step_logits, dim=0)
+                        true_token = ep["tail_tokens"][t_idx]
+                        lp = log_probs[true_token].item()
+                        total_log_probs[pi] += lp
+                        if t_idx == 0:
+                            log_prob_firsts[pi] = lp
+                        log_prob_lasts[pi] = lp
+
+                        top5 = torch.topk(step_logits, k=min(5, step_logits.shape[0])).indices.tolist()
+                        if true_token not in top5:
+                            all_in_top5s[pi] = False
+
+            # --- Simultaneous mask: mask ALL tail positions at once (for hit@1) ---
+            for sb_start in range(0, len(prompt_indices), batch_size):
+                sb_indices = prompt_indices[sb_start:sb_start + batch_size]
+                B = len(sb_indices)
+
+                tokens = torch.full((B, seq_len), vocab.PAD, dtype=torch.long)
+                targets = torch.full((B, seq_len), -100, dtype=torch.long)
+                head_lens_list = []
+                rel_names_list = []
+
+                for bi, pi in enumerate(sb_indices):
+                    ep = encoded_prompts[pi]
+                    if model_type in ("E", "H"):
+                        seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
+                        for ti in range(tail_len):
+                            pos = head_len + ti
+                            targets[bi, pos] = seq[pos]
+                            seq[pos] = vocab.MASK
+                    else:
+                        rel_token = vocab.kg_relations[ep["rel_name"]]
+                        seq = list(ep["head_tokens"]) + [rel_token] + list(ep["tail_tokens"])
+                        for ti in range(tail_len):
+                            pos = head_len + 1 + ti
+                            targets[bi, pos] = seq[pos]
+                            seq[pos] = vocab.MASK
+
+                    tokens[bi, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+                    head_lens_list.append(head_len)
+                    rel_names_list.append(ep["rel_name"])
+
                 tokens = tokens.to(config.device)
                 targets = targets.to(config.device)
 
-                logits = _forward_kg_eval(model, tokens, targets, head_lens, rel_names, model_type)
+                logits = _forward_kg_eval(model, tokens, targets, head_lens_list, rel_names_list, model_type)
 
-                # Find the mask position in the output
-                mask_pos = head_len + t_idx if model_type == "E" else head_len + 1 + t_idx
-                step_logits = logits[0, mask_pos, :]
-                log_probs = F.log_softmax(step_logits, dim=0)
-                true_token = tail_tokens[t_idx]
-                total_log_prob += log_probs[true_token].item()
-                if t_idx == 0:
-                    log_prob_first = log_probs[true_token].item()
-                log_prob_last = log_probs[true_token].item()
+                for bi, pi in enumerate(sb_indices):
+                    ep = encoded_prompts[pi]
+                    for ti in range(tail_len):
+                        mask_pos = head_len + ti if model_type in ("E", "H") else head_len + 1 + ti
+                        pred = torch.argmax(logits[bi, mask_pos, :]).item()
+                        if pred != ep["tail_tokens"][ti]:
+                            hit1s[pi] = 0
+                            break
 
-                top5 = torch.topk(step_logits, k=min(5, step_logits.shape[0])).indices.tolist()
-                if true_token not in top5:
-                    all_in_top5 = False
+    # --- Collect per-prompt results ---
+    for pi, ep in enumerate(encoded_prompts):
+        tail_len = ep["tail_len"]
+        ppl = np.exp(-total_log_probs[pi] / max(tail_len, 1))
+        first_char_ppl = np.exp(-log_prob_firsts[pi]) if log_prob_firsts[pi] is not None else ppl
+        last_char_ppl = np.exp(-log_prob_lasts[pi]) if log_prob_lasts[pi] is not None else ppl
 
-            ppl = np.exp(-total_log_prob / max(tail_len, 1))
-            first_char_ppl = np.exp(-log_prob_first) if log_prob_first is not None else ppl
-            last_char_ppl = np.exp(-log_prob_last) if log_prob_last is not None else ppl
-            hit5 = 1 if all_in_top5 else 0
-
-            # --- Simultaneous mask: mask ALL tail positions at once ---
-            all_mask_positions = list(range(head_len, head_len + tail_len))
-            tokens, targets, head_lens, rel_names = _build_kg_eval_batch(
-                head_tokens, rel_name, tail_tokens, all_mask_positions,
-                vocab, model_type)
-            tokens = tokens.to(config.device)
-            targets = targets.to(config.device)
-
-            logits = _forward_kg_eval(model, tokens, targets, head_lens, rel_names, model_type)
-
-            hit1 = 1
-            for t_idx in range(tail_len):
-                mask_pos = head_len + t_idx if model_type == "E" else head_len + 1 + t_idx
-                pred = torch.argmax(logits[0, mask_pos, :]).item()
-                if pred != tail_tokens[t_idx]:
-                    hit1 = 0
-                    break
-
-            results[tier][relation].append({
-                "hit1": hit1,
-                "hit5": hit5,
-                "ppl": ppl,
-                "first_char_ppl": first_char_ppl,
-                "last_char_ppl": last_char_ppl,
-                "head": head_name,
-                "rel": rel_name,
-                "tail": tail_name,
-            })
+        results[ep["tier"]][ep["relation"]].append({
+            "hit1": hit1s[pi],
+            "hit5": 1 if all_in_top5s[pi] else 0,
+            "ppl": ppl,
+            "first_char_ppl": first_char_ppl,
+            "last_char_ppl": last_char_ppl,
+            "head": ep["head"],
+            "rel": ep["rel_name"],
+            "tail": ep["tail"],
+        })
 
     # --- Tier-level summary ---
     summary = {}
@@ -1895,6 +2062,193 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                   f"ppl={s['ppl']:.2f}  fc_ppl={s['first_char_ppl']:.2f}  lc_ppl={s['last_char_ppl']:.2f}  (n={s['n']})")
 
     print(f"\n  Per-relation breakout (KG):")
+    print(f"  {'Tier':<35s} {'Relation':<20s} {'hit@1':>6s} {'hit@5':>6s} {'ppl':>8s} {'n':>4s}")
+    print(f"  {'-'*80}")
+    for tier in ALL_TIERS:
+        if tier not in relation_summary:
+            continue
+        for rel in sorted(relation_summary[tier].keys()):
+            rs = relation_summary[tier][rel]
+            print(f"  {tier:<35s} {rel:<20s} {rs['hit1']:>6.3f} {rs['hit5']:>6.3f} "
+                  f"{rs['ppl']:>8.2f} {rs['n']:>4d}")
+
+    model.train()
+    return summary, relation_summary, results
+
+
+def evaluate_model_kg_causal(model, kg_eval_prompts, vocab, config, model_name="?"):
+    """Evaluate E/E' with causal KG: next-token prediction in both directions.
+
+    For each (head, rel, tail) prompt:
+      Forward:  sequence = head + tail, causal mask, relation angle +theta
+                predict tail chars given head chars
+      Backward: sequence = tail + head, causal mask, relation angle -theta
+                predict head chars given tail chars
+
+    Each direction produces a separate entry in the results pool for global averaging.
+
+    Batched: groups (prompt, direction) pairs by sequence length for efficient GPU utilization.
+    """
+    model.eval()
+    model.to(config.device)
+
+    results = defaultdict(lambda: defaultdict(list))
+    batch_size = config.batch_size
+
+    # Pre-encode all (prompt, direction) pairs
+    eval_items = []
+    for p in kg_eval_prompts:
+        head_tokens = vocab.encode_entity(p["head"])
+        tail_tokens = vocab.encode_entity(p["tail"])
+        head_len = len(head_tokens)
+        tail_len = len(tail_tokens)
+
+        for direction in ("forward", "backward"):
+            if direction == "forward":
+                seq = list(head_tokens) + list(tail_tokens)
+                ctx_len = head_len
+                pred_tokens = list(tail_tokens)
+                negate = False
+            else:
+                seq = list(tail_tokens) + list(head_tokens)
+                ctx_len = tail_len
+                pred_tokens = list(head_tokens)
+                negate = True
+
+            eval_items.append({
+                "seq": seq,
+                "ctx_len": ctx_len,
+                "pred_tokens": pred_tokens,
+                "pred_len": len(pred_tokens),
+                "negate": negate,
+                "rel_name": p["rel"],
+                "tier": p["tier"],
+                "relation": p["relation"],
+                "head": p["head"],
+                "tail": p["tail"],
+                "direction": direction,
+            })
+
+    # Group by sequence length
+    groups = defaultdict(list)
+    for idx, item in enumerate(eval_items):
+        groups[len(item["seq"])].append(idx)
+
+    with torch.no_grad():
+        for seq_len, item_indices in groups.items():
+            for sb_start in range(0, len(item_indices), batch_size):
+                sb_indices = item_indices[sb_start:sb_start + batch_size]
+                B = len(sb_indices)
+
+                seq_t = torch.zeros(B, seq_len, dtype=torch.long, device=config.device)
+                ctx_lens = []
+                rel_names_list = []
+                negate_list = []
+
+                for bi, ii in enumerate(sb_indices):
+                    item = eval_items[ii]
+                    seq_t[bi] = torch.tensor(item["seq"], dtype=torch.long)
+                    ctx_lens.append(item["ctx_len"])
+                    rel_names_list.append(item["rel_name"])
+                    negate_list.append(item["negate"])
+
+                # Forward pass with causal masking
+                pad_mask = (seq_t != 0)
+                x = model.expander(model.token_embedding(seq_t))
+                angles = model._cumsum_angles_kg(
+                    seq_t, ctx_lens, rel_names_list, config.device,
+                    negate_angles=negate_list)
+
+                for block in model.blocks:
+                    x = block(x, angles, causal=True, pad_mask=pad_mask)
+
+                logits = model.lm_head(x)
+
+                # Extract per-item results
+                for bi, ii in enumerate(sb_indices):
+                    item = eval_items[ii]
+                    pred_len = item["pred_len"]
+                    ctx_len = item["ctx_len"]
+                    pred_tokens = item["pred_tokens"]
+
+                    total_log_prob = 0.0
+                    all_in_top5 = True
+                    all_top1 = True
+
+                    for j in range(pred_len):
+                        pred_pos = ctx_len - 1 + j
+                        true_token = pred_tokens[j]
+                        step_logits = logits[bi, pred_pos, :]
+                        log_probs = F.log_softmax(step_logits, dim=0)
+                        total_log_prob += log_probs[true_token].item()
+
+                        top5 = torch.topk(step_logits, k=min(5, step_logits.shape[0])).indices.tolist()
+                        if true_token not in top5:
+                            all_in_top5 = False
+                        if torch.argmax(step_logits).item() != true_token:
+                            all_top1 = False
+
+                    ppl = np.exp(-total_log_prob / max(pred_len, 1))
+
+                    results[item["tier"]][item["relation"]].append({
+                        "hit1": 1 if all_top1 else 0,
+                        "hit5": 1 if all_in_top5 else 0,
+                        "ppl": ppl,
+                        "first_char_ppl": ppl,
+                        "last_char_ppl": ppl,
+                        "head": item["head"],
+                        "rel": item["rel_name"],
+                        "tail": item["tail"],
+                        "direction": item["direction"],
+                    })
+
+    # --- Tier-level summary ---
+    summary = {}
+    for tier in results:
+        tier_results = {"hit1": [], "hit5": [], "ppl": [], "first_char_ppl": [], "last_char_ppl": []}
+        for rel in results[tier]:
+            for r in results[tier][rel]:
+                tier_results["hit1"].append(r["hit1"])
+                tier_results["hit5"].append(r["hit5"])
+                tier_results["ppl"].append(r["ppl"])
+                tier_results["first_char_ppl"].append(r["first_char_ppl"])
+                tier_results["last_char_ppl"].append(r["last_char_ppl"])
+
+        summary[tier] = {
+            "hit1": np.mean(tier_results["hit1"]),
+            "hit5": np.mean(tier_results["hit5"]),
+            "ppl": np.exp(np.mean(np.log(tier_results["ppl"]))),
+            "first_char_ppl": np.exp(np.mean(np.log(tier_results["first_char_ppl"]))),
+            "last_char_ppl": np.exp(np.mean(np.log(tier_results["last_char_ppl"]))),
+            "n": len(tier_results["hit1"]),
+        }
+
+    # --- Per-relation summary ---
+    relation_summary = {}
+    for tier in results:
+        relation_summary[tier] = {}
+        for rel in results[tier]:
+            rel_data = results[tier][rel]
+            if len(rel_data) == 0:
+                continue
+            relation_summary[tier][rel] = {
+                "hit1": np.mean([r["hit1"] for r in rel_data]),
+                "hit5": np.mean([r["hit5"] for r in rel_data]),
+                "ppl": np.exp(np.mean([np.log(r["ppl"]) for r in rel_data])),
+                "n": len(rel_data),
+            }
+
+    # --- Print summary ---
+    print(f"\n{'='*60}")
+    print(f"  KG Evaluation (causal, both directions): {model_name}")
+    print(f"{'='*60}")
+    for tier in ALL_TIERS:
+        if tier in summary:
+            s = summary[tier]
+            print(f"  {tier:>35s}: hit@1={s['hit1']:.3f}  hit@5={s['hit5']:.3f}  "
+                  f"ppl={s['ppl']:.2f}  fc_ppl={s['first_char_ppl']:.2f}  lc_ppl={s['last_char_ppl']:.2f}  (n={s['n']})")
+
+    print(f"\n  Per-relation breakout (KG causal):")
     print(f"  {'Tier':<35s} {'Relation':<20s} {'hit@1':>6s} {'hit@5':>6s} {'ppl':>8s} {'n':>4s}")
     print(f"  {'-'*80}")
     for tier in ALL_TIERS:
@@ -2002,7 +2356,8 @@ def train_model_text_only(model, text_dataset, config, name="?",
 
 
 def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
-                      kg_batch_fn="native", resume_optimizer_state=None):
+                      kg_batch_fn="native", resume_optimizer_state=None,
+                      kg_only=False, causal_kg=False):
     """Train mixed text+KG model (A/A', D/D', E/E').
 
     Each iteration: text batch (causal, NTP) + KG batch (bidir, MLM).
@@ -2022,28 +2377,37 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
 
     for it in tqdm(range(config.max_iters), desc=f"Model {name}"):
         # --- Text batch ---
-        x, y = text_dataset.get_batch(config.batch_size, config.device)
-        if hasattr(model, 'forward_text'):
-            _, text_loss = model.forward_text(x, y)
-        else:
-            _, text_loss = model(x, y)
+        if not kg_only:
+            x, y = text_dataset.get_batch(config.batch_size, config.device)
+            if hasattr(model, 'forward_text'):
+                _, text_loss = model.forward_text(x, y)
+            else:
+                _, text_loss = model(x, y)
 
         # --- KG batch ---
         if kg_batch_fn == "slotted":
             tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
                 config.batch_size, config.device, config.mlm_mask_prob)
             _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+        elif kg_batch_fn == "native" and causal_kg:
+            char_tokens, targets, head_lens, rel_names, negate = kg_dataset.get_causal_batch_native(
+                config.batch_size, config.device)
+            _, kg_loss = model.forward_kg_causal(char_tokens, targets, head_lens, rel_names, negate)
         elif kg_batch_fn == "native":
-            char_tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_native(
+            char_tokens, targets, head_lens, rel_names, negate = kg_dataset.get_mlm_batch_native(
                 config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names)
+            _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names, negate)
         elif kg_batch_fn == "flat":
             tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
                 config.batch_size, config.device, config.mlm_mask_prob)
             _, kg_loss = model.forward_kg(tokens, targets)
 
         # Combined loss
-        loss = text_loss + kg_loss
+        if kg_only:
+            loss = kg_loss
+            text_loss = torch.tensor(0.0)
+        else:
+            loss = text_loss + kg_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -2068,81 +2432,127 @@ def evaluate_model(model, eval_prompts, vocab, config, model_name="?"):
     """Evaluate a model on cloze-style text prompts.
 
     All models evaluated as text models -- given a text prompt, predict next chars.
+
+    Batched: groups prompts by (prompt_len, target_len) for efficient GPU utilization.
+    Single pass computes ppl, hit@1, and hit@5 together (old code did two passes).
     """
     model.eval()
     model.to(config.device)
 
     results = defaultdict(lambda: defaultdict(list))
+    batch_size = config.batch_size
+
+    # Pre-process prompts
+    processed = []
+    for p in eval_prompts:
+        prompt_tokens = p["prompt_tokens"]
+        target_tokens = p["target_tokens"]
+        if len(prompt_tokens) > config.block_size:
+            prompt_tokens = prompt_tokens[-config.block_size:]
+        processed.append({
+            "prompt_tokens": prompt_tokens,
+            "target_tokens": target_tokens,
+            "prompt_len": len(prompt_tokens),
+            "target_len": len(target_tokens),
+            "tier": p["tier"],
+            "relation": p["relation"],
+            "prompt": p["prompt"],
+            "target": p["target"],
+        })
+
+    # Group by (prompt_len, target_len) so all prompts have identical input length at each step
+    groups = defaultdict(list)
+    for idx, pp in enumerate(processed):
+        groups[(pp["prompt_len"], pp["target_len"])].append(idx)
+
+    # Per-prompt accumulators
+    n = len(processed)
+    total_log_probs = [0.0] * n
+    log_prob_firsts = [None] * n
+    log_prob_lasts = [None] * n
+    generated_names = [[] for _ in range(n)]
+    all_correct = [True] * n
+    all_in_top5s = [True] * n
 
     with torch.no_grad():
-        for p in eval_prompts:
-            tier = p["tier"]
-            relation = p["relation"]
-            prompt_tokens = p["prompt_tokens"]
-            target_tokens = p["target_tokens"]
+        for (prompt_len, target_len), prompt_indices in groups.items():
+            if target_len == 0:
+                continue
 
-            if len(prompt_tokens) > config.block_size:
-                prompt_tokens = prompt_tokens[-config.block_size:]
+            # Build per-prompt current_tokens (will grow with teacher forcing)
+            current_tokens_map = {}
+            for pi in prompt_indices:
+                current_tokens_map[pi] = processed[pi]["prompt_tokens"].copy()
 
-            # Autoregressive generation of full target name
-            full_correct = True
-            total_log_prob = 0.0
-            generated_name = []
-            current_tokens = prompt_tokens.copy()
-            log_probs_first = None
-            log_probs_last = None
-            for t_idx, t_tok in enumerate(target_tokens):
-                x = torch.tensor([current_tokens[-config.block_size:]],
-                                 dtype=torch.long, device=config.device)
-                logits = model.predict_text(x)
-                step_logits = logits[0, -1, :]
-                log_probs = F.log_softmax(step_logits, dim=0)
-                total_log_prob += log_probs[t_tok].item()
-                if t_idx == 0:
-                    log_probs_first = log_probs[t_tok]
-                log_probs_last = log_probs[t_tok]
-                pred = torch.argmax(step_logits).item()
-                generated_name.append(pred)
-                if pred != t_tok:
-                    full_correct = False
-                # Teacher forcing: always append true token
-                current_tokens.append(t_tok)
+            for t_idx in range(target_len):
+                # At this step, input length is min(prompt_len + t_idx, block_size)
+                input_len = min(prompt_len + t_idx, config.block_size)
 
-            ppl = np.exp(-total_log_prob / len(target_tokens))
-            first_char_ppl = np.exp(-log_probs_first.item()) if target_tokens else ppl
-            last_char_ppl = np.exp(-log_probs_last.item()) if target_tokens else ppl
+                # Process in sub-batches
+                for sb_start in range(0, len(prompt_indices), batch_size):
+                    sb_indices = prompt_indices[sb_start:sb_start + batch_size]
+                    B = len(sb_indices)
 
-            # hit@1: greedy-decoded name matches target exactly
-            hit1 = 1 if generated_name == target_tokens else 0
+                    x = torch.zeros(B, input_len, dtype=torch.long, device=config.device)
+                    for bi, pi in enumerate(sb_indices):
+                        toks = current_tokens_map[pi][-config.block_size:]
+                        x[bi] = torch.tensor(toks, dtype=torch.long)
 
-            # hit@5: target name's first char is in top-5 at first step,
-            # AND all subsequent chars are correct under teacher forcing
-            # (approximation: full name would require beam search;
-            #  instead, check if all chars are in top-5 at each step)
-            all_in_top5 = True
-            current_tokens_t5 = prompt_tokens.copy()
-            for t_idx, t_tok in enumerate(target_tokens):
-                x = torch.tensor([current_tokens_t5[-config.block_size:]],
-                                 dtype=torch.long, device=config.device)
-                logits = model.predict_text(x)
-                step_logits = logits[0, -1, :]
-                top5 = torch.topk(step_logits, k=min(5, step_logits.shape[0])).indices.tolist()
-                if t_tok not in top5:
-                    all_in_top5 = False
-                    break
-                current_tokens_t5.append(t_tok)
-            hit5 = 1 if all_in_top5 else 0
+                    logits = model.predict_text(x)
 
-            results[tier][relation].append({
-                "hit1": hit1,
-                "hit5": hit5,
-                "ppl": ppl,
-                "first_char_ppl": first_char_ppl,
-                "last_char_ppl": last_char_ppl,
-                "full_correct": 1 if full_correct else 0,
-                "prompt": p["prompt"],
-                "target": p["target"],
-            })
+                    for bi, pi in enumerate(sb_indices):
+                        pp = processed[pi]
+                        t_tok = pp["target_tokens"][t_idx]
+                        step_logits = logits[bi, -1, :]
+
+                        # PPL computation
+                        log_probs = F.log_softmax(step_logits, dim=0)
+                        lp = log_probs[t_tok].item()
+                        total_log_probs[pi] += lp
+                        if t_idx == 0:
+                            log_prob_firsts[pi] = lp
+                        log_prob_lasts[pi] = lp
+
+                        # hit@1: greedy prediction
+                        pred = torch.argmax(step_logits).item()
+                        generated_names[pi].append(pred)
+                        if pred != t_tok:
+                            all_correct[pi] = False
+
+                        # hit@5: check if true token in top-5
+                        if all_in_top5s[pi]:
+                            top5 = torch.topk(step_logits, k=min(5, step_logits.shape[0])).indices.tolist()
+                            if t_tok not in top5:
+                                all_in_top5s[pi] = False
+
+                        # Teacher forcing: append true token
+                        current_tokens_map[pi].append(t_tok)
+
+    # --- Collect per-prompt results ---
+    for pi, pp in enumerate(processed):
+        target_tokens = pp["target_tokens"]
+        target_len = pp["target_len"]
+
+        if target_len > 0:
+            ppl = np.exp(-total_log_probs[pi] / target_len)
+            first_char_ppl = np.exp(-log_prob_firsts[pi]) if log_prob_firsts[pi] is not None else ppl
+            last_char_ppl = np.exp(-log_prob_lasts[pi]) if log_prob_lasts[pi] is not None else ppl
+        else:
+            ppl = first_char_ppl = last_char_ppl = 1.0
+
+        hit1 = 1 if generated_names[pi] == target_tokens else 0
+        hit5 = 1 if all_in_top5s[pi] else 0
+
+        results[pp["tier"]][pp["relation"]].append({
+            "hit1": hit1,
+            "hit5": hit5,
+            "ppl": ppl,
+            "first_char_ppl": first_char_ppl,
+            "last_char_ppl": last_char_ppl,
+            "full_correct": 1 if all_correct[pi] else 0,
+            "prompt": pp["prompt"],
+            "target": pp["target"],
+        })
 
     # --- Tier-level summary ---
     summary = {}
@@ -2275,7 +2685,9 @@ def count_parameters(model):
 
 def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
                    checkpoint_dir=None, load_checkpoints=False,
-                   resume_training=False, expanded_names=False):
+                   resume_training=False, expanded_names=False,
+                   one_to_one=False, kg_only=False, causal_kg=False,
+                   inverse_kg=False):
     """Run one sub-experiment (7a or 7b) with a given seed.
 
     Args:
@@ -2299,7 +2711,7 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
     np.random.seed(seed)
 
     (vocab, text_base, text_linearized, kg_dataset,
-     eval_prompts, kg_eval_prompts) = prepare_data(generous_linearization, expanded_names=expanded_names)
+     eval_prompts, kg_eval_prompts) = prepare_data(generous_linearization, expanded_names=expanded_names, one_to_one=one_to_one, inverse_kg=inverse_kg)
     print(f"Vocabulary size: {vocab.size}")
     print(f"Text dataset (base): {len(text_base.data)} tokens")
     print(f"Text dataset (linearized): {len(text_linearized.data)} tokens")
@@ -2366,17 +2778,20 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
                 _, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="slotted",
-                    resume_optimizer_state=resume_opt)
+                    resume_optimizer_state=resume_opt,
+                    kg_only=kg_only)
             elif name in NATIVE_KG_MODELS:
                 _, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="native",
-                    resume_optimizer_state=resume_opt)
+                    resume_optimizer_state=resume_opt,
+                    kg_only=kg_only, causal_kg=causal_kg)
             elif name in FLAT_KG_MODELS:
                 _, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="flat",
-                    resume_optimizer_state=resume_opt)
+                    resume_optimizer_state=resume_opt,
+                    kg_only=kg_only)
             cfg.max_iters = orig_max_iters
             total_iters = iters_done + remaining
 
@@ -2404,8 +2819,12 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
         # KG evaluation for A/D/E models
         base_name = name.replace("'", "")
         if base_name in ("A", "D", "E", "F", "G", "H"):
-            kg_summary, kg_rel_summary, _ = evaluate_model_kg(
-                model, kg_eval_prompts, vocab, cfg, model_name=name, model_type=base_name)
+            if causal_kg and base_name in ("E", "H"):
+                kg_summary, kg_rel_summary, _ = evaluate_model_kg_causal(
+                    model, kg_eval_prompts, vocab, cfg, model_name=name)
+            else:
+                kg_summary, kg_rel_summary, _ = evaluate_model_kg(
+                    model, kg_eval_prompts, vocab, cfg, model_name=name, model_type=base_name)
             kg_results[name] = kg_summary
             kg_relation_results[name] = kg_rel_summary
 
@@ -2568,6 +2987,14 @@ def main():
                         help="Load checkpoint and continue training")
     parser.add_argument("--expanded_names", action="store_true",
                         help="Use expanded 240-char alphabet for name generation")
+    parser.add_argument("--one_to_one", action="store_true",
+                        help="1:1 KG-text correspondence (one text variation per fact)")
+    parser.add_argument("--kg_only", action="store_true",
+                        help="Train on KG data only (skip text loss for mixed models)")
+    parser.add_argument("--causal_kg", action="store_true",
+                        help="Use causal masking for KG (next-token prediction with random direction flip)")
+    parser.add_argument("--inverse_kg", action="store_true",
+                        help="Add inverse KG triples (swapped head/tail with negated relation angle)")
     args = parser.parse_args()
 
     if args.n_embed is not None:
@@ -2626,7 +3053,11 @@ def main():
                 checkpoint_dir=args.checkpoint_dir,
                 load_checkpoints=args.load_checkpoints,
                 resume_training=args.resume_training,
-                expanded_names=args.expanded_names)
+                expanded_names=args.expanded_names,
+                one_to_one=args.one_to_one,
+                kg_only=args.kg_only,
+                causal_kg=args.causal_kg,
+                inverse_kg=args.inverse_kg)
             seed_results.append(results)
             seed_relation_results.append(rel_results)
             seed_kg_results.append(kg_res)
