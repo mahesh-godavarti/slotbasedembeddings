@@ -16,10 +16,12 @@
 # with BPE tokenization. Adapted from joformer_src/ character-level models.
 
 import argparse
+import json
 import math
 import os
 import tempfile
 import time
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -515,6 +517,7 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     print(f"{'='*60}")
 
     best_val_loss = float('inf')
+    ppl_log = {"iter": [], "train_ppl": [], "val_ppl": []}
 
     pbar = tqdm(range(args.max_iters), desc=model_name)
     for it in pbar:
@@ -524,6 +527,9 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
                                    args.block_size, args.batch_size, device)
             train_ppl = math.exp(losses['train'])
             val_ppl = math.exp(losses['val'])
+            ppl_log["iter"].append(it)
+            ppl_log["train_ppl"].append(round(train_ppl, 2))
+            ppl_log["val_ppl"].append(round(val_ppl, 2))
             pbar.set_postfix(train_loss=f"{losses['train']:.3f}",
                              val_loss=f"{losses['val']:.3f}",
                              val_ppl=f"{val_ppl:.2f}")
@@ -586,7 +592,7 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
             'val_loss': losses['val'],
         }, path)
 
-    return losses['val'], val_ppl
+    return losses['val'], val_ppl, ppl_log
 
 # ---------------------------------------------------------------------------
 # Main
@@ -691,9 +697,10 @@ def main():
         cls = MODEL_CLASSES[model_name]
         model = cls(actual_vocab_size, args.n_embed, args.n_layers,
                     args.block_size, args.dropout)
-        val_loss, val_ppl = train_model(model_name, model, train_data, val_data,
-                                        args, device, tokenizer)
-        results[model_name] = {'val_loss': val_loss, 'val_ppl': val_ppl}
+        val_loss, val_ppl, ppl_log = train_model(model_name, model, train_data, val_data,
+                                                  args, device, tokenizer)
+        results[model_name] = {'val_loss': val_loss, 'val_ppl': val_ppl,
+                               'ppl_curve': ppl_log}
 
     # Comparison table
     print(f"\n{'='*60}")
@@ -709,6 +716,28 @@ def main():
     # Find best
     best_name = min(results, key=lambda k: results[k]['val_loss'])
     print(f"\nBest model: {best_name} (val PPL {results[best_name]['val_ppl']:.2f})")
+
+    # Save results with PPL curves
+    results_dir = os.path.dirname(os.path.abspath(__file__))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_data = {
+        "config": {
+            "n_embed": args.n_embed, "n_layers": args.n_layers,
+            "block_size": args.block_size, "batch_size": args.batch_size,
+            "lr": args.lr, "max_iters": args.max_iters,
+            "vocab_size": args.vocab_size, "models": args.models,
+        },
+        "results": results,
+        "timestamp": timestamp,
+    }
+    results_file = os.path.join(results_dir, f"joformer_results_{timestamp}.json")
+    with open(results_file, "w") as f:
+        json.dump(save_data, f, indent=2)
+    print(f"\nResults saved to: {results_file}")
+    latest_file = os.path.join(results_dir, "joformer_results_latest.json")
+    with open(latest_file, "w") as f:
+        json.dump(save_data, f, indent=2)
+    print(f"Latest results: {latest_file}")
 
 
 if __name__ == '__main__':

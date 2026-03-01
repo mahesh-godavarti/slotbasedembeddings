@@ -17,6 +17,7 @@
 #   Tier 7: Text-exclusive generalization (base in text only, derived nowhere)
 # -----------------------------------------------------------------------------
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -3226,6 +3227,49 @@ def evaluate_model_kg_causal(model, kg_eval_prompts, vocab, config, model_name="
 # Training
 # ============================================================================
 
+@torch.no_grad()
+def _eval_text_ppl(model, text_dataset, config, n_batches=10):
+    """Estimate text PPL (causal) by averaging over n_batches."""
+    model.eval()
+    total_loss = 0.0
+    for _ in range(n_batches):
+        x, y = text_dataset.get_batch(config.batch_size, config.device)
+        if hasattr(model, 'forward_text'):
+            _, loss = model.forward_text(x, y)
+        else:
+            _, loss = model(x, y)
+        total_loss += loss.item()
+    model.train()
+    return math.exp(total_loss / n_batches)
+
+
+@torch.no_grad()
+def _eval_kg_ppl(model, kg_dataset, config, kg_batch_fn, n_batches=10):
+    """Estimate KG PPL (MLM) by averaging over n_batches."""
+    model.eval()
+    total_loss = 0.0
+    for _ in range(n_batches):
+        if kg_batch_fn == "slotted":
+            tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+        elif kg_batch_fn == "native":
+            ct, tgt, hl, rn, neg = kg_dataset.get_mlm_batch_native(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(ct, tgt, hl, rn, neg)
+        elif kg_batch_fn == "native_slots":
+            ct, tgt, hl, rn = kg_dataset.get_mlm_batch_native_slots(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(ct, tgt, hl, rn)
+        elif kg_batch_fn == "flat":
+            tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(tokens, targets)
+        total_loss += loss.item()
+    model.train()
+    return math.exp(total_loss / n_batches)
+
+
 def train_model_text_only(model, text_dataset, config, name="?",
                           resume_optimizer_state=None):
     """Train text-only model (B/C) with next-token prediction.
@@ -3240,7 +3284,7 @@ def train_model_text_only(model, text_dataset, config, name="?",
     model.train()
 
     dual = config.dual_objective
-    losses_log = {"text": [], "iter": []}
+    losses_log = {"text": [], "iter": [], "eval_text_ppl": []}
     if dual:
         losses_log["text_mlm"] = []
 
@@ -3272,12 +3316,16 @@ def train_model_text_only(model, text_dataset, config, name="?",
         if it % config.eval_interval == 0:
             losses_log["iter"].append(it)
             losses_log["text"].append(causal_loss.item())
+            train_ppl = math.exp(loss.item())
+            eval_text_ppl = _eval_text_ppl(model, text_dataset, config)
+            losses_log["eval_text_ppl"].append(round(eval_text_ppl, 2))
             if dual:
                 losses_log["text_mlm"].append(mlm_loss.item())
-                print(f"  [{name}] iter {it} [{obj}], text_causal: {causal_loss.item():.4f}, "
-                      f"text_mlm: {mlm_loss.item():.4f}")
+                print(f"  [{name}] iter {it} [{obj}], train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}")
             else:
-                print(f"  [{name}] iter {it}, loss: {causal_loss.item():.4f}")
+                print(f"  [{name}] iter {it}, train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}")
 
     return losses_log, optimizer.state_dict()
 
@@ -3303,7 +3351,8 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
 
     dual = config.dual_objective
 
-    losses_log = {"text": [], "kg": [], "iter": []}
+    losses_log = {"text": [], "kg": [], "iter": [],
+                  "eval_text_ppl": [], "eval_kg_ppl": []}
     if dual:
         losses_log["text_mlm"] = []
         losses_log["kg_causal"] = []
@@ -3430,15 +3479,19 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
             losses_log["iter"].append(it)
             losses_log["text"].append(text_loss.item())
             losses_log["kg"].append(kg_loss.item())
+            train_ppl = math.exp(loss.item())
+            eval_text_ppl = _eval_text_ppl(model, text_dataset, config) if not kg_only else 0.0
+            eval_kg_ppl = _eval_kg_ppl(model, kg_dataset, config, kg_batch_fn)
+            losses_log["eval_text_ppl"].append(round(eval_text_ppl, 2))
+            losses_log["eval_kg_ppl"].append(round(eval_kg_ppl, 2))
             if dual:
                 losses_log["text_mlm"].append(text_mlm_loss.item())
                 losses_log["kg_causal"].append(kg_causal_loss.item())
-                print(f"  [{name}] iter {it} [{obj}], text_causal: {text_loss.item():.4f}, "
-                      f"text_mlm: {text_mlm_loss.item():.4f}, "
-                      f"kg_mlm: {kg_loss.item():.4f}, "
-                      f"kg_causal: {kg_causal_loss.item():.4f}")
+                print(f"  [{name}] iter {it} [{obj}], train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}, eval_kg_ppl: {eval_kg_ppl:.2f}")
             else:
-                print(f"  [{name}] iter {it}, text: {text_loss.item():.4f}, kg: {kg_loss.item():.4f}")
+                print(f"  [{name}] iter {it}, train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}, eval_kg_ppl: {eval_kg_ppl:.2f}")
 
     return losses_log, optimizer.state_dict()
 
@@ -3554,6 +3607,7 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+    training_curves = {}
     for name in models_to_run:
         model = create_model(name, vocab.size, cfg, n_relations=n_relations)
         model.vocab = vocab
@@ -3593,26 +3647,28 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
             cfg.max_iters = remaining
             print(f"--- Training Model {name} ---")
             opt_state = None
+            curves = {}
             if name in LINEARIZED_MODELS:
-                _, opt_state = train_model_text_only(model, text_linearized, cfg, name=name,
-                                                     resume_optimizer_state=resume_opt)
+                curves, opt_state = train_model_text_only(model, text_linearized, cfg, name=name,
+                                                          resume_optimizer_state=resume_opt)
             elif name in SLOTTED_KG_MODELS:
-                _, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
-                                                  name=name, kg_batch_fn="slotted",
-                                                  resume_optimizer_state=resume_opt, kg_only=kg_only)
+                curves, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
+                                                       name=name, kg_batch_fn="slotted",
+                                                       resume_optimizer_state=resume_opt, kg_only=kg_only)
             elif name in NATIVE_KG_MODELS:
-                _, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
-                                                  name=name, kg_batch_fn="native",
-                                                  resume_optimizer_state=resume_opt,
-                                                  kg_only=kg_only, causal_kg=causal_kg)
+                curves, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
+                                                       name=name, kg_batch_fn="native",
+                                                       resume_optimizer_state=resume_opt,
+                                                       kg_only=kg_only, causal_kg=causal_kg)
             elif name in NATIVE_SLOTS_KG_MODELS:
-                _, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
-                                                  name=name, kg_batch_fn="native_slots",
-                                                  resume_optimizer_state=resume_opt, kg_only=kg_only)
+                curves, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
+                                                       name=name, kg_batch_fn="native_slots",
+                                                       resume_optimizer_state=resume_opt, kg_only=kg_only)
             elif name in FLAT_KG_MODELS:
-                _, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
-                                                  name=name, kg_batch_fn="flat",
-                                                  resume_optimizer_state=resume_opt, kg_only=kg_only)
+                curves, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
+                                                       name=name, kg_batch_fn="flat",
+                                                       resume_optimizer_state=resume_opt, kg_only=kg_only)
+            training_curves[name] = curves
             cfg.max_iters = orig_max_iters
             total_iters = iters_done + remaining
 
@@ -3649,7 +3705,7 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
             torch.cuda.empty_cache()
 
     return (results, relation_results, kg_results, kg_relation_results,
-            linearized_results, linearized_relation_results)
+            linearized_results, linearized_relation_results, training_curves)
 
 
 # ============================================================================
@@ -3858,10 +3914,11 @@ def main():
     seed_results_list = []
     seed_kg_results_list = []
     seed_lin_results_list = []
+    all_training_curves = {}  # model_name -> list of per-seed curves
 
     for seed in range(cfg.n_seeds):
         (res, rel_res, kg_res, kg_rel_res,
-         lin_res, lin_rel_res) = run_experiment(
+         lin_res, lin_rel_res, curves) = run_experiment(
             wiki_path=args.wiki_path, wiki_lines=args.wiki_lines,
             vocab_size=args.vocab_size, seed=seed, models_to_run=models,
             checkpoint_dir=args.checkpoint_dir,
@@ -3876,6 +3933,8 @@ def main():
         seed_results_list.append(res)
         seed_kg_results_list.append(kg_res)
         seed_lin_results_list.append(lin_res)
+        for m, c in curves.items():
+            all_training_curves.setdefault(m, []).append(c)
 
     # Average across seeds
     avg_results = {}
@@ -3934,6 +3993,7 @@ def main():
             "lr": cfg.lr, "n_seeds": cfg.n_seeds, "models": models,
         },
         "results": to_serializable({"text": avg_results, "kg": avg_kg_results}),
+        "training_curves": to_serializable(all_training_curves),
         "timestamp": timestamp,
     }
 
