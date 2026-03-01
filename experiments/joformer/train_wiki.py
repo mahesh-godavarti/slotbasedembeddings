@@ -108,7 +108,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.ffn = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embed, n_embed),
             nn.Dropout(dropout),
         )
@@ -426,7 +426,7 @@ class JoFormerLearned(nn.Module):
 
 # ---------------------------------------------------------------------------
 # JoFormer-Projected — angles projected from previous layer output per block
-# Each block: vector = Linear(C, C)(x), angle = Linear(C, 2C) -> ReLU -> Linear(2C, C//2)
+# Each block: vector = Linear(C, C)(x), angle = Linear(C, 2C) -> GELU -> Linear(2C, C//2)
 # Then flip -> cumsum -> flip on angles, same attention as JoFormerLearned
 # ---------------------------------------------------------------------------
 
@@ -440,7 +440,7 @@ class JoFormerProjectedBlock(nn.Module):
         self.vector_proj = nn.Linear(n_embed, n_embed)
         self.angle_proj = nn.Sequential(
             nn.Linear(n_embed, 2 * n_embed),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(2 * n_embed, n_embed // 2),
         )
 
