@@ -3230,7 +3230,8 @@ def train_model_text_only(model, text_dataset, config, name="?",
                           resume_optimizer_state=None):
     """Train text-only model (B/C) with next-token prediction.
 
-    When config.dual_objective is True, also adds MLM text objective.
+    When config.dual_objective is True, randomly picks one objective per
+    iteration: text_causal or text_mlm.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
     if resume_optimizer_state is not None:
@@ -3244,16 +3245,24 @@ def train_model_text_only(model, text_dataset, config, name="?",
         losses_log["text_mlm"] = []
 
     for it in tqdm(range(config.max_iters), desc=f"Model {name}"):
-        x, y = text_dataset.get_batch(config.batch_size, config.device)
-        _, causal_loss = model(x, y)
-
-        loss = causal_loss
-
         if dual:
+            # Randomly pick one objective per iteration
+            obj = random.choice(["text_causal", "text_mlm"])
+        else:
+            obj = "text_causal"
+
+        causal_loss = torch.tensor(0.0)
+        mlm_loss = torch.tensor(0.0)
+
+        if obj == "text_causal":
+            x, y = text_dataset.get_batch(config.batch_size, config.device)
+            _, causal_loss = model(x, y)
+            loss = causal_loss
+        else:  # text_mlm
             mlm_tokens, mlm_targets = text_dataset.get_mlm_batch(
                 config.batch_size, config.device, config.mlm_mask_prob)
             _, mlm_loss = model.forward_text_mlm(mlm_tokens, mlm_targets)
-            loss = loss + mlm_loss
+            loss = mlm_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -3265,7 +3274,7 @@ def train_model_text_only(model, text_dataset, config, name="?",
             losses_log["text"].append(causal_loss.item())
             if dual:
                 losses_log["text_mlm"].append(mlm_loss.item())
-                print(f"  [{name}] iter {it}, text_causal: {causal_loss.item():.4f}, "
+                print(f"  [{name}] iter {it} [{obj}], text_causal: {causal_loss.item():.4f}, "
                       f"text_mlm: {mlm_loss.item():.4f}")
             else:
                 print(f"  [{name}] iter {it}, loss: {causal_loss.item():.4f}")
@@ -3279,9 +3288,8 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
     """Train mixed text+KG model.
 
     Each iteration: text batch (causal, NTP) + KG batch (bidir, MLM).
-    When config.dual_objective is True, adds:
-      - Text MLM (bidirectional, random mask)
-      - KG causal (next-token prediction)
+    When config.dual_objective is True, randomly picks one objective per
+    iteration from {text_causal, text_mlm, kg_mlm, kg_causal}.
 
     Args:
         kg_batch_fn: "slotted" for A/A',G/G', "native" for E/E',H/H',I/I',
@@ -3300,77 +3308,118 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
         losses_log["text_mlm"] = []
         losses_log["kg_causal"] = []
 
-    for it in tqdm(range(config.max_iters), desc=f"Model {name}"):
-        # --- Text causal (next-token prediction) ---
-        if not kg_only:
-            x, y = text_dataset.get_batch(config.batch_size, config.device)
-            if hasattr(model, 'forward_text'):
-                _, text_loss = model.forward_text(x, y)
-            else:
-                _, text_loss = model(x, y)
-
-        # --- Text MLM (bidirectional, random mask) --- [dual only]
-        text_mlm_loss = torch.tensor(0.0)
-        if dual and not kg_only:
-            mlm_tokens, mlm_targets = text_dataset.get_mlm_batch(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, text_mlm_loss = model.forward_text_mlm(mlm_tokens, mlm_targets)
-
-        # --- KG MLM (bidirectional, random mask) ---
-        if kg_batch_fn == "slotted":
-            tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
-        elif kg_batch_fn == "native" and causal_kg:
-            ct, tgt, hl, rn, neg = kg_dataset.get_causal_batch_native(config.batch_size, config.device)
-            _, kg_loss = model.forward_kg_causal(ct, tgt, hl, rn, neg)
-        elif kg_batch_fn == "native":
-            ct, tgt, hl, rn, neg = kg_dataset.get_mlm_batch_native(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(ct, tgt, hl, rn, neg)
-        elif kg_batch_fn == "native_slots":
-            ct, tgt, hl, rn = kg_dataset.get_mlm_batch_native_slots(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(ct, tgt, hl, rn)
-        elif kg_batch_fn == "flat":
-            tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(tokens, targets)
-
-        # --- KG slot-causal (mask one slot, predict causally) --- [dual only]
-        kg_causal_loss = torch.tensor(0.0)
-        if dual:
-            if kg_batch_fn == "slotted":
-                c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx = \
-                    kg_dataset.get_slot_causal_batch_slotted(config.batch_size, config.device)
-                _, kg_causal_loss = model.forward_kg_causal(
-                    c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx)
-            elif kg_batch_fn == "native":
-                c_tokens, c_targets, c_hlens, c_rels, c_neg, c_ctx = \
-                    kg_dataset.get_slot_causal_batch_native(config.batch_size, config.device)
-                _, kg_causal_loss = model.forward_kg_causal(
-                    c_tokens, c_targets, c_hlens, c_rels, c_neg, c_ctx)
-            elif kg_batch_fn == "flat":
-                c_tokens, c_targets, c_rels, c_ctx = \
-                    kg_dataset.get_slot_causal_batch_flat(config.batch_size, config.device)
-                _, kg_causal_loss = model.forward_kg_causal(
-                    c_tokens, c_targets, c_ctx)
-            elif kg_batch_fn == "native_slots":
-                c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx = \
-                    kg_dataset.get_slot_causal_batch_native_slots(config.batch_size, config.device)
-                _, kg_causal_loss = model.forward_kg_causal(
-                    c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx)
-
-        # Combined loss
+    # Build the pool of objectives for random selection
+    if dual:
         if kg_only:
-            loss = kg_loss
-            text_loss = torch.tensor(0.0)
-            if dual:
-                loss = loss + kg_causal_loss
+            objectives = ["kg_mlm", "kg_causal"]
         else:
-            loss = text_loss + kg_loss
-            if dual:
-                loss = loss + text_mlm_loss + kg_causal_loss
+            objectives = ["text_causal", "text_mlm", "kg_mlm", "kg_causal"]
+
+    for it in tqdm(range(config.max_iters), desc=f"Model {name}"):
+        text_loss = torch.tensor(0.0)
+        text_mlm_loss = torch.tensor(0.0)
+        kg_loss = torch.tensor(0.0)
+        kg_causal_loss = torch.tensor(0.0)
+
+        if dual:
+            obj = random.choice(objectives)
+        else:
+            obj = None  # non-dual: always do text_causal + kg_mlm
+
+        if not dual:
+            # --- Original behavior: text causal + KG MLM ---
+            if not kg_only:
+                x, y = text_dataset.get_batch(config.batch_size, config.device)
+                if hasattr(model, 'forward_text'):
+                    _, text_loss = model.forward_text(x, y)
+                else:
+                    _, text_loss = model(x, y)
+
+            if kg_batch_fn == "slotted":
+                tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+            elif kg_batch_fn == "native" and causal_kg:
+                ct, tgt, hl, rn, neg = kg_dataset.get_causal_batch_native(config.batch_size, config.device)
+                _, kg_loss = model.forward_kg_causal(ct, tgt, hl, rn, neg)
+            elif kg_batch_fn == "native":
+                ct, tgt, hl, rn, neg = kg_dataset.get_mlm_batch_native(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(ct, tgt, hl, rn, neg)
+            elif kg_batch_fn == "native_slots":
+                ct, tgt, hl, rn = kg_dataset.get_mlm_batch_native_slots(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(ct, tgt, hl, rn)
+            elif kg_batch_fn == "flat":
+                tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(tokens, targets)
+
+            if kg_only:
+                loss = kg_loss
+            else:
+                loss = text_loss + kg_loss
+
+        else:
+            # --- Dual: randomly picked single objective ---
+            if obj == "text_causal":
+                x, y = text_dataset.get_batch(config.batch_size, config.device)
+                if hasattr(model, 'forward_text'):
+                    _, text_loss = model.forward_text(x, y)
+                else:
+                    _, text_loss = model(x, y)
+                loss = text_loss
+
+            elif obj == "text_mlm":
+                mlm_tokens, mlm_targets = text_dataset.get_mlm_batch(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, text_mlm_loss = model.forward_text_mlm(mlm_tokens, mlm_targets)
+                loss = text_mlm_loss
+
+            elif obj == "kg_mlm":
+                if kg_batch_fn == "slotted":
+                    tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+                elif kg_batch_fn == "native" and causal_kg:
+                    ct, tgt, hl, rn, neg = kg_dataset.get_causal_batch_native(config.batch_size, config.device)
+                    _, kg_loss = model.forward_kg_causal(ct, tgt, hl, rn, neg)
+                elif kg_batch_fn == "native":
+                    ct, tgt, hl, rn, neg = kg_dataset.get_mlm_batch_native(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(ct, tgt, hl, rn, neg)
+                elif kg_batch_fn == "native_slots":
+                    ct, tgt, hl, rn = kg_dataset.get_mlm_batch_native_slots(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(ct, tgt, hl, rn)
+                elif kg_batch_fn == "flat":
+                    tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(tokens, targets)
+                loss = kg_loss
+
+            elif obj == "kg_causal":
+                if kg_batch_fn == "slotted":
+                    c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_slotted(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx)
+                elif kg_batch_fn == "native":
+                    c_tokens, c_targets, c_hlens, c_rels, c_neg, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_native(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_hlens, c_rels, c_neg, c_ctx)
+                elif kg_batch_fn == "flat":
+                    c_tokens, c_targets, c_rels, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_flat(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_ctx)
+                elif kg_batch_fn == "native_slots":
+                    c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_native_slots(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx)
+                loss = kg_causal_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -3384,7 +3433,7 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
             if dual:
                 losses_log["text_mlm"].append(text_mlm_loss.item())
                 losses_log["kg_causal"].append(kg_causal_loss.item())
-                print(f"  [{name}] iter {it}, text_causal: {text_loss.item():.4f}, "
+                print(f"  [{name}] iter {it} [{obj}], text_causal: {text_loss.item():.4f}, "
                       f"text_mlm: {text_mlm_loss.item():.4f}, "
                       f"kg_mlm: {kg_loss.item():.4f}, "
                       f"kg_causal: {kg_causal_loss.item():.4f}")
