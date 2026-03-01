@@ -60,6 +60,7 @@ class Config:
     n_seeds = 3
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mlm_mask_prob = 0.15  # MLM masking probability
+    use_softmax = False   # Use softmax attention instead of log(exp(x)+1)
 
 cfg = Config()
 
@@ -404,6 +405,37 @@ KG_RELATIONS = [
     "brother_of", "capital_of", "lives_in", "lives_in_country"
 ]
 
+KG_RELATIONS_INVERSE = {
+    "son_of": "inverse_son_of",
+    "father_of": "inverse_father_of",
+    "grandson_of": "inverse_grandson_of",
+    "grandfather_of": "inverse_grandfather_of",
+    "brother_of": "inverse_brother_of",
+    "capital_of": "inverse_capital_of",
+    "lives_in": "inverse_lives_in",
+    "lives_in_country": "inverse_lives_in_country",
+}
+
+
+def linearize_kg_triples(triples):
+    """Convert KG triples to linearized text strings with relation tokens.
+
+    For each (head, rel, tail), produces two strings:
+      Forward:  "Adam <son_of> Brian"
+      Inverse:  "Brian <inverse_son_of> Adam"
+
+    The relation token (e.g. <son_of>) is encoded as a single token by the vocab.
+    Returns list of strings.
+    """
+    sentences = []
+    for head, rel, tail in triples:
+        fwd = f"{head} <{rel}> {tail}"
+        inv_rel = KG_RELATIONS_INVERSE[rel]
+        inv = f"{tail} <{inv_rel}> {head}"
+        sentences.append(fwd)
+        sentences.append(inv)
+    return sentences
+
 
 class Vocabulary:
     """Character-level vocabulary with special tokens."""
@@ -422,6 +454,9 @@ class Vocabulary:
         self.kg_relations = {}
         for rel in KG_RELATIONS:
             self.kg_relations[rel] = self._add(f"<{rel}>")
+        # Inverse relation tokens (used by kg_as_text linearization)
+        for inv_rel in KG_RELATIONS_INVERSE.values():
+            self.kg_relations[inv_rel] = self._add(f"<{inv_rel}>")
 
     def _add(self, token):
         if token not in self.char2idx:
@@ -437,7 +472,18 @@ class Vocabulary:
                 self._add(ch)
 
     def encode_sentence(self, sentence):
-        return [self.char2idx[ch] for ch in sentence]
+        tokens = []
+        i = 0
+        while i < len(sentence):
+            if sentence[i] == '<':
+                j = sentence.index('>', i)
+                token_str = sentence[i:j+1]
+                tokens.append(self.char2idx[token_str])
+                i = j + 1
+            else:
+                tokens.append(self.char2idx[sentence[i]])
+                i += 1
+        return tokens
 
     def encode_kg_triple(self, head, rel, tail):
         head_tokens = [self.char2idx[ch] for ch in head]
@@ -739,7 +785,7 @@ class FeedForward(nn.Module):
 class RotaryAttention(nn.Module):
     """Attention with external angles. Supports both commutative and operator-based modes."""
 
-    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
@@ -748,6 +794,7 @@ class RotaryAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
         self.rotate_v = rotate_v
+        self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x, angles, causal=True, pad_mask=None):
@@ -780,7 +827,10 @@ class RotaryAttention(nn.Module):
             pad_mask_k = pad_mask.unsqueeze(1)  # (B, 1, T)
             wei = wei.masked_fill(~pad_mask_k, float('-inf'))
 
-        wei = torch.log(torch.exp(wei) + 1)
+        if self.use_softmax:
+            wei = F.softmax(wei, dim=-1)
+        else:
+            wei = torch.log(torch.exp(wei) + 1)
         wei = self.dropout(wei)
         out = wei @ v
 
@@ -793,9 +843,9 @@ class RotaryAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
-        self.sa_head = RotaryAttention(n_embed, block_size, dropout, rotate_v)
+        self.sa_head = RotaryAttention(n_embed, block_size, dropout, rotate_v, use_softmax)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -821,7 +871,7 @@ class ModelA(nn.Module):
     rotate_v=True  -> Model A' (operator-based)
     """
 
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.block_size = block_size
@@ -837,7 +887,7 @@ class ModelA(nn.Module):
             1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
 
@@ -946,7 +996,7 @@ class ModelB(nn.Module):
     rotate_v=True  -> Model B' (operator-based, rotate Q,K,V + inverse on output)
     """
 
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
@@ -955,7 +1005,7 @@ class ModelB(nn.Module):
             1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -1000,13 +1050,13 @@ class ModelC(nn.Module):
     rotate_v=True  -> Model C' (operator-based, rotate Q,K,V + inverse on output)
     """
 
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embed // 2)
         self.angle_embedding = nn.Embedding(vocab_size, n_embed // 2)
         self.expander = nn.Linear(n_embed // 2, n_embed)
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -1058,14 +1108,14 @@ class ModelD(nn.Module):
     rotate_v=True  -> Model D' (operator-based)
     """
 
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed // 2)
         self.angle_embedding = nn.Embedding(vocab_size, n_embed // 2)
         self.expander = nn.Linear(n_embed // 2, n_embed)
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -1142,7 +1192,7 @@ class ModelF(nn.Module):
     rotate_v=True  -> Model F' (operator-based, rotate Q,K,V + inverse on output)
     """
 
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
@@ -1151,7 +1201,7 @@ class ModelF(nn.Module):
             1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -1228,7 +1278,7 @@ class ModelE(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
-                 dropout=0.2, rotate_v=False):
+                 dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed // 2)
@@ -1239,7 +1289,7 @@ class ModelE(nn.Module):
         self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -1418,7 +1468,7 @@ class ModelG(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
-                 dropout=0.2, rotate_v=False):
+                 dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.block_size = block_size
@@ -1435,7 +1485,7 @@ class ModelG(nn.Module):
             1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
 
@@ -1549,7 +1599,7 @@ class ModelH(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
-                 dropout=0.2, rotate_v=False):
+                 dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
@@ -1562,7 +1612,7 @@ class ModelH(nn.Module):
         self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v)
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
             for _ in range(n_layers)
         ])
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -1578,7 +1628,7 @@ class ModelH(nn.Module):
         angles = torch.flip(angles, dims=(0,))
         return angles.unsqueeze(0).expand(B, -1, -1)
 
-    def _cumsum_angles_kg(self, T, head_lens, rel_names, device):
+    def _cumsum_angles_kg(self, T, head_lens, rel_names, device, negate_angles=None):
         """Cumsum angles for KG with relation angle inserted between head and tail.
 
         Same structure as ModelE._cumsum_angles_kg but uses fixed base_freq instead
@@ -1587,6 +1637,10 @@ class ModelH(nn.Module):
         Cumsum entries: [freq, freq, ..., rel_angle, freq, freq, ...]
         The relation angle is inserted at position h_len between HEAD and TAIL.
         After cumsum, we drop the relation entry to get T angles for the char tokens.
+
+        Args:
+            negate_angles: optional list of bool. If True for sample i,
+                           negate the relation angle (for inverse direction).
         """
         B = len(head_lens)
 
@@ -1600,9 +1654,12 @@ class ModelH(nn.Module):
             # Head positions: base_freq repeated h_len times
             ext_angles[i, :h_len] = self.base_freq.unsqueeze(0).expand(h_len, -1)
 
-            # Relation angle: position h_len
+            # Relation angle: position h_len (negated if inverse direction)
             rel_idx = self.rel_to_idx[rel_names[i]]
-            ext_angles[i, h_len] = self.relation_angles[rel_idx]
+            rel_angle = self.relation_angles[rel_idx]
+            if negate_angles is not None and negate_angles[i]:
+                rel_angle = -rel_angle
+            ext_angles[i, h_len] = rel_angle
 
             # Tail positions: base_freq repeated t_len times
             t_len = T - h_len
@@ -1644,7 +1701,7 @@ class ModelH(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
-    def forward_kg(self, char_tokens, targets, head_lens, rel_names):
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
         """KG mode: bidirectional on char tokens only, MLM.
         Relation angle is only in the cumsum, not in the attention sequence.
 
@@ -1653,15 +1710,244 @@ class ModelH(nn.Module):
             targets: (B, T) original tokens, -100 for non-masked
             head_lens: list of head lengths
             rel_names: list of relation strings
+            negate_angles: optional list of bool, True to negate relation angle
         """
         B, T = char_tokens.shape
         pad_mask = (char_tokens != 0)  # PAD = 0
 
         x = self.token_embedding(char_tokens)
-        angles = self._cumsum_angles_kg(T, head_lens, rel_names, char_tokens.device)
+        angles = self._cumsum_angles_kg(T, head_lens, rel_names, char_tokens.device,
+                                        negate_angles=negate_angles)
 
         for block in self.blocks:
             x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
+        """KG mode with causal masking and next-token prediction.
+        Randomly flipped direction is handled by the batch function;
+        negate_angles tells us to negate the relation angle for flipped triples.
+
+        Args:
+            char_tokens: (B, T) character tokens (head + tail)
+            targets: (B, T) next-token targets, -100 for padding
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            negate_angles: list of bool, True if relation angle should be negated
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+
+        x = self.token_embedding(char_tokens)
+        angles = self._cumsum_angles_kg(T, head_lens, rel_names, char_tokens.device,
+                                        negate_angles=negate_angles)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def predict_text(self, idx):
+        logits, _ = self.forward_text(idx)
+        return logits
+
+
+# ============================================================================
+# Model I/I': Per-Layer Angle Computation, Native KG
+# ============================================================================
+
+class ModelI(nn.Module):
+    """Journey transformer with per-layer angle computation. Like Model E, but
+    each layer extracts its own angles from the residual stream via a learned
+    projection, so deeper layers can learn different geometric structures.
+
+    Architecture:
+        x = token_embedding(idx)               -> (B,T,C)
+        for each layer l:
+            raw_angles = angle_projectors[l](x) -> (B,T,C//2)
+            angles = cumsum(raw_angles)
+            x = block(x, angles)                -> (B,T,C)
+
+    Key difference from E: angles are recomputed at each layer from the full
+    residual stream via a learned linear projection (C -> C//2), rather than
+    computed once from a separate angle embedding. This lets the model learn
+    depth-dependent angle strategies while keeping the residual stream intact.
+
+    Text: causal mask, next-token prediction.
+    KG: bidirectional attention on character tokens only, MLM.
+        Cumsum includes relation angle between head and tail chars.
+
+    rotate_v=False -> Model I (commutative)
+    rotate_v=True  -> Model I' (operator-based)
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
+                 dropout=0.2, rotate_v=False, use_softmax=False):
+        super().__init__()
+        self.n_embed = n_embed
+        self.token_embedding = nn.Embedding(vocab_size, n_embed)
+
+        # Per-layer angle projectors: 2-layer MLP to extract angles from residual stream
+        self.angle_projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_embed, n_embed),
+                nn.GELU(),
+                nn.Linear(n_embed, n_embed // 2),
+            )
+            for _ in range(n_layers)
+        ])
+
+        # Learned angle vectors for each relation type (shared across layers)
+        self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
+            for _ in range(n_layers)
+        ])
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+
+        # Mapping from relation name to index
+        self.rel_to_idx = {rel: i for i, rel in enumerate(KG_RELATIONS)}
+
+    def _cumsum_angles_text(self, raw_angles):
+        """Right-cumsum angles for text from raw angle tensor."""
+        angles = torch.flip(raw_angles, dims=(1,))
+        angles = torch.cumsum(angles, dim=1)
+        angles = torch.flip(angles, dims=(1,))
+        return angles
+
+    def _cumsum_angles_kg(self, raw_angles, head_lens, rel_names, device,
+                          negate_angles=None):
+        """Cumsum angles for KG with relation angle inserted between head and tail.
+
+        Same logic as ModelE._cumsum_angles_kg but takes a raw angle tensor
+        instead of char_tokens (no embedding lookup).
+
+        Args:
+            raw_angles: (B, T, C//2) raw angle values from the angle projector
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            device: torch device
+            negate_angles: optional list of bool. If True for sample i,
+                           negate the relation angle (for inverse direction).
+        """
+        B, T, D = raw_angles.shape
+
+        # Build extended angle sequence with relation angle inserted
+        # Extended length = T + 1 (one extra for relation)
+        ext_angles = torch.zeros(B, T + 1, D, device=device)
+
+        for i in range(B):
+            h_len = head_lens[i]
+            rel_idx = self.rel_to_idx[rel_names[i]]
+
+            # Head char angles: positions 0..h_len-1
+            ext_angles[i, :h_len] = raw_angles[i, :h_len]
+
+            # Relation angle: position h_len (negated if inverse direction)
+            rel_angle = self.relation_angles[rel_idx]
+            if negate_angles is not None and negate_angles[i]:
+                rel_angle = -rel_angle
+            ext_angles[i, h_len] = rel_angle
+
+            # Tail char angles: positions h_len+1..
+            t_len = T - h_len
+            ext_angles[i, h_len + 1:h_len + 1 + t_len] = raw_angles[i, h_len:h_len + t_len]
+
+        # Right-cumsum on extended sequence
+        ext_cumsum = torch.flip(ext_angles, dims=(1,))
+        ext_cumsum = torch.cumsum(ext_cumsum, dim=1)
+        ext_cumsum = torch.flip(ext_cumsum, dims=(1,))
+
+        # Extract angles for actual char positions (skip the relation position)
+        angles = torch.zeros(B, T, D, device=device)
+        for i in range(B):
+            h_len = head_lens[i]
+            t_len = T - h_len
+            # Head positions
+            angles[i, :h_len] = ext_cumsum[i, :h_len]
+            # Tail positions (skip the relation entry at index h_len)
+            angles[i, h_len:h_len + t_len] = ext_cumsum[i, h_len + 1:h_len + 1 + t_len]
+
+        return angles
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: causal, next-token prediction."""
+        B, T = idx.shape
+        pad_mask = (idx != 0)
+        x = self.token_embedding(idx)
+
+        for l, block in enumerate(self.blocks):
+            raw_angles = self.angle_projectors[l](x)
+            angles = self._cumsum_angles_text(raw_angles)
+            x = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        if targets is None:
+            return logits, None
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
+        """KG mode: bidirectional on char tokens only, MLM.
+        Relation angle is only in the cumsum, not in the attention sequence.
+
+        Args:
+            char_tokens: (B, T) character tokens (head + tail, no relation token), MLM masked
+            targets: (B, T) original tokens, -100 for non-masked
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            negate_angles: optional list of bool, True to negate relation angle
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)  # PAD = 0
+        x = self.token_embedding(char_tokens)
+
+        for l, block in enumerate(self.blocks):
+            raw_angles = self.angle_projectors[l](x)
+            angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
+                                            char_tokens.device, negate_angles=negate_angles)
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
+        """KG mode with causal masking and next-token prediction.
+        Randomly flipped direction is handled by the batch function;
+        negate_angles tells us to negate the relation angle for flipped triples.
+
+        Args:
+            char_tokens: (B, T) character tokens (head + tail)
+            targets: (B, T) next-token targets, -100 for padding
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            negate_angles: list of bool, True if relation angle should be negated
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+        x = self.token_embedding(char_tokens)
+
+        for l, block in enumerate(self.blocks):
+            raw_angles = self.angle_projectors[l](x)
+            angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
+                                            char_tokens.device, negate_angles=negate_angles)
+            x = block(x, angles, causal=True, pad_mask=pad_mask)
 
         logits = self.lm_head(x)
 
@@ -1678,12 +1964,12 @@ class ModelH(nn.Module):
 # Data Preparation
 # ============================================================================
 
-def prepare_data(generous_linearization=True, expanded_names=False, one_to_one=False, inverse_kg=False):
+def prepare_data(generous_linearization=True, expanded_names=False, one_to_one=False, inverse_kg=False, kg_as_text=False):
     """Prepare train data for all models.
 
     Returns:
         vocab, text_dataset_base (for A/D/E), text_dataset_linearized (for B/C),
-        kg_dataset, eval_prompts
+        kg_dataset, eval_prompts, kg_eval_prompts[, linearized_eval_prompts]
     """
     (teaching, transfer, generalization,
      kg_excl_mem, kg_excl_gen,
@@ -1722,9 +2008,14 @@ def prepare_data(generous_linearization=True, expanded_names=False, one_to_one=F
     extra_derived_only = [s for s in extra_transfer_text if s not in base_transfer]
     linearized_extra_text = extra_derived_only
 
+    # ---- Linearized KG sentences (for kg_as_text mode) ----
+    linearized_kg_sentences = []
+    if kg_as_text:
+        linearized_kg_sentences = linearize_kg_triples(all_kg_triples)
+
     # ---- Build vocabulary ----
     vocab = Vocabulary()
-    all_sentences = base_text + linearized_extra_text
+    all_sentences = base_text + linearized_extra_text + linearized_kg_sentences
     vocab.build_from_sentences(all_sentences)
 
     # Add chars from KG entities (including KG-exclusive names)
@@ -1733,7 +2024,11 @@ def prepare_data(generous_linearization=True, expanded_names=False, one_to_one=F
 
     # ---- Build datasets ----
     text_dataset_base = TextDataset(base_text, vocab, cfg.block_size)
-    text_linearized = base_text + linearized_extra_text
+    if kg_as_text:
+        # B/C models see: base text + extra linearized + linearized KG (incl. KG-exclusive)
+        text_linearized = base_text + linearized_extra_text + linearized_kg_sentences
+    else:
+        text_linearized = base_text + linearized_extra_text
     text_dataset_linearized = TextDataset(text_linearized, vocab, cfg.block_size)
     kg_dataset = KGDataset(all_kg_triples, vocab, cfg.device, inverse_kg=inverse_kg)
 
@@ -1749,8 +2044,16 @@ def prepare_data(generous_linearization=True, expanded_names=False, one_to_one=F
         kg_excl_mem, kg_excl_gen,
         text_excl_mem, text_excl_gen)
 
+    # ---- Build linearized KG eval prompts (for kg_as_text mode) ----
+    linearized_eval_prompts = None
+    if kg_as_text:
+        linearized_eval_prompts = build_linearized_eval_prompts(
+            teaching, transfer, generalization,
+            kg_excl_mem, kg_excl_gen,
+            text_excl_mem, text_excl_gen, vocab)
+
     return (vocab, text_dataset_base, text_dataset_linearized, kg_dataset,
-            eval_prompts, kg_eval_prompts)
+            eval_prompts, kg_eval_prompts, linearized_eval_prompts)
 
 
 def build_eval_prompts(teaching, transfer, generalization,
@@ -1844,6 +2147,54 @@ def build_kg_eval_prompts(teaching, transfer, generalization,
     return prompts
 
 
+def build_linearized_eval_prompts(teaching, transfer, generalization,
+                                   kg_excl_mem, kg_excl_gen,
+                                   text_excl_mem, text_excl_gen, vocab):
+    """Build eval prompts for linearized KG-as-text evaluation.
+
+    For each chain (son, father, grandfather), creates 12 prompts using
+    forward and inverse relation tokens.  Evaluated as causal text:
+    given "Adam <son_of> ", predict "Brian".
+    """
+    prompts = []
+
+    def add_linearized_prompts(chains, tier):
+        for son, father, grandfather in chains:
+            # son_of: son -> father
+            prompts.append({"tier": tier, "prompt": f"{son} <son_of> ", "target": father, "relation": "son_of"})
+            prompts.append({"tier": tier, "prompt": f"{father} <inverse_son_of> ", "target": son, "relation": "inverse_son_of"})
+            # father_of: father -> son
+            prompts.append({"tier": tier, "prompt": f"{father} <father_of> ", "target": son, "relation": "father_of"})
+            prompts.append({"tier": tier, "prompt": f"{son} <inverse_father_of> ", "target": father, "relation": "inverse_father_of"})
+            # son_of: father -> grandfather
+            prompts.append({"tier": tier, "prompt": f"{father} <son_of> ", "target": grandfather, "relation": "son_of"})
+            prompts.append({"tier": tier, "prompt": f"{grandfather} <inverse_son_of> ", "target": father, "relation": "inverse_son_of"})
+            # father_of: grandfather -> father
+            prompts.append({"tier": tier, "prompt": f"{grandfather} <father_of> ", "target": father, "relation": "father_of"})
+            prompts.append({"tier": tier, "prompt": f"{father} <inverse_father_of> ", "target": grandfather, "relation": "inverse_father_of"})
+            # grandson_of: son -> grandfather
+            prompts.append({"tier": tier, "prompt": f"{son} <grandson_of> ", "target": grandfather, "relation": "grandson_of"})
+            prompts.append({"tier": tier, "prompt": f"{grandfather} <inverse_grandson_of> ", "target": son, "relation": "inverse_grandson_of"})
+            # grandfather_of: grandfather -> son
+            prompts.append({"tier": tier, "prompt": f"{grandfather} <grandfather_of> ", "target": son, "relation": "grandfather_of"})
+            prompts.append({"tier": tier, "prompt": f"{son} <inverse_grandfather_of> ", "target": grandfather, "relation": "inverse_grandfather_of"})
+
+    add_linearized_prompts(teaching, "memorization")
+    add_linearized_prompts(transfer, "transfer")
+    add_linearized_prompts(generalization, "generalization")
+    add_linearized_prompts(kg_excl_mem, "kg_exclusive_memorization")
+    add_linearized_prompts(kg_excl_gen, "kg_exclusive_generalization")
+    add_linearized_prompts(text_excl_mem, "text_exclusive_memorization")
+    add_linearized_prompts(text_excl_gen, "text_exclusive_generalization")
+
+    # Tokenize prompts and targets
+    for p in prompts:
+        p["prompt_tokens"] = vocab.encode_sentence(p["prompt"])
+        p["target_tokens"] = [vocab.char2idx.get(ch, vocab.PAD) for ch in p["target"]]
+
+    return prompts
+
+
 def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", model_type="A"):
     """Evaluate a KG model (A/D/E) on KG completion: given head+relation, predict tail.
 
@@ -1898,7 +2249,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
     with torch.no_grad():
         for (head_len, tail_len), prompt_indices in groups.items():
             # Determine sequence length for this group
-            if model_type in ("E", "H"):
+            if model_type in ("E", "H", "I"):
                 seq_len = head_len + tail_len
             else:
                 seq_len = head_len + 1 + tail_len  # +1 for relation token
@@ -1917,7 +2268,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
 
                     for bi, pi in enumerate(sb_indices):
                         ep = encoded_prompts[pi]
-                        if model_type in ("E", "H"):
+                        if model_type in ("E", "H", "I"):
                             seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
                             mask_pos = head_len + t_idx
                         else:
@@ -1937,7 +2288,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                     logits = _forward_kg_eval(model, tokens, targets, head_lens_list, rel_names_list, model_type)
 
                     # Extract results per prompt
-                    mask_pos = head_len + t_idx if model_type in ("E", "H") else head_len + 1 + t_idx
+                    mask_pos = head_len + t_idx if model_type in ("E", "H", "I") else head_len + 1 + t_idx
                     for bi, pi in enumerate(sb_indices):
                         ep = encoded_prompts[pi]
                         step_logits = logits[bi, mask_pos, :]
@@ -1965,7 +2316,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
 
                 for bi, pi in enumerate(sb_indices):
                     ep = encoded_prompts[pi]
-                    if model_type in ("E", "H"):
+                    if model_type in ("E", "H", "I"):
                         seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
                         for ti in range(tail_len):
                             pos = head_len + ti
@@ -1991,7 +2342,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                 for bi, pi in enumerate(sb_indices):
                     ep = encoded_prompts[pi]
                     for ti in range(tail_len):
-                        mask_pos = head_len + ti if model_type in ("E", "H") else head_len + 1 + ti
+                        mask_pos = head_len + ti if model_type in ("E", "H", "I") else head_len + 1 + ti
                         pred = torch.argmax(logits[bi, mask_pos, :]).item()
                         if pred != ep["tail_tokens"][ti]:
                             hit1s[pi] = 0
@@ -2154,13 +2505,32 @@ def evaluate_model_kg_causal(model, kg_eval_prompts, vocab, config, model_name="
 
                 # Forward pass with causal masking
                 pad_mask = (seq_t != 0)
-                x = model.expander(model.token_embedding(seq_t))
-                angles = model._cumsum_angles_kg(
-                    seq_t, ctx_lens, rel_names_list, config.device,
-                    negate_angles=negate_list)
+                model_type = model_name.replace("'", "")
 
-                for block in model.blocks:
-                    x = block(x, angles, causal=True, pad_mask=pad_mask)
+                if model_type == "I":
+                    # ModelI: per-layer angle projection from residual stream
+                    x = model.token_embedding(seq_t)
+                    for l, block in enumerate(model.blocks):
+                        raw_angles = model.angle_projectors[l](x)
+                        angles = model._cumsum_angles_kg(
+                            raw_angles, ctx_lens, rel_names_list, config.device,
+                            negate_angles=negate_list)
+                        x = block(x, angles, causal=True, pad_mask=pad_mask)
+                else:
+                    x = model.token_embedding(seq_t)
+                    if hasattr(model, 'expander'):
+                        x = model.expander(x)
+                    if model_type == "H":
+                        angles = model._cumsum_angles_kg(
+                            seq_t.shape[1], ctx_lens, rel_names_list, config.device,
+                            negate_angles=negate_list)
+                    else:
+                        angles = model._cumsum_angles_kg(
+                            seq_t, ctx_lens, rel_names_list, config.device,
+                            negate_angles=negate_list)
+
+                    for block in model.blocks:
+                        x = block(x, angles, causal=True, pad_mask=pad_mask)
 
                 logits = model.lm_head(x)
 
@@ -2276,8 +2646,8 @@ def _build_kg_eval_batch(head_tokens, rel_name, tail_tokens, mask_positions,
     head_len = len(head_tokens)
     tail_len = len(tail_tokens)
 
-    if model_type == "E":
-        # Model E: char_tokens = head + tail (no relation token in sequence)
+    if model_type in ("E", "I"):
+        # Model E/I: char_tokens = head + tail (no relation token in sequence)
         seq = list(head_tokens) + list(tail_tokens)
         seq_len = len(seq)
         tokens = torch.full((1, seq_len), vocab.PAD, dtype=torch.long)
@@ -2318,7 +2688,7 @@ def _forward_kg_eval(model, tokens, targets, head_lens, rel_names, model_type):
         logits, _ = model.forward_kg(tokens, targets, head_lens, rel_names)
     elif model_type in ("D", "F"):
         logits, _ = model.forward_kg(tokens, targets)
-    elif model_type in ("E", "H"):
+    elif model_type in ("E", "H", "I"):
         logits, _ = model.forward_kg(tokens, targets, head_lens, rel_names)
     return logits
 
@@ -2623,12 +2993,12 @@ def evaluate_model(model, eval_prompts, vocab, config, model_name="?"):
 # Model Factory
 # ============================================================================
 
-MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'", "F", "F'", "G", "G'", "H", "H'"]
+MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'", "F", "F'", "G", "G'", "H", "H'", "I", "I'"]
 
 # Which models use linearized text (B/C family) vs structured KG (A/D/E family)
 LINEARIZED_MODELS = {"B", "B'", "C", "C'"}
 SLOTTED_KG_MODELS = {"A", "A'", "G", "G'"}    # use get_mlm_batch_slotted (3 slots: HEAD/REL/TAIL)
-NATIVE_KG_MODELS = {"E", "E'", "H", "H'"}     # use get_mlm_batch_native (rel as angle operator only)
+NATIVE_KG_MODELS = {"E", "E'", "H", "H'", "I", "I'"}  # use get_mlm_batch_native (rel as angle operator only)
 FLAT_KG_MODELS = {"D", "D'", "F", "F'"}       # use get_mlm_batch_flat (rel as token)
 
 
@@ -2638,39 +3008,44 @@ def create_model(name, vocab_size, config):
     n_l = config.n_layers
     bs = config.block_size
     d = config.dropout
+    sm = config.use_softmax
 
     if name == "A":
-        return ModelA(vocab_size, n_e, n_l, bs, d, rotate_v=False)
+        return ModelA(vocab_size, n_e, n_l, bs, d, rotate_v=False, use_softmax=sm)
     elif name == "A'":
-        return ModelA(vocab_size, n_e, n_l, bs, d, rotate_v=True)
+        return ModelA(vocab_size, n_e, n_l, bs, d, rotate_v=True, use_softmax=sm)
     elif name == "B":
-        return ModelB(vocab_size, n_e, n_l, bs, d, rotate_v=False)
+        return ModelB(vocab_size, n_e, n_l, bs, d, rotate_v=False, use_softmax=sm)
     elif name == "B'":
-        return ModelB(vocab_size, n_e, n_l, bs, d, rotate_v=True)
+        return ModelB(vocab_size, n_e, n_l, bs, d, rotate_v=True, use_softmax=sm)
     elif name == "C":
-        return ModelC(vocab_size, n_e, n_l, bs, d, rotate_v=False)
+        return ModelC(vocab_size, n_e, n_l, bs, d, rotate_v=False, use_softmax=sm)
     elif name == "C'":
-        return ModelC(vocab_size, n_e, n_l, bs, d, rotate_v=True)
+        return ModelC(vocab_size, n_e, n_l, bs, d, rotate_v=True, use_softmax=sm)
     elif name == "D":
-        return ModelD(vocab_size, n_e, n_l, bs, d, rotate_v=False)
+        return ModelD(vocab_size, n_e, n_l, bs, d, rotate_v=False, use_softmax=sm)
     elif name == "D'":
-        return ModelD(vocab_size, n_e, n_l, bs, d, rotate_v=True)
+        return ModelD(vocab_size, n_e, n_l, bs, d, rotate_v=True, use_softmax=sm)
     elif name == "E":
-        return ModelE(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False)
+        return ModelE(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
     elif name == "E'":
-        return ModelE(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True)
+        return ModelE(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
     elif name == "F":
-        return ModelF(vocab_size, n_e, n_l, bs, d, rotate_v=False)
+        return ModelF(vocab_size, n_e, n_l, bs, d, rotate_v=False, use_softmax=sm)
     elif name == "F'":
-        return ModelF(vocab_size, n_e, n_l, bs, d, rotate_v=True)
+        return ModelF(vocab_size, n_e, n_l, bs, d, rotate_v=True, use_softmax=sm)
     elif name == "G":
-        return ModelG(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False)
+        return ModelG(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
     elif name == "G'":
-        return ModelG(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True)
+        return ModelG(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
     elif name == "H":
-        return ModelH(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False)
+        return ModelH(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
     elif name == "H'":
-        return ModelH(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True)
+        return ModelH(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
+    elif name == "I":
+        return ModelI(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
+    elif name == "I'":
+        return ModelI(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
     else:
         raise ValueError(f"Unknown model name: {name}")
 
@@ -2687,7 +3062,7 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
                    checkpoint_dir=None, load_checkpoints=False,
                    resume_training=False, expanded_names=False,
                    one_to_one=False, kg_only=False, causal_kg=False,
-                   inverse_kg=False):
+                   inverse_kg=False, kg_as_text=False):
     """Run one sub-experiment (7a or 7b) with a given seed.
 
     Args:
@@ -2696,6 +3071,7 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
         models_to_run: list of model names to run, or None for all
         checkpoint_dir: directory to save/load model checkpoints
         load_checkpoints: if True, load saved models instead of training
+        kg_as_text: if True, convert KG triples to linearized text for B/C models
     """
     if models_to_run is None:
         models_to_run = MODEL_NAMES
@@ -2711,18 +3087,24 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
     np.random.seed(seed)
 
     (vocab, text_base, text_linearized, kg_dataset,
-     eval_prompts, kg_eval_prompts) = prepare_data(generous_linearization, expanded_names=expanded_names, one_to_one=one_to_one, inverse_kg=inverse_kg)
+     eval_prompts, kg_eval_prompts, linearized_eval_prompts) = prepare_data(
+        generous_linearization, expanded_names=expanded_names,
+        one_to_one=one_to_one, inverse_kg=inverse_kg, kg_as_text=kg_as_text)
     print(f"Vocabulary size: {vocab.size}")
     print(f"Text dataset (base): {len(text_base.data)} tokens")
     print(f"Text dataset (linearized): {len(text_linearized.data)} tokens")
     print(f"KG triples: {len(kg_dataset.triples)}")
     print(f"Eval prompts (text): {len(eval_prompts)}")
     print(f"Eval prompts (KG): {len(kg_eval_prompts)}")
+    if linearized_eval_prompts:
+        print(f"Eval prompts (linearized KG): {len(linearized_eval_prompts)}")
 
     results = {}
     relation_results = {}
     kg_results = {}
     kg_relation_results = {}
+    linearized_results = {}
+    linearized_relation_results = {}
 
     # Create checkpoint dir if needed
     if checkpoint_dir:
@@ -2816,10 +3198,17 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
         results[name] = summary
         relation_results[name] = rel_summary
 
-        # KG evaluation for A/D/E models
+        # Linearized KG eval (kg_as_text mode): run as text eval on linearized prompts
+        if kg_as_text and linearized_eval_prompts and name in LINEARIZED_MODELS:
+            lin_summary, lin_rel_summary, _ = evaluate_model(
+                model, linearized_eval_prompts, vocab, cfg, name)
+            linearized_results[name] = lin_summary
+            linearized_relation_results[name] = lin_rel_summary
+
+        # KG evaluation for A/D/E models (skip in kg_as_text mode)
         base_name = name.replace("'", "")
-        if base_name in ("A", "D", "E", "F", "G", "H"):
-            if causal_kg and base_name in ("E", "H"):
+        if not kg_as_text and base_name in ("A", "D", "E", "F", "G", "H", "I"):
+            if causal_kg and base_name in ("E", "H", "I"):
                 kg_summary, kg_rel_summary, _ = evaluate_model_kg_causal(
                     model, kg_eval_prompts, vocab, cfg, model_name=name)
             else:
@@ -2833,7 +3222,8 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    return results, relation_results, kg_results, kg_relation_results
+    return (results, relation_results, kg_results, kg_relation_results,
+            linearized_results, linearized_relation_results)
 
 
 def print_comparison_table(results, exp_name, models):
@@ -2898,7 +3288,7 @@ def print_relation_table(relation_results, exp_name, models):
 
 def print_kg_comparison_table(kg_results, exp_name, models):
     """Print KG evaluation comparison table (A/D/E models only)."""
-    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H")]
+    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
     if not kg_models:
         return
 
@@ -2930,7 +3320,7 @@ def print_kg_comparison_table(kg_results, exp_name, models):
 
 def print_kg_relation_table(kg_relation_results, exp_name, models):
     """Print per-relation KG evaluation table (A/D/E models only)."""
-    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H")]
+    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
     if not kg_models:
         return
 
@@ -2995,12 +3385,18 @@ def main():
                         help="Use causal masking for KG (next-token prediction with random direction flip)")
     parser.add_argument("--inverse_kg", action="store_true",
                         help="Add inverse KG triples (swapped head/tail with negated relation angle)")
+    parser.add_argument("--kg_as_text", action="store_true",
+                        help="Convert KG triples to linearized text with relation tokens for B/C models")
+    parser.add_argument("--softmax", action="store_true",
+                        help="Use softmax attention instead of log(exp(x)+1)")
     args = parser.parse_args()
 
     if args.n_embed is not None:
         cfg.n_embed = args.n_embed
     if args.n_layers is not None:
         cfg.n_layers = args.n_layers
+    if args.softmax:
+        cfg.use_softmax = True
 
     if args.smoke:
         cfg.max_iters = 50
@@ -3026,9 +3422,10 @@ def main():
     print("=" * 70)
     print("  Exp 7: Native KG+Text vs Linearized KG-as-Text")
     print("=" * 70)
+    attn_type = "softmax" if cfg.use_softmax else "log(exp+1)"
     print(f"\nConfig: n_embed={cfg.n_embed}, n_layers={cfg.n_layers}, "
           f"max_iters={cfg.max_iters}, batch_size={cfg.batch_size}, "
-          f"lr={cfg.lr}, device={cfg.device}")
+          f"lr={cfg.lr}, device={cfg.device}, attention={attn_type}")
     print(f"Models: {models}")
 
     experiments = []
@@ -3045,9 +3442,12 @@ def main():
         seed_relation_results = []
         seed_kg_results = []
         seed_kg_relation_results = []
+        seed_linearized_results = []
+        seed_linearized_relation_results = []
 
         for seed in range(cfg.n_seeds):
-            results, rel_results, kg_res, kg_rel_res = run_experiment(
+            (results, rel_results, kg_res, kg_rel_res,
+             lin_res, lin_rel_res) = run_experiment(
                 generous_linearization=generous, seed=seed,
                 models_to_run=models,
                 checkpoint_dir=args.checkpoint_dir,
@@ -3057,11 +3457,14 @@ def main():
                 one_to_one=args.one_to_one,
                 kg_only=args.kg_only,
                 causal_kg=args.causal_kg,
-                inverse_kg=args.inverse_kg)
+                inverse_kg=args.inverse_kg,
+                kg_as_text=args.kg_as_text)
             seed_results.append(results)
             seed_relation_results.append(rel_results)
             seed_kg_results.append(kg_res)
             seed_kg_relation_results.append(kg_rel_res)
+            seed_linearized_results.append(lin_res)
+            seed_linearized_relation_results.append(lin_rel_res)
 
         # Average tier-level text results across seeds
         avg_results = {}
@@ -3105,7 +3508,7 @@ def main():
 
         # Average KG results across seeds (A/D/E models only)
         avg_kg_results = {}
-        kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H")]
+        kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
         for model_name in kg_models:
             avg_kg_results[model_name] = {}
             for tier in ALL_TIERS:
@@ -3144,11 +3547,58 @@ def main():
                             rel_metrics[metric] = np.mean(values)
                     avg_kg_relation_results[model_name][tier][rel] = rel_metrics
 
+        # Average linearized KG results across seeds (kg_as_text mode)
+        avg_linearized_results = {}
+        avg_linearized_relation_results = {}
+        lin_models = [m for m in models if m in LINEARIZED_MODELS]
+        if args.kg_as_text and lin_models:
+            for model_name in lin_models:
+                avg_linearized_results[model_name] = {}
+                for tier in ALL_TIERS:
+                    metrics = {}
+                    for metric in ["hit1", "hit5", "full_correct", "ppl"]:
+                        values = [
+                            slr[model_name][tier][metric]
+                            for slr in seed_linearized_results
+                            if model_name in slr and tier in slr[model_name]
+                        ]
+                        if values:
+                            metrics[metric] = np.mean(values)
+                            metrics[f"{metric}_std"] = np.std(values)
+                    avg_linearized_results[model_name][tier] = metrics
+
+            for model_name in lin_models:
+                avg_linearized_relation_results[model_name] = {}
+                for tier in ALL_TIERS:
+                    avg_linearized_relation_results[model_name][tier] = {}
+                    all_rels = set()
+                    for slrr in seed_linearized_relation_results:
+                        if model_name in slrr and tier in slrr[model_name]:
+                            all_rels.update(slrr[model_name][tier].keys())
+                    for rel in all_rels:
+                        rel_metrics = {}
+                        for metric in ["hit1", "hit5", "full_correct", "ppl"]:
+                            values = [
+                                slrr[model_name][tier][rel][metric]
+                                for slrr in seed_linearized_relation_results
+                                if (model_name in slrr and tier in slrr[model_name]
+                                    and rel in slrr[model_name][tier])
+                            ]
+                            if values:
+                                rel_metrics[metric] = np.mean(values)
+                        avg_linearized_relation_results[model_name][tier][rel] = rel_metrics
+
         exp_label = f"Exp {exp_name} ({'Generous' if generous else 'Realistic'} Linearization)"
         print_comparison_table(avg_results, exp_label, models)
         print_relation_table(avg_relation_results, exp_label, models)
         print_kg_comparison_table(avg_kg_results, exp_label, models)
         print_kg_relation_table(avg_kg_relation_results, exp_label, models)
+
+        if args.kg_as_text and avg_linearized_results:
+            print_comparison_table(avg_linearized_results,
+                                   f"{exp_label} -- LINEARIZED KG EVAL", lin_models)
+            print_relation_table(avg_linearized_relation_results,
+                                  f"{exp_label} -- LINEARIZED KG EVAL", lin_models)
 
         print(f"\n  Mean +/- Std across {cfg.n_seeds} seeds (TEXT):")
         for tier in ALL_TIERS:
@@ -3173,11 +3623,26 @@ def main():
                         line += f"  {m:.3f}+/-{s:.3f}"
                     print(line)
 
+        if args.kg_as_text and avg_linearized_results:
+            print(f"\n  Mean +/- Std across {cfg.n_seeds} seeds (LINEARIZED KG):")
+            for tier in ALL_TIERS:
+                print(f"\n  {tier}:")
+                for metric in ["hit1", "hit5", "full_correct"]:
+                    line = f"    {metric:<15}"
+                    for model_name in lin_models:
+                        m = avg_linearized_results[model_name][tier].get(metric, 0)
+                        s = avg_linearized_results[model_name][tier].get(f"{metric}_std", 0)
+                        line += f"  {m:.3f}+/-{s:.3f}"
+                    print(line)
+
         all_results[exp_name] = avg_results
         all_results[f"{exp_name}_per_seed"] = seed_results
         all_results[f"{exp_name}_per_relation"] = avg_relation_results
         all_results[f"{exp_name}_kg"] = avg_kg_results
         all_results[f"{exp_name}_kg_per_relation"] = avg_kg_relation_results
+        if args.kg_as_text:
+            all_results[f"{exp_name}_linearized"] = avg_linearized_results
+            all_results[f"{exp_name}_linearized_per_relation"] = avg_linearized_relation_results
 
     # Save results to JSON
     results_dir = os.path.dirname(os.path.abspath(__file__))
