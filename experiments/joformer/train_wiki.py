@@ -154,7 +154,7 @@ def apply_inverse_rotation(x, matrix):
 # ---------------------------------------------------------------------------
 
 class RoFormerAttention(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
@@ -162,6 +162,7 @@ class RoFormerAttention(nn.Module):
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
+        self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
@@ -183,7 +184,11 @@ class RoFormerAttention(nn.Module):
 
         wei = k @ q.transpose(-1, -2) * C ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = torch.log(torch.exp(wei) + 1)
+        if self.use_softmax:
+            wei = F.softmax(wei, dim=-1)
+        else:
+            wei = torch.log(torch.exp(wei) + 1)
+            wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
         wei = self.dropout(wei)
         out = wei @ v
 
@@ -193,9 +198,9 @@ class RoFormerAttention(nn.Module):
 
 
 class RoFormerBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
-        self.sa_head = RoFormerAttention(n_embed, block_size, dropout)
+        self.sa_head = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -207,12 +212,12 @@ class RoFormerBlock(nn.Module):
 
 
 class RoFormer(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [RoFormerBlock(n_embed, block_size, dropout) for _ in range(n_layers)]
+            [RoFormerBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -244,7 +249,7 @@ class RoFormer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class JoFormerFixedAttention(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
@@ -252,6 +257,7 @@ class JoFormerFixedAttention(nn.Module):
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
+        self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
@@ -272,7 +278,11 @@ class JoFormerFixedAttention(nn.Module):
 
         wei = k @ q.transpose(-1, -2) * C ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = torch.log(torch.exp(wei) + 1)
+        if self.use_softmax:
+            wei = F.softmax(wei, dim=-1)
+        else:
+            wei = torch.log(torch.exp(wei) + 1)
+            wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
         wei = self.dropout(wei)
         out = wei @ v
 
@@ -284,9 +294,9 @@ class JoFormerFixedAttention(nn.Module):
 
 
 class JoFormerFixedBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
-        self.sa_head = JoFormerFixedAttention(n_embed, block_size, dropout)
+        self.sa_head = JoFormerFixedAttention(n_embed, block_size, dropout, use_softmax)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -298,12 +308,12 @@ class JoFormerFixedBlock(nn.Module):
 
 
 class JoFormerFixed(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [JoFormerFixedBlock(n_embed, block_size, dropout) for _ in range(n_layers)]
+            [JoFormerFixedBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -335,7 +345,7 @@ class JoFormerFixed(nn.Module):
 # ---------------------------------------------------------------------------
 
 class JoFormerLearnedAttention(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
@@ -343,6 +353,7 @@ class JoFormerLearnedAttention(nn.Module):
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
+        self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x, angles):
@@ -360,7 +371,11 @@ class JoFormerLearnedAttention(nn.Module):
 
         wei = k @ q.transpose(-1, -2) * C ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = torch.log(torch.exp(wei) + 1)
+        if self.use_softmax:
+            wei = F.softmax(wei, dim=-1)
+        else:
+            wei = torch.log(torch.exp(wei) + 1)
+            wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
         wei = self.dropout(wei)
         out = wei @ v
 
@@ -372,9 +387,9 @@ class JoFormerLearnedAttention(nn.Module):
 
 
 class JoFormerLearnedBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
-        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout)
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -386,14 +401,14 @@ class JoFormerLearnedBlock(nn.Module):
 
 
 class JoFormerLearned(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
         self.angle_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
         self.expander = nn.Linear(n_embed // 2, n_embed)
         self.blocks = nn.ModuleList(
-            [JoFormerLearnedBlock(n_embed, block_size, dropout) for _ in range(n_layers)]
+            [JoFormerLearnedBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -433,9 +448,9 @@ class JoFormerLearned(nn.Module):
 # ---------------------------------------------------------------------------
 
 class JoFormerProjectedBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
         super().__init__()
-        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout)
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -458,12 +473,12 @@ class JoFormerProjectedBlock(nn.Module):
 
 
 class JoFormerProjected(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [JoFormerProjectedBlock(n_embed, block_size, dropout) for _ in range(n_layers)]
+            [JoFormerProjectedBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -636,6 +651,8 @@ def main():
                         help='Generation sample length in tokens')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--softmax', action='store_true',
+                        help='Use softmax attention instead of normalized softplus')
     args = parser.parse_args()
 
     # Smoke test overrides
@@ -661,9 +678,10 @@ def main():
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
+    attn_type = "softmax" if args.softmax else "normalized softplus"
     print(f"Config: n_embed={args.n_embed}, n_layers={args.n_layers}, "
           f"block_size={args.block_size}, batch_size={args.batch_size}, "
-          f"lr={args.lr}, max_iters={args.max_iters}")
+          f"lr={args.lr}, max_iters={args.max_iters}, attn={attn_type}")
 
     # Load wiki text
     print(f"\nLoading wiki text from {args.wiki_path} (max {args.wiki_lines} lines)...")
@@ -696,7 +714,7 @@ def main():
         torch.manual_seed(args.seed)  # same init for fair comparison
         cls = MODEL_CLASSES[model_name]
         model = cls(actual_vocab_size, args.n_embed, args.n_layers,
-                    args.block_size, args.dropout)
+                    args.block_size, args.dropout, use_softmax=args.softmax)
         val_loss, val_ppl, ppl_log = train_model(model_name, model, train_data, val_data,
                                                   args, device, tokenizer)
         results[model_name] = {'val_loss': val_loss, 'val_ppl': val_ppl,
