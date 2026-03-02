@@ -831,6 +831,7 @@ class RotaryAttention(nn.Module):
             wei = F.softmax(wei, dim=-1)
         else:
             wei = torch.log(torch.exp(wei) + 1)
+            wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
         wei = self.dropout(wei)
         out = wei @ v
 
