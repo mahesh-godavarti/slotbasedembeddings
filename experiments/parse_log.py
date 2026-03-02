@@ -154,7 +154,7 @@ def extract_eval_results(lines):
         line = lines[i].strip()
 
         # Match evaluation headers: "Evaluation: X" or "KG Evaluation: X"
-        m = re.match(r'(KG )?Evaluation:\s+([A-IJ]\'?)$', line)
+        m = re.match(r'(KG )?Evaluation:\s+(\S+)$', line)
         if m:
             is_kg = m.group(1) is not None
             model = m.group(2)
