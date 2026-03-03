@@ -1233,61 +1233,37 @@ class ModelA(nn.Module):
         return angles.unsqueeze(0)  # (1, T, C//2)
 
     def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
-        """KG angles: position_in_slot * base_freq + slot_angle.
+        """KG angles: position_in_slot * base_freq + slot_angle (vectorized).
 
         Sequence layout: [head_chars] [rel_token] [tail_chars]
         - HEAD slot: positions 0..h_len-1, angle = pos * base_freq + slot_angles[0]
         - REL slot: position 0 (single token), angle = 0 * base_freq + slot_angles[1]
         - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[2]
-
-        Args:
-            head_lens: list of int, head length per sample
-            seq_len: total sequence length (head + 1 rel + tail, padded)
-            batch_size: batch size
-            rel_names: list of relation name strings
         """
-        angles = torch.zeros(batch_size, seq_len, self.n_embed // 2, device=device)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
+        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
 
-        for i in range(batch_size):
-            h_len = head_lens[i]
-            rel_pos = h_len        # position of the relation token
-            tail_start = h_len + 1  # first tail character position
+        # Slot assignment: 0=HEAD, 1=REL, 2=TAIL
+        slot_ids = torch.where(positions < h_lens_t, 0,
+                   torch.where(positions == h_lens_t, 1, 2))  # (B, T)
 
-            # HEAD slot: positions 0..h_len-1
-            for j in range(h_len):
-                angles[i, j] = j * self.base_freq + self.slot_angles[0]
+        # Position within slot
+        pos_in_slot = torch.where(slot_ids == 0, positions,
+                     torch.where(slot_ids == 1, torch.zeros_like(positions),
+                                 positions - h_lens_t - 1))  # (B, T)
 
-            # REL slot: single token at position 0 in its slot
-            angles[i, rel_pos] = 0 * self.base_freq + self.slot_angles[1]
-
-            # TAIL slot: positions 0..t_len-1
-            for j in range(seq_len - tail_start):
-                if tail_start + j < seq_len:
-                    angles[i, tail_start + j] = j * self.base_freq + self.slot_angles[2]
-
-        return angles
+        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+        slot_offset = self.slot_angles[slot_ids]  # (B, T, C//2)
+        return rope + slot_offset
 
     def _kg_angles_slotcausal(self, slot_assignments, slot_positions, rel_names, device):
-        """KG angles for rearranged slot-causal sequences.
+        """KG angles for rearranged slot-causal sequences (vectorized).
 
         Each position gets: slot_position * base_freq + slot_angles[slot_id]
-
-        Args:
-            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL for each position
-            slot_positions: (B, T) int — position within slot for each position
-            rel_names: list of relation name strings (unused for A, shared slot_angles)
-            device: torch device
         """
-        B, T = slot_assignments.shape
-        angles = torch.zeros(B, T, self.n_embed // 2, device=device)
-
-        for i in range(B):
-            for j in range(T):
-                sid = slot_assignments[i, j].item()
-                pos = slot_positions[i, j].item()
-                angles[i, j] = pos * self.base_freq + self.slot_angles[sid]
-
-        return angles
+        rope = slot_positions.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+        slot_offset = self.slot_angles[slot_assignments]  # (B, T, C//2)
+        return rope + slot_offset
 
     def forward_text(self, idx, targets=None):
         """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
@@ -2033,7 +2009,7 @@ class ModelG(nn.Module):
         return angles.unsqueeze(0)  # (1, T, C//2)
 
     def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
-        """KG angles: position_in_slot * base_freq + slot_angle[rel].
+        """KG angles: position_in_slot * base_freq + slot_angle[rel] (vectorized).
 
         Like ModelA._kg_angles but slot angles are relation-dependent.
 
@@ -2042,50 +2018,35 @@ class ModelG(nn.Module):
         - REL slot: position 0 (single token), angle = 0 * base_freq + slot_angles[rel, 1]
         - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[rel, 2]
         """
-        angles = torch.zeros(batch_size, seq_len, self.n_embed // 2, device=device)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
+        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
 
-        for i in range(batch_size):
-            h_len = head_lens[i]
-            rel_pos = h_len        # position of the relation token
-            tail_start = h_len + 1  # first tail character position
-            rel_idx = self.rel_to_idx[rel_names[i]]
+        # Slot assignment: 0=HEAD, 1=REL, 2=TAIL
+        slot_ids = torch.where(positions < h_lens_t, 0,
+                   torch.where(positions == h_lens_t, 1, 2))  # (B, T)
 
-            # HEAD slot: positions 0..h_len-1
-            for j in range(h_len):
-                angles[i, j] = j * self.base_freq + self.slot_angles[rel_idx, 0]
+        # Position within slot
+        pos_in_slot = torch.where(slot_ids == 0, positions,
+                     torch.where(slot_ids == 1, torch.zeros_like(positions),
+                                 positions - h_lens_t - 1))  # (B, T)
 
-            # REL slot: single token at position 0 in its slot
-            angles[i, rel_pos] = 0 * self.base_freq + self.slot_angles[rel_idx, 1]
+        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
 
-            # TAIL slot: positions 0..t_len-1
-            for j in range(seq_len - tail_start):
-                if tail_start + j < seq_len:
-                    angles[i, tail_start + j] = j * self.base_freq + self.slot_angles[rel_idx, 2]
-
-        return angles
+        # Per-relation slot angles
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, seq_len), slot_ids]  # (B, T, C//2)
+        return rope + slot_offset
 
     def _kg_angles_slotcausal(self, slot_assignments, slot_positions, rel_names, device):
-        """KG angles for rearranged slot-causal sequences (per-relation).
+        """KG angles for rearranged slot-causal sequences, per-relation (vectorized).
 
         Each position gets: slot_position * base_freq + slot_angles[rel, slot_id]
-
-        Args:
-            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL for each position
-            slot_positions: (B, T) int — position within slot for each position
-            rel_names: list of relation name strings
-            device: torch device
         """
         B, T = slot_assignments.shape
-        angles = torch.zeros(B, T, self.n_embed // 2, device=device)
-
-        for i in range(B):
-            rel_idx = self.rel_to_idx[rel_names[i]]
-            for j in range(T):
-                sid = slot_assignments[i, j].item()
-                pos = slot_positions[i, j].item()
-                angles[i, j] = pos * self.base_freq + self.slot_angles[rel_idx, sid]
-
-        return angles
+        rope = slot_positions.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, T), slot_assignments]  # (B, T, C//2)
+        return rope + slot_offset
 
     def forward_text(self, idx, targets=None):
         """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
@@ -2645,52 +2606,38 @@ class ModelJ(nn.Module):
         return angles.unsqueeze(0)  # (1, T, C//2)
 
     def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
-        """KG angles: position_in_slot * base_freq + slot_angle[rel].
+        """KG angles: position_in_slot * base_freq + slot_angle[rel] (vectorized).
 
         Native sequence layout: [head_chars] [tail_chars] (no relation token)
         - HEAD slot: positions 0..h_len-1, angle = pos * base_freq + slot_angles[rel, 0]
         - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[rel, 1]
         """
-        angles = torch.zeros(batch_size, seq_len, self.n_embed // 2, device=device)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
+        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
 
-        for i in range(batch_size):
-            h_len = head_lens[i]
-            rel_idx = self.rel_to_idx[rel_names[i]]
+        # Slot assignment: 0=HEAD, 1=TAIL (no REL token)
+        slot_ids = torch.where(positions < h_lens_t, 0, 1)  # (B, T)
 
-            # HEAD slot: positions 0..h_len-1
-            for j in range(h_len):
-                angles[i, j] = j * self.base_freq + self.slot_angles[rel_idx, 0]
+        # Position within slot
+        pos_in_slot = torch.where(slot_ids == 0, positions, positions - h_lens_t)  # (B, T)
 
-            # TAIL slot: positions 0..t_len-1
-            tail_start = h_len
-            for j in range(seq_len - tail_start):
-                if tail_start + j < seq_len:
-                    angles[i, tail_start + j] = j * self.base_freq + self.slot_angles[rel_idx, 1]
+        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
 
-        return angles
+        # Per-relation slot angles
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, seq_len), slot_ids]  # (B, T, C//2)
+        return rope + slot_offset
 
     def _kg_angles_slotcausal(self, slot_assignments, slot_positions, rel_names, device):
-        """KG angles for rearranged slot-causal sequences (per-relation, 2 slots).
+        """KG angles for rearranged slot-causal sequences, per-relation, 2 slots (vectorized).
 
         Each position gets: slot_position * base_freq + slot_angles[rel, slot_id]
-
-        Args:
-            slot_assignments: (B, T) int — 0=HEAD, 1=TAIL for each position
-            slot_positions: (B, T) int — position within slot for each position
-            rel_names: list of relation name strings
-            device: torch device
         """
         B, T = slot_assignments.shape
-        angles = torch.zeros(B, T, self.n_embed // 2, device=device)
-
-        for i in range(B):
-            rel_idx = self.rel_to_idx[rel_names[i]]
-            for j in range(T):
-                sid = slot_assignments[i, j].item()
-                pos = slot_positions[i, j].item()
-                angles[i, j] = pos * self.base_freq + self.slot_angles[rel_idx, sid]
-
-        return angles
+        rope = slot_positions.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, T), slot_assignments]  # (B, T, C//2)
+        return rope + slot_offset
 
     def forward_text(self, idx, targets=None):
         """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
@@ -4653,7 +4600,7 @@ def main():
     # Save results to JSON
     results_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = os.path.join(results_dir, f"exp7_results_{timestamp}.json")
+    results_file = os.path.join(results_dir, f"exp7_dual_results_{timestamp}.json")
 
     # Convert numpy floats to Python floats for JSON serialization
     def to_serializable(obj):
@@ -4685,7 +4632,7 @@ def main():
     print(f"\nResults saved to: {results_file}")
 
     # Also save a latest symlink/copy for easy access
-    latest_file = os.path.join(results_dir, "exp7_results_latest.json")
+    latest_file = os.path.join(results_dir, "exp7_dual_results_latest.json")
     with open(latest_file, "w") as f:
         json.dump(save_data, f, indent=2)
     print(f"Latest results: {latest_file}")
