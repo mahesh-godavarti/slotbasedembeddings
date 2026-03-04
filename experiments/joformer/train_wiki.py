@@ -523,6 +523,7 @@ MODEL_CLASSES = {
 def train_model(model_name, model, train_data, val_data, args, device, tokenizer):
     """Train a single model and return final val loss."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters) if args.cosine_decay else None
     model.to(device)
     model.train()
 
@@ -568,21 +569,33 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
 
             # Generate sample
             if it > 0 and it % (args.eval_interval * 2) == 0:
-                model.eval()
-                prompt = torch.zeros((1, 1), dtype=torch.long, device=device)
-                generated = model.generate(prompt, args.generate_len)
-                text = tokenizer.decode(generated[0].cpu().tolist())
-                tqdm.write(f"  [{model_name}] sample: {text[:200]}")
-                model.train()
+                try:
+                    model.eval()
+                    prompt = torch.zeros((1, 1), dtype=torch.long, device=device)
+                    generated = model.generate(prompt, args.generate_len)
+                    text = tokenizer.decode(generated[0].cpu().tolist())
+                    tqdm.write(f"  [{model_name}] sample: {text[:200]}")
+                    model.train()
+                except Exception as e:
+                    tqdm.write(f"  [{model_name}] sample generation failed: {e}")
+                    model.train()
 
         # Train step
         xb, yb = get_batch(train_data, val_data, "train",
                            args.block_size, args.batch_size, device)
         _, loss = model(xb, yb)
+
+        # NaN detection — stop early
+        if torch.isnan(loss):
+            tqdm.write(f"  [{model_name}] NaN loss detected at iter {it}, stopping early.")
+            break
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler:
+            scheduler.step()
 
     # Final eval
     losses = estimate_loss(model, train_data, val_data,
@@ -590,12 +603,15 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     val_ppl = math.exp(losses['val'])
 
     # Final generation sample
-    model.eval()
-    prompt = torch.zeros((1, 1), dtype=torch.long, device=device)
-    generated = model.generate(prompt, args.generate_len)
-    text = tokenizer.decode(generated[0].cpu().tolist())
     print(f"\n  [{model_name}] final val loss: {losses['val']:.4f} (PPL {val_ppl:.2f})")
-    print(f"  [{model_name}] sample: {text[:300]}")
+    try:
+        model.eval()
+        prompt = torch.zeros((1, 1), dtype=torch.long, device=device)
+        generated = model.generate(prompt, args.generate_len)
+        text = tokenizer.decode(generated[0].cpu().tolist())
+        print(f"  [{model_name}] sample: {text[:300]}")
+    except Exception as e:
+        print(f"  [{model_name}] final sample generation failed: {e}")
 
     # Save final checkpoint
     if args.checkpoint_dir:
@@ -653,6 +669,8 @@ def main():
                         help='Random seed')
     parser.add_argument('--softmax', action='store_true',
                         help='Use softmax attention instead of normalized softplus')
+    parser.add_argument('--cosine_decay', action='store_true',
+                        help='Use cosine annealing LR schedule')
     args = parser.parse_args()
 
     # Smoke test overrides
