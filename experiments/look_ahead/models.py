@@ -43,8 +43,114 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from train_wiki import (
     RoFormerBlock, JoFormerFixedBlock, JoFormerLearnedBlock,
     JoFormerProjectedBlock,
+    JoFormerLearnedAttention,
     RoFormer, JoFormerFixed, JoFormerLearned, JoFormerProjected,
+    FeedForward,
+    build_rotation_matrix, apply_rotation, apply_inverse_rotation,
 )
+
+
+# ---------------------------------------------------------------------------
+# JoFormerProjectedBlock with causal angle shift for look-ahead architecture
+# ---------------------------------------------------------------------------
+
+class JoFormerProjectedBlockCausal(nn.Module):
+    """JoFormerProjectedBlock with causal angle shift.
+
+    In standard JoFormerProjectedBlock, angles at position t are derived from
+    x_t. This means Q_t is rotated by angle(x_t), so the attention score
+    between position t and t-1 involves angle(x_t) — leaking current-token
+    information into the "past-only" attention.
+
+    Fix: shift the angles so position t uses angle(t-1). The query rotation
+    at position t only involves information from past positions, making the
+    block strictly causal/past-only.
+    """
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+        super().__init__()
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
+        self.ffn = FeedForward(n_embed, dropout)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+        self.vector_proj = nn.Linear(n_embed, n_embed)
+        self.angle_proj = nn.Sequential(
+            nn.Linear(n_embed, 2 * n_embed),
+            nn.GELU(),
+            nn.Linear(2 * n_embed, n_embed // 2),
+        )
+
+    def forward(self, x):
+        x_proj = self.vector_proj(x)
+        raw_angles = self.angle_proj(x)  # (B, T, C//2)
+
+        # Shift angles: position t gets angle from position t-1
+        # Position 0 gets zero angles (no past information)
+        zero = torch.zeros_like(raw_angles[:, :1, :])
+        shifted_angles = torch.cat([zero, raw_angles[:, :-1, :]], dim=1)
+
+        # Apply flip-cumsum-flip to the shifted angles
+        angles = torch.flip(shifted_angles, dims=(1,))
+        angles = torch.cumsum(angles, dim=1)
+        angles = torch.flip(angles, dims=(1,))
+
+        x_proj = x_proj + self.sa_head(self.ln1(x_proj), angles)
+        x_proj = x_proj + self.ffn(self.ln2(x_proj))
+        return x_proj
+
+
+# ---------------------------------------------------------------------------
+# Vector Quantizer for discrete convergence
+# ---------------------------------------------------------------------------
+
+class VectorQuantizer(nn.Module):
+    """Vector quantization layer (VQ-VAE style).
+
+    Quantizes each position's correction vector to the nearest codebook entry.
+    Uses straight-through estimator for backprop and EMA codebook updates.
+
+    Args:
+        n_codes: number of codebook entries
+        dim: dimension of each code vector
+        commitment_weight: weight for commitment loss (default 0.25)
+    """
+    def __init__(self, n_codes, dim, commitment_weight=0.25):
+        super().__init__()
+        self.n_codes = n_codes
+        self.dim = dim
+        self.commitment_weight = commitment_weight
+        self.codebook = nn.Embedding(n_codes, dim)
+        self.codebook.weight.data.uniform_(-1.0 / n_codes, 1.0 / n_codes)
+
+    def forward(self, x):
+        """Quantize x to nearest codebook entry.
+
+        Args:
+            x: (B, T, C) tensor to quantize
+
+        Returns:
+            quantized: (B, T, C) quantized tensor (straight-through)
+            vq_loss: scalar commitment + codebook loss
+        """
+        B, T, C = x.shape
+        flat = x.reshape(-1, C)  # (B*T, C)
+
+        # Distances: ||x - e||^2 = ||x||^2 + ||e||^2 - 2*x·e
+        dist = (flat ** 2).sum(dim=1, keepdim=True) + \
+               (self.codebook.weight ** 2).sum(dim=1) - \
+               2 * flat @ self.codebook.weight.t()
+
+        indices = dist.argmin(dim=1)  # (B*T,)
+        quantized = self.codebook(indices).reshape(B, T, C)
+
+        # Losses
+        codebook_loss = F.mse_loss(quantized, x.detach())
+        commitment_loss = F.mse_loss(x, quantized.detach())
+        vq_loss = codebook_loss + self.commitment_weight * commitment_loss
+
+        # Straight-through estimator
+        quantized_st = x + (quantized - x).detach()
+
+        return quantized_st, vq_loss
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +171,8 @@ class LookAheadModel(nn.Module):
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
                  block_cls, non_cumulative=True, past_only=True,
-                 use_softmax=False):
+                 use_softmax=False, concat_head=True, mlp_head=False,
+                 vq_codes=0, vq_start_iter=0):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
@@ -73,6 +180,7 @@ class LookAheadModel(nn.Module):
         self.block_size = block_size
         self.non_cumulative = non_cumulative
         self.past_only = past_only
+        self.concat_head = concat_head
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.drop = nn.Dropout(dropout)
@@ -80,14 +188,22 @@ class LookAheadModel(nn.Module):
         # Single shared-weight block (same block reused N times)
         self.block = block_cls(n_embed, block_size, dropout, use_softmax)
 
+        # Optional vector quantizer for corrections
+        self.vq = VectorQuantizer(vq_codes, n_embed) if vq_codes > 0 else None
+        self.vq_start_iter = vq_start_iter
+        self._current_iter = 0
+
         # Classification head
-        head_in = 2 * n_embed if past_only else n_embed
+        head_in = 2 * n_embed if (past_only and concat_head) else n_embed
         self.ln_f = nn.LayerNorm(head_in)
-        self.head = nn.Sequential(
-            nn.Linear(head_in, 4 * n_embed),
-            nn.GELU(),
-            nn.Linear(4 * n_embed, vocab_size),
-        )
+        if mlp_head:
+            self.head = nn.Sequential(
+                nn.Linear(head_in, 4 * n_embed),
+                nn.GELU(),
+                nn.Linear(4 * n_embed, vocab_size),
+            )
+        else:
+            self.head = nn.Linear(head_in, vocab_size)
 
     # ------------------------------------------------------------------
     # Internal helpers (override in subclasses for different block types)
@@ -107,15 +223,22 @@ class LookAheadModel(nn.Module):
         Returns:
             processed_x: (B, T, C) — contextualized embeddings
             correction:  (B, T, C) — un-shifted correction from last iteration
+            vq_loss:     scalar — VQ commitment+codebook loss (0 if no VQ)
         """
         B, T, C = tok_emb.shape
         processed_x = tok_emb
         correction = None
+        total_vq_loss = 0.0
 
         for _ in range(n_iters):
             block_out = self._apply_block(processed_x)
             # Extract correction: block has built-in residual, so correction = out - in
             correction = block_out - processed_x
+
+            # Vector quantize the correction if enabled and past warmup
+            if self.vq is not None and self._current_iter >= self.vq_start_iter:
+                correction, vq_loss = self.vq(correction)
+                total_vq_loss = total_vq_loss + vq_loss
 
             if self.past_only:
                 # Position shift: position t gets correction from position t-1
@@ -131,12 +254,11 @@ class LookAheadModel(nn.Module):
             else:
                 processed_x = processed_x + effective_correction
 
-        return processed_x, correction
+        return processed_x, correction, total_vq_loss
 
     def _build_output(self, processed_x, correction):
         """Build classification input from processed embeddings and correction."""
-        if self.past_only and correction is not None:
-            # Concatenate past-only embedding with self-inclusive look-ahead
+        if self.past_only and correction is not None and self.concat_head:
             return torch.cat([processed_x, correction], dim=2)  # (B, T, 2C)
         return processed_x
 
@@ -151,7 +273,7 @@ class LookAheadModel(nn.Module):
     def forward(self, idx, targets=None):
         """Training forward pass. Returns (logits, loss)."""
         tok_emb = self._get_embeddings(idx)
-        processed_x, correction = self._run_iterations(tok_emb, self.n_iters)
+        processed_x, correction, vq_loss = self._run_iterations(tok_emb, self.n_iters)
         output = self._build_output(processed_x, correction)
         logits = self._classify(output)
 
@@ -160,6 +282,10 @@ class LookAheadModel(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1)
             )
+            if self.vq is not None and self._current_iter >= self.vq_start_iter:
+                loss = loss + vq_loss
+        if self.training:
+            self._current_iter += 1
         return logits, loss
 
     @torch.no_grad()
@@ -194,7 +320,7 @@ class LookAheadModel(nn.Module):
 
             if eff_corr is None:
                 # Bootstrap: full-depth
-                processed_x, correction = self._run_iterations(
+                processed_x, correction, _ = self._run_iterations(
                     tok_emb, self.n_iters
                 )
                 eff_corr = processed_x - tok_emb  # shifted correction
@@ -240,7 +366,7 @@ class LookAheadModel(nn.Module):
         Runs only K iterations instead of self.n_iters.
         """
         tok_emb = self._get_embeddings(idx)
-        processed_x, correction = self._run_iterations(tok_emb, K)
+        processed_x, correction, _ = self._run_iterations(tok_emb, K)
         output = self._build_output(processed_x, correction)
         logits = self._classify(output)
 
@@ -273,6 +399,10 @@ class LookAheadModel(nn.Module):
         for k in range(self.n_iters):
             block_out = self._apply_block(processed_x)
             correction = block_out - processed_x
+
+            # Vector quantize the correction if enabled and past warmup
+            if self.vq is not None and self._current_iter >= self.vq_start_iter:
+                correction, _ = self.vq(correction)
 
             if self.past_only:
                 zero = torch.zeros(B, 1, C, device=tok_emb.device)
@@ -352,7 +482,7 @@ class LookAheadModel(nn.Module):
                 zero = torch.zeros(B, 1, C, device=tok_emb.device)
 
                 if eff_corr is None:
-                    processed_x, correction = self._run_iterations(
+                    processed_x, correction, _ = self._run_iterations(
                         tok_emb, self.n_iters
                     )
                     eff_corr = processed_x - tok_emb
@@ -448,11 +578,13 @@ class LookAheadLearnedModel(LookAheadModel):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
-                 non_cumulative=True, past_only=True, use_softmax=False):
+                 non_cumulative=True, past_only=True, use_softmax=False,
+                 concat_head=True, mlp_head=False):
         # Initialize with JoFormerLearnedBlock
         super().__init__(
             vocab_size, n_embed, n_layers, block_size, dropout,
-            JoFormerLearnedBlock, non_cumulative, past_only, use_softmax
+            JoFormerLearnedBlock, non_cumulative, past_only, use_softmax,
+            concat_head, mlp_head
         )
         # Override embeddings to match JoFormerLearned
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
@@ -464,6 +596,12 @@ class LookAheadLearnedModel(LookAheadModel):
         """Compute token embeddings and cache angles for block calls."""
         x = self.expander(self.token_embedding_table(idx))
         raw_angles = self.angle_embedding_table(idx)  # (B, T, C//2)
+
+        # Causal angle shift: position t uses angle from position t-1
+        if self.past_only:
+            zero = torch.zeros_like(raw_angles[:, :1, :])
+            raw_angles = torch.cat([zero, raw_angles[:, :-1, :]], dim=1)
+
         angles = torch.flip(raw_angles, dims=(1,))
         angles = torch.cumsum(angles, dim=1)
         angles = torch.flip(angles, dims=(1,))
@@ -487,11 +625,42 @@ def make_roformer_look_ahead(vocab_size, n_embed, n_layers, block_size,
                           RoFormerBlock, non_cumulative=True, past_only=True,
                           use_softmax=use_softmax)
 
+def make_roformer_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
+                                    dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False)
+
+def make_roformer_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
+                                  dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, mlp_head=True)
+
+def make_roformer_look_ahead_nocat_vq(vocab_size, n_embed, n_layers, block_size,
+                                       dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          vq_codes=25000, vq_start_iter=500)
+
 def make_joformer_fixed_look_ahead(vocab_size, n_embed, n_layers, block_size,
                                     dropout, use_softmax=False):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=True, past_only=True,
                           use_softmax=use_softmax)
+
+def make_joformer_fixed_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
+                                          dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerFixedBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False)
+
+def make_joformer_fixed_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
+                                        dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerFixedBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, mlp_head=True)
 
 def make_joformer_learned_look_ahead(vocab_size, n_embed, n_layers, block_size,
                                       dropout, use_softmax=False):
@@ -499,11 +668,35 @@ def make_joformer_learned_look_ahead(vocab_size, n_embed, n_layers, block_size,
                                   dropout, non_cumulative=True, past_only=True,
                                   use_softmax=use_softmax)
 
+def make_joformer_learned_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
+                                            dropout, use_softmax=False):
+    return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
+                                  dropout, non_cumulative=True, past_only=True,
+                                  use_softmax=use_softmax, concat_head=False)
+
+def make_joformer_learned_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
+                                          dropout, use_softmax=False):
+    return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
+                                  dropout, non_cumulative=True, past_only=True,
+                                  use_softmax=use_softmax, concat_head=False, mlp_head=True)
+
 def make_joformer_projected_look_ahead(vocab_size, n_embed, n_layers, block_size,
                                         dropout, use_softmax=False):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
-                          JoFormerProjectedBlock, non_cumulative=True,
+                          JoFormerProjectedBlockCausal, non_cumulative=True,
                           past_only=True, use_softmax=use_softmax)
+
+def make_joformer_projected_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
+                                              dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerProjectedBlockCausal, non_cumulative=True,
+                          past_only=True, use_softmax=use_softmax, concat_head=False)
+
+def make_joformer_projected_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
+                                            dropout, use_softmax=False):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerProjectedBlockCausal, non_cumulative=True,
+                          past_only=True, use_softmax=use_softmax, concat_head=False, mlp_head=True)
 
 # --- Baseline (Model B): cumulative + self-inclusive (shared weights) ---
 
@@ -547,6 +740,8 @@ def make_joformer_fixed_pastonly_only(vocab_size, n_embed, n_layers, block_size,
                           JoFormerFixedBlock, non_cumulative=False, past_only=True,
                           use_softmax=use_softmax)
 
+# --- VQ variants: vector-quantized corrections for discrete convergence ---
+
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -554,10 +749,18 @@ def make_joformer_fixed_pastonly_only(vocab_size, n_embed, n_layers, block_size,
 
 MODEL_CLASSES = {
     # Look-ahead variants (Model A: shared weights, non-cumulative, past-only)
-    'roformer_look_ahead':           make_roformer_look_ahead,
-    'joformer_fixed_look_ahead':     make_joformer_fixed_look_ahead,
-    'joformer_learned_look_ahead':   make_joformer_learned_look_ahead,
-    'joformer_projected_look_ahead': make_joformer_projected_look_ahead,
+    'roformer_look_ahead':                make_roformer_look_ahead,
+    'roformer_look_ahead_nocat':          make_roformer_look_ahead_nocat,
+    'roformer_look_ahead_mlp':            make_roformer_look_ahead_mlp,
+    'joformer_fixed_look_ahead':          make_joformer_fixed_look_ahead,
+    'joformer_fixed_look_ahead_nocat':    make_joformer_fixed_look_ahead_nocat,
+    'joformer_fixed_look_ahead_mlp':      make_joformer_fixed_look_ahead_mlp,
+    'joformer_learned_look_ahead':        make_joformer_learned_look_ahead,
+    'joformer_learned_look_ahead_nocat':  make_joformer_learned_look_ahead_nocat,
+    'joformer_learned_look_ahead_mlp':    make_joformer_learned_look_ahead_mlp,
+    'joformer_projected_look_ahead':      make_joformer_projected_look_ahead,
+    'joformer_projected_look_ahead_nocat': make_joformer_projected_look_ahead_nocat,
+    'joformer_projected_look_ahead_mlp':  make_joformer_projected_look_ahead_mlp,
 
     # Baseline variants (Model B: shared weights, cumulative, self-inclusive)
     'roformer_baseline':             make_roformer_baseline,
@@ -568,6 +771,9 @@ MODEL_CLASSES = {
     # Ablations (on joformer_fixed)
     'joformer_fixed_noncum_only':    make_joformer_fixed_noncum_only,
     'joformer_fixed_pastonly_only':   make_joformer_fixed_pastonly_only,
+
+    # VQ variants (vector-quantized corrections)
+    'roformer_look_ahead_nocat_vq':          make_roformer_look_ahead_nocat_vq,
 
     # Original joformer models (separate blocks, for reference)
     'roformer':            RoFormer,

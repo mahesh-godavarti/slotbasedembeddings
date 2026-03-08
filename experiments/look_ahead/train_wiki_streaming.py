@@ -314,8 +314,9 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
                                            device, n_batches=3)
                 diagnostics_log.append({'iter': it, **diag})
                 if diag['empirical_L'] is not None:
+                    ratios_str = [f'{r:.4f}' for r in diag['avg_contraction_ratios']]
                     tqdm.write(f"  [{model_name}]   empirical L = {diag['empirical_L']:.4f}, "
-                               f"correction norms: {[f'{n:.4f}' for n in diag['avg_correction_norms'][-3:]]}")
+                               f"contraction ratios: {ratios_str}")
 
             # Generate samples (full-depth and single-step)
             if it > 0 and it % (args.eval_interval * 2) == 0:
