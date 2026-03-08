@@ -79,7 +79,7 @@ class JoFormerProjectedBlockCausal(nn.Module):
             nn.Linear(2 * n_embed, n_embed // 2),
         )
 
-    def forward(self, x):
+    def forward(self, x, return_raw_angles=False):
         x_proj = self.vector_proj(x)
         raw_angles = self.angle_proj(x)  # (B, T, C//2)
 
@@ -95,62 +95,14 @@ class JoFormerProjectedBlockCausal(nn.Module):
 
         x_proj = x_proj + self.sa_head(self.ln1(x_proj), angles)
         x_proj = x_proj + self.ffn(self.ln2(x_proj))
+        if return_raw_angles:
+            return x_proj, raw_angles
         return x_proj
 
 
 # ---------------------------------------------------------------------------
 # Vector Quantizer for discrete convergence
 # ---------------------------------------------------------------------------
-
-class VectorQuantizer(nn.Module):
-    """Vector quantization layer (VQ-VAE style).
-
-    Quantizes each position's correction vector to the nearest codebook entry.
-    Uses straight-through estimator for backprop and EMA codebook updates.
-
-    Args:
-        n_codes: number of codebook entries
-        dim: dimension of each code vector
-        commitment_weight: weight for commitment loss (default 0.25)
-    """
-    def __init__(self, n_codes, dim, commitment_weight=0.25):
-        super().__init__()
-        self.n_codes = n_codes
-        self.dim = dim
-        self.commitment_weight = commitment_weight
-        self.codebook = nn.Embedding(n_codes, dim)
-        self.codebook.weight.data.uniform_(-1.0 / n_codes, 1.0 / n_codes)
-
-    def forward(self, x):
-        """Quantize x to nearest codebook entry.
-
-        Args:
-            x: (B, T, C) tensor to quantize
-
-        Returns:
-            quantized: (B, T, C) quantized tensor (straight-through)
-            vq_loss: scalar commitment + codebook loss
-        """
-        B, T, C = x.shape
-        flat = x.reshape(-1, C)  # (B*T, C)
-
-        # Distances: ||x - e||^2 = ||x||^2 + ||e||^2 - 2*x·e
-        dist = (flat ** 2).sum(dim=1, keepdim=True) + \
-               (self.codebook.weight ** 2).sum(dim=1) - \
-               2 * flat @ self.codebook.weight.t()
-
-        indices = dist.argmin(dim=1)  # (B*T,)
-        quantized = self.codebook(indices).reshape(B, T, C)
-
-        # Losses
-        codebook_loss = F.mse_loss(quantized, x.detach())
-        commitment_loss = F.mse_loss(x, quantized.detach())
-        vq_loss = codebook_loss + self.commitment_weight * commitment_loss
-
-        # Straight-through estimator
-        quantized_st = x + (quantized - x).detach()
-
-        return quantized_st, vq_loss
 
 
 # ---------------------------------------------------------------------------
@@ -172,26 +124,42 @@ class LookAheadModel(nn.Module):
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
                  block_cls, non_cumulative=True, past_only=True,
                  use_softmax=False, concat_head=True, mlp_head=False,
-                 vq_codes=0, vq_start_iter=0):
+                 use_combiner=False,
+                 convergence_weight=0.0, d_block=1, correct_rotation=False,
+                 full_correction=False, no_self_embed=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
-        self.n_iters = n_layers       # number of shared-weight iterations
+        self.d_block = d_block         # number of layers per shared unit
+        self.n_iters = n_layers // d_block  # number of shared-weight iterations
         self.block_size = block_size
         self.non_cumulative = non_cumulative
         self.past_only = past_only
         self.concat_head = concat_head
+        self.correct_rotation = correct_rotation
+        self.full_correction = full_correction
+        self.no_self_embed = no_self_embed  # don't add tok_emb back, just use shifted output
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.drop = nn.Dropout(dropout)
 
-        # Single shared-weight block (same block reused N times)
-        self.block = block_cls(n_embed, block_size, dropout, use_softmax)
+        # Shared-weight unit: D blocks with separate weights, iterated K times
+        self.blocks = nn.ModuleList([
+            block_cls(n_embed, block_size, dropout, use_softmax)
+            for _ in range(d_block)
+        ])
 
-        # Optional vector quantizer for corrections
-        self.vq = VectorQuantizer(vq_codes, n_embed) if vq_codes > 0 else None
-        self.vq_start_iter = vq_start_iter
-        self._current_iter = 0
+        # Optional learned combiner: f(correction, original) -> corrected
+        # Replaces the additive processed_x = tok_emb + correction
+        self.use_combiner = use_combiner
+        if use_combiner:
+            self.combiner = nn.Sequential(
+                nn.Linear(2 * n_embed, 4 * n_embed),
+                nn.GELU(),
+                nn.Linear(4 * n_embed, n_embed),
+            )
+
+        self.convergence_weight = convergence_weight
 
         # Classification head
         head_in = 2 * n_embed if (past_only and concat_head) else n_embed
@@ -213,9 +181,75 @@ class LookAheadModel(nn.Module):
         """Compute token embeddings from indices."""
         return self.drop(self.token_embedding_table(idx))
 
-    def _apply_block(self, x):
-        """Apply the shared block. Returns block output with built-in residual."""
-        return self.block(x)
+    def _build_correction_rotation(self, T, C, device):
+        """Build rotation matrix to apply to corrections before shifting.
+
+        For fixed JoFormer: constant R(-freq) for all positions.
+        V[t-1] appears in output at t rotated by R(Θ_{t-1} - Θ_t) = R(-freq_flipped),
+        where Θ_t = t * freq_flipped is the cumsum angle. The correction inherits
+        this rotation and must be matched when shifted to position t+1.
+        Returns shape (1, 1, C//2, 2, 2) — broadcasts over B and T.
+        """
+        freq = torch.flip(torch.arange(C // 2, device=device), dims=(0,))
+        angle = (-freq).float().unsqueeze(0).unsqueeze(0)  # (1, 1, C//2)
+        return build_rotation_matrix(torch.cos(angle), torch.sin(angle))
+
+    def _build_projected_rotation(self, raw_angles):
+        """Build per-position rotation matrices for projected JoFormer correction.
+
+        For projected JoFormer, angles are input-dependent. The angle difference
+        between position t and t+1 is shifted_angles[t] = raw_angles[t-1] (t>=1)
+        or 0 (t=0). We apply R(-shifted_angles[t]) to correction[t] before
+        shifting it to position t+1.
+
+        raw_angles: (B, T, C//2) from angle_proj.
+        Returns: (B, T, C//2, 2, 2) rotation matrices.
+        """
+        B, T, half_C = raw_angles.shape
+        zero = torch.zeros(B, 1, half_C, device=raw_angles.device)
+        neg_shifted = torch.cat([zero, -raw_angles[:, :-1, :]], dim=1)  # (B, T, C//2)
+        return build_rotation_matrix(torch.cos(neg_shifted), torch.sin(neg_shifted))
+
+    def _has_projected_block(self):
+        """Check if the last block has input-dependent angles (projected JoFormer)."""
+        return hasattr(self.blocks[-1], 'angle_proj')
+
+    def _apply_block(self, x, return_raw_angles=False):
+        """Apply the shared unit and return the correction.
+
+        full_correction=False (default):
+            D=1: correction = block(x) - x
+            D>1: blocks 1..D-1 run with standard residuals,
+                 correction = last block's output - last block's input.
+        full_correction=True:
+            Run all D blocks with standard residuals.
+            Return full output h (no subtraction).
+            The network output IS the correction added to tok_emb.
+
+        If return_raw_angles=True and the block supports it (JoFormerProjectedBlockCausal),
+        also returns raw_angles from the last block for position-dependent rotation correction.
+        """
+        h = x
+        raw_angles = None
+        if self.full_correction:
+            for block in self.blocks:
+                if return_raw_angles and block is self.blocks[-1] and hasattr(block, 'angle_proj'):
+                    h, raw_angles = block(h, return_raw_angles=True)
+                else:
+                    h = block(h)
+            if return_raw_angles:
+                return h, raw_angles
+            return h
+        else:
+            for block in self.blocks[:-1]:
+                h = block(h)  # standard residual blocks
+            # Last block: extract delta only
+            last_block = self.blocks[-1]
+            if return_raw_angles and hasattr(last_block, 'angle_proj'):
+                out, raw_angles = last_block(h, return_raw_angles=True)
+                if return_raw_angles:
+                    return out - h, raw_angles
+            return self.blocks[-1](h) - h
 
     def _run_iterations(self, tok_emb, n_iters):
         """Run n_iters shared-weight iterations.
@@ -223,38 +257,64 @@ class LookAheadModel(nn.Module):
         Returns:
             processed_x: (B, T, C) — contextualized embeddings
             correction:  (B, T, C) — un-shifted correction from last iteration
-            vq_loss:     scalar — VQ commitment+codebook loss (0 if no VQ)
+            aux_loss:    scalar — convergence loss
         """
         B, T, C = tok_emb.shape
         processed_x = tok_emb
+        prev_processed_x = None
         correction = None
-        total_vq_loss = 0.0
+        total_conv_loss = 0.0
 
-        for _ in range(n_iters):
-            block_out = self._apply_block(processed_x)
-            # Extract correction: block has built-in residual, so correction = out - in
-            correction = block_out - processed_x
+        # Build correction rotation matrix (JoFormer blocks only)
+        rot_matrix = None
+        use_projected_rotation = self.correct_rotation and self._has_projected_block()
+        if self.correct_rotation and not use_projected_rotation:
+            rot_matrix = self._build_correction_rotation(T, C, tok_emb.device)
 
-            # Vector quantize the correction if enabled and past warmup
-            if self.vq is not None and self._current_iter >= self.vq_start_iter:
-                correction, vq_loss = self.vq(correction)
-                total_vq_loss = total_vq_loss + vq_loss
+        for k in range(n_iters):
+            prev_processed_x = processed_x
+
+            if use_projected_rotation:
+                correction, raw_angles = self._apply_block(processed_x, return_raw_angles=True)
+                rot_matrix = self._build_projected_rotation(raw_angles)
+            else:
+                correction = self._apply_block(processed_x)
 
             if self.past_only:
+                # Apply rotation to correction before shifting (JoFormer fix)
+                corr_to_shift = correction
+                if rot_matrix is not None:
+                    corr_to_shift = apply_rotation(correction, rot_matrix)
+
                 # Position shift: position t gets correction from position t-1
                 zero = torch.zeros(B, 1, C, device=tok_emb.device)
                 effective_correction = torch.cat(
-                    [zero, correction[:, :-1, :]], dim=1
+                    [zero, corr_to_shift[:, :-1, :]], dim=1
                 )
             else:
                 effective_correction = correction
 
             if self.non_cumulative:
-                processed_x = tok_emb + effective_correction
+                if self.use_combiner:
+                    # Learned combination: f(original, correction) -> corrected
+                    processed_x = self.combiner(
+                        torch.cat([effective_correction, tok_emb], dim=-1)
+                    )
+                elif self.no_self_embed:
+                    processed_x = effective_correction
+                else:
+                    processed_x = tok_emb + effective_correction
             else:
                 processed_x = processed_x + effective_correction
 
-        return processed_x, correction, total_vq_loss
+            # Convergence loss: push last iteration output toward previous
+            if self.convergence_weight > 0 and self.training and k == n_iters - 1:
+                total_conv_loss = F.mse_loss(
+                    processed_x, prev_processed_x.detach()
+                )
+
+        aux_loss = total_conv_loss
+        return processed_x, correction, aux_loss
 
     def _build_output(self, processed_x, correction):
         """Build classification input from processed embeddings and correction."""
@@ -273,7 +333,7 @@ class LookAheadModel(nn.Module):
     def forward(self, idx, targets=None):
         """Training forward pass. Returns (logits, loss)."""
         tok_emb = self._get_embeddings(idx)
-        processed_x, correction, vq_loss = self._run_iterations(tok_emb, self.n_iters)
+        processed_x, correction, aux_loss = self._run_iterations(tok_emb, self.n_iters)
         output = self._build_output(processed_x, correction)
         logits = self._classify(output)
 
@@ -282,10 +342,8 @@ class LookAheadModel(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1)
             )
-            if self.vq is not None and self._current_iter >= self.vq_start_iter:
-                loss = loss + vq_loss
-        if self.training:
-            self._current_iter += 1
+            if aux_loss > 0:
+                loss = loss + self.convergence_weight * aux_loss
         return logits, loss
 
     @torch.no_grad()
@@ -300,30 +358,38 @@ class LookAheadModel(nn.Module):
         return idx
 
     @torch.no_grad()
-    def generate2(self, idx, max_new_tokens):
+    def generate2(self, idx, max_new_tokens, prime_tokens=None):
         """Single-step warm-started generation (look-ahead mode only).
 
-        Uses the correction from the previous step as a warm start,
-        requiring only one block evaluation per token.
+        Primes the first `prime_tokens` tokens at full depth N so the
+        correction cache is fully built up. After priming, each subsequent
+        token requires only one block evaluation.
+
+        Args:
+            prime_tokens: number of tokens to generate at full depth before
+                switching to K=1. Defaults to n_iters.
         """
         if not (self.non_cumulative and self.past_only):
             return self.generate(idx, max_new_tokens)
 
+        if prime_tokens is None:
+            prime_tokens = self.n_iters
+
         # Track effective correction (shifted) = processed_x - tok_emb
         eff_corr = None
 
-        for _ in range(max_new_tokens):
+        for i in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
             tok_emb = self._get_embeddings(idx_cond)
             B, T, C = tok_emb.shape
             zero = torch.zeros(B, 1, C, device=tok_emb.device)
 
-            if eff_corr is None:
-                # Bootstrap: full-depth
+            if i < prime_tokens:
+                # Priming phase: full-depth iterations
                 processed_x, correction, _ = self._run_iterations(
                     tok_emb, self.n_iters
                 )
-                eff_corr = processed_x - tok_emb  # shifted correction
+                eff_corr = processed_x - tok_emb
                 output = self._build_output(processed_x, correction)
             else:
                 # Warm start: reuse previous effective correction
@@ -334,13 +400,17 @@ class LookAheadModel(nn.Module):
                     pad = torch.zeros(
                         B, T - ec.shape[1], C, device=tok_emb.device
                     )
-                    ec = torch.cat([ec, pad], dim=1)
+                    ec = torch.cat([pad, ec], dim=1)
 
-                processed_x = tok_emb + ec  # warm-started
+                if self.use_combiner:
+                    processed_x = self.combiner(
+                        torch.cat([ec, tok_emb], dim=-1)
+                    )
+                else:
+                    processed_x = tok_emb + ec  # warm-started
 
                 # One block evaluation
-                block_out = self._apply_block(processed_x)
-                correction = block_out - processed_x
+                correction = self._apply_block(processed_x)
 
                 # Save new effective correction for next step
                 eff_corr = torch.cat(
@@ -377,6 +447,79 @@ class LookAheadModel(nn.Module):
             )
         return logits, loss
 
+    def forward_sequential(self, idx, targets=None):
+        """Sequential evaluation: process positions one at a time.
+
+        Each position sees already-contextualized previous positions.
+        This matches autoregressive deployment when K>1 during training
+        (the unit learned to handle contextualized inputs).
+
+        For K=1 (e.g. D=N), the unit only saw raw tok_emb during training,
+        so sequential buildup is invalid — falls back to parallel K=1.
+
+        Cost: T block evaluations.
+        """
+        if self.n_iters <= 1:
+            return self.forward_at_depth(idx, 1, targets)
+
+        tok_emb = self._get_embeddings(idx)
+        B, T, C = tok_emb.shape
+
+        # Build correction rotation matrix (JoFormer blocks only)
+        rot_matrix = None
+        use_projected_rotation = self.correct_rotation and self._has_projected_block()
+        if self.correct_rotation and not use_projected_rotation:
+            rot_matrix = self._build_correction_rotation(T, C, tok_emb.device)
+
+        processed_x = tok_emb.clone()
+        correction = torch.zeros_like(tok_emb)
+
+        for t in range(T):
+            if use_projected_rotation:
+                corr, raw_angles = self._apply_block(processed_x, return_raw_angles=True)
+            else:
+                corr = self._apply_block(processed_x)
+            correction[:, t, :] = corr[:, t, :]
+
+            # Past-only shift: correction at t updates position t+1
+            if t < T - 1:
+                corr_t = correction[:, t, :]
+                if use_projected_rotation and t >= 1:
+                    # Position-dependent rotation: R(-raw_angles[t-1])
+                    angle_t = -raw_angles[:, t - 1, :]  # (B, C//2)
+                    rot_t = build_rotation_matrix(
+                        torch.cos(angle_t).unsqueeze(1),
+                        torch.sin(angle_t).unsqueeze(1)
+                    )  # (B, 1, C//2, 2, 2)
+                    corr_t = apply_rotation(
+                        corr_t.unsqueeze(1), rot_t
+                    ).squeeze(1)
+                elif rot_matrix is not None:
+                    corr_t = apply_rotation(
+                        corr_t.unsqueeze(1), rot_matrix
+                    ).squeeze(1)
+
+                if self.use_combiner:
+                    combo_in = torch.cat([
+                        corr_t.unsqueeze(1),
+                        tok_emb[:, t+1:t+2, :]
+                    ], dim=-1)
+                    processed_x[:, t+1:t+2, :] = self.combiner(combo_in)
+                elif self.no_self_embed:
+                    processed_x[:, t+1, :] = corr_t
+                else:
+                    processed_x[:, t+1, :] = tok_emb[:, t+1, :] + corr_t
+
+        output = self._build_output(processed_x, correction)
+        logits = self._classify(output)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+        return logits, loss
+
     def forward_with_diagnostics(self, idx, targets=None):
         """Forward pass returning convergence diagnostics (Section 4.6).
 
@@ -396,24 +539,40 @@ class LookAheadModel(nn.Module):
         correction_norms = []
         contraction_ratios = []
 
-        for k in range(self.n_iters):
-            block_out = self._apply_block(processed_x)
-            correction = block_out - processed_x
+        # Build correction rotation matrix (JoFormer blocks only)
+        rot_matrix = None
+        use_projected_rotation = self.correct_rotation and self._has_projected_block()
+        if self.correct_rotation and not use_projected_rotation:
+            rot_matrix = self._build_correction_rotation(T, C, tok_emb.device)
 
-            # Vector quantize the correction if enabled and past warmup
-            if self.vq is not None and self._current_iter >= self.vq_start_iter:
-                correction, _ = self.vq(correction)
+        for k in range(self.n_iters):
+            if use_projected_rotation:
+                correction, raw_angles = self._apply_block(processed_x, return_raw_angles=True)
+                rot_matrix = self._build_projected_rotation(raw_angles)
+            else:
+                correction = self._apply_block(processed_x)
 
             if self.past_only:
+                corr_to_shift = correction
+                if rot_matrix is not None:
+                    corr_to_shift = apply_rotation(correction, rot_matrix)
+
                 zero = torch.zeros(B, 1, C, device=tok_emb.device)
                 effective_correction = torch.cat(
-                    [zero, correction[:, :-1, :]], dim=1
+                    [zero, corr_to_shift[:, :-1, :]], dim=1
                 )
             else:
                 effective_correction = correction
 
             if self.non_cumulative:
-                processed_x = tok_emb + effective_correction
+                if self.use_combiner:
+                    processed_x = self.combiner(
+                        torch.cat([effective_correction, tok_emb], dim=-1)
+                    )
+                elif self.no_self_embed:
+                    processed_x = effective_correction
+                else:
+                    processed_x = tok_emb + effective_correction
             else:
                 processed_x = processed_x + effective_correction
 
@@ -497,8 +656,7 @@ class LookAheadModel(nn.Module):
                         )
                         ec = torch.cat([ec, pad], dim=1)
                     processed_x = tok_emb + ec
-                    block_out = self._apply_block(processed_x)
-                    correction = block_out - processed_x
+                    correction = self._apply_block(processed_x)
                     eff_corr = torch.cat(
                         [zero, correction[:, :-1, :]], dim=1
                     )
@@ -579,12 +737,12 @@ class LookAheadLearnedModel(LookAheadModel):
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
                  non_cumulative=True, past_only=True, use_softmax=False,
-                 concat_head=True, mlp_head=False):
+                 concat_head=True, mlp_head=False, **kwargs):
         # Initialize with JoFormerLearnedBlock
         super().__init__(
             vocab_size, n_embed, n_layers, block_size, dropout,
             JoFormerLearnedBlock, non_cumulative, past_only, use_softmax,
-            concat_head, mlp_head
+            concat_head, mlp_head, **kwargs
         )
         # Override embeddings to match JoFormerLearned
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
@@ -609,139 +767,447 @@ class LookAheadLearnedModel(LookAheadModel):
         return self.drop(x)
 
     def _apply_block(self, x):
-        """Apply block with cached angles."""
-        return self.block(x, self._angles)
+        """Apply block with cached angles, return correction (delta)."""
+        h = x
+        for block in self.blocks[:-1]:
+            h = block(h, self._angles)
+        return self.blocks[-1](h, self._angles) - h
+
+
+# ---------------------------------------------------------------------------
+# Stacked Look-Ahead Model
+# ---------------------------------------------------------------------------
+
+class StackedLookAheadModel(nn.Module):
+    """Stacked look-ahead model: N units with separate weights, each iterated K times.
+
+    Each unit has its own shared-weight block. Within each unit, K iterations
+    run with non-cumulative corrections anchored to the unit's input (not tok_emb).
+    Between units, representations flow cumulatively (standard residual stacking).
+
+    At inference K=1: equivalent to a standard N-layer transformer.
+    During training: N*K effective depth.
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
+                 block_cls, n_units, use_softmax=False,
+                 convergence_weight=0.0, full_correction=False):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.n_embed = n_embed
+        self.n_units = n_units
+        self.k_iters = n_layers // n_units  # iterations per unit
+        self.block_size = block_size
+        self.convergence_weight = convergence_weight
+        self.full_correction = full_correction
+
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.drop = nn.Dropout(dropout)
+
+        # N units, each with its own block (separate weights between units)
+        self.units = nn.ModuleList([
+            block_cls(n_embed, block_size, dropout, use_softmax)
+            for _ in range(n_units)
+        ])
+
+        self.ln_f = nn.LayerNorm(n_embed)
+        self.head = nn.Linear(n_embed, vocab_size)
+
+    def _apply_unit(self, block, x):
+        """Apply one block and return correction."""
+        if self.full_correction:
+            return block(x)
+        else:
+            return block(x) - x
+
+    def _run_unit(self, block, anchor, k_iters):
+        """Run K iterations of one unit with non-cumulative corrections."""
+        B, T, C = anchor.shape
+        processed = anchor
+        prev_processed = None
+
+        for k in range(k_iters):
+            prev_processed = processed
+            correction = self._apply_unit(block, processed)
+
+            # Past-only shift: position t gets correction from t-1
+            zero = torch.zeros(B, 1, C, device=anchor.device)
+            shifted = torch.cat([zero, correction[:, :-1, :]], dim=1)
+
+            # Non-cumulative: reset to unit input
+            processed = anchor + shifted
+
+        # Convergence loss for this unit
+        conv_loss = 0.0
+        if self.convergence_weight > 0 and self.training and k_iters > 1:
+            conv_loss = F.mse_loss(processed, prev_processed.detach())
+
+        return processed, conv_loss
+
+    def forward(self, idx, targets=None):
+        tok_emb = self.drop(self.token_embedding_table(idx))
+        h = tok_emb
+        total_conv_loss = 0.0
+
+        for block in self.units:
+            h, conv_loss = self._run_unit(block, h, self.k_iters)
+            total_conv_loss = total_conv_loss + conv_loss
+
+        logits = self.head(self.ln_f(h))
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+            if total_conv_loss > 0:
+                loss = loss + self.convergence_weight * total_conv_loss
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size:]
+            logits, _ = self(idx_cond)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, idx_next], dim=1)
+        return idx
+
+    @torch.no_grad()
+    def generate2(self, idx, max_new_tokens, prime_tokens=None):
+        """At K=1, each unit is just one block — standard transformer generation."""
+        return self.generate(idx, max_new_tokens)
+
+    def forward_at_depth(self, idx, K, targets=None):
+        """Evaluate with K iterations per unit."""
+        tok_emb = self.drop(self.token_embedding_table(idx))
+        h = tok_emb
+
+        for block in self.units:
+            h, _ = self._run_unit(block, h, K)
+
+        logits = self.head(self.ln_f(h))
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+        return logits, loss
+
+    def forward_sequential(self, idx, targets=None):
+        """Sequential evaluation: process positions one at a time per unit.
+
+        For each unit, processes positions left-to-right so each position
+        sees contextualized previous positions from that unit.
+        """
+        if self.k_iters <= 1:
+            return self.forward_at_depth(idx, 1, targets)
+
+        tok_emb = self.drop(self.token_embedding_table(idx))
+        B, T, C = tok_emb.shape
+        h = tok_emb
+
+        for block in self.units:
+            anchor = h.clone()
+            processed = h.clone()
+
+            for t in range(T):
+                corr = self._apply_unit(block, processed)
+                if t < T - 1:
+                    zero_pad = torch.zeros(B, 1, C, device=h.device)
+                    shifted = torch.cat([zero_pad, corr[:, :-1, :]], dim=1)
+                    processed[:, t+1, :] = anchor[:, t+1, :] + shifted[:, t+1, :]
+
+            h = processed
+
+        logits = self.head(self.ln_f(h))
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+        return logits, loss
+
+    def forward_with_diagnostics(self, idx, targets=None):
+        """Forward pass with convergence diagnostics (per-unit)."""
+        tok_emb = self.drop(self.token_embedding_table(idx))
+        h = tok_emb
+        all_ratios = []
+        all_norms = []
+
+        for block in self.units:
+            B, T, C = h.shape
+            anchor = h
+            processed = anchor
+            prev_correction = None
+            unit_ratios = []
+
+            for k in range(self.k_iters):
+                correction = self._apply_unit(block, processed)
+
+                zero = torch.zeros(B, 1, C, device=h.device)
+                shifted = torch.cat([zero, correction[:, :-1, :]], dim=1)
+                processed = anchor + shifted
+
+                corr_norm = correction.norm(dim=-1).mean().item()
+                all_norms.append(corr_norm)
+
+                if prev_correction is not None:
+                    diff = (correction - prev_correction).norm(dim=-1).mean()
+                    prev_diff = prev_correction.norm(dim=-1).mean()
+                    if prev_diff > 1e-8:
+                        unit_ratios.append((diff / prev_diff).item())
+                prev_correction = correction
+
+            h = processed
+            all_ratios.extend(unit_ratios)
+
+        logits = self.head(self.ln_f(h))
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1)
+            )
+
+        diag = {
+            'empirical_L': all_ratios[-1] if all_ratios else None,
+            'correction_norms': all_norms,
+            'contraction_ratios': all_ratios,
+        }
+        return logits, loss, diag
 
 
 # ---------------------------------------------------------------------------
 # Factory functions (matching joformer constructor interface)
 # ---------------------------------------------------------------------------
+#
+# Model factory guide:
+#
+# LOOK-AHEAD VARIANTS (shared weights, non-cumulative, past-only):
+#   correction = block(x) - x (delta extraction)
+#   processed_x[t] = tok_emb[t] + correction[t-1]
+#
+#   {block}_look_ahead           — concat head (2C -> vocab), correction cat'd with processed_x
+#   {block}_look_ahead_nocat     — linear head (C -> vocab), uses processed_x only
+#   {block}_look_ahead_mlp       — MLP head (C -> 4C -> vocab), uses processed_x only
+#
+#   block types: roformer, joformer_fixed, joformer_learned, joformer_projected
+#
+# FULL CORRECTION VARIANT:
+#   No delta subtraction — network output h is used directly as correction.
+#   processed_x[t] = tok_emb[t] + h[t-1]   (h includes input due to residuals)
+#
+#   roformer_look_ahead_nocat_full — linear head, full correction
+#
+# PAST-ONLY BASELINE:
+#   Like full correction but without adding tok_emb back.
+#   processed_x[t] = h[t-1]   (position t gets only past network output)
+#
+#   roformer_look_ahead_nocat_pastonly — linear head, no self-embed
+#
+# ROTATION-CORRECTED VARIANTS (JoFormer only):
+#   Pre-rotates correction by R(-raw_angle) before shifting to fix
+#   rotation frame mismatch between positions.
+#
+#   joformer_fixed_look_ahead[_nocat|_mlp]_corrected
+#
+# BASELINES (shared weights, cumulative, self-inclusive):
+#   Standard shared-weight iteration: x_k = x_{k-1} + f(x_{k-1})
+#   No past-only shift — position t sees its own correction.
+#
+#   {block}_baseline
+#
+# ABLATIONS:
+#   joformer_fixed_noncum_only   — non-cumulative but NO past-only shift
+#   joformer_fixed_pastonly_only  — past-only shift but cumulative
+#
+# STANDARD TRANSFORMERS (separate weights per layer, no look-ahead):
+#   roformer, joformer_fixed, joformer_learned, joformer_projected
+#
+# ---------------------------------------------------------------------------
 
 # --- Look-ahead (Model A): non-cumulative + past-only ---
 
 def make_roformer_look_ahead(vocab_size, n_embed, n_layers, block_size,
-                              dropout, use_softmax=False):
+                              dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           RoFormerBlock, non_cumulative=True, past_only=True,
-                          use_softmax=use_softmax)
+                          use_softmax=use_softmax, **kwargs)
 
 def make_roformer_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
-                                    dropout, use_softmax=False):
+                                    dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           RoFormerBlock, non_cumulative=True, past_only=True,
-                          use_softmax=use_softmax, concat_head=False)
+                          use_softmax=use_softmax, concat_head=False, **kwargs)
 
 def make_roformer_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
-                                  dropout, use_softmax=False):
+                                  dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           RoFormerBlock, non_cumulative=True, past_only=True,
-                          use_softmax=use_softmax, concat_head=False, mlp_head=True)
+                          use_softmax=use_softmax, concat_head=False, mlp_head=True, **kwargs)
 
-def make_roformer_look_ahead_nocat_vq(vocab_size, n_embed, n_layers, block_size,
-                                       dropout, use_softmax=False):
+def make_roformer_look_ahead_nocat_full(vocab_size, n_embed, n_layers, block_size,
+                                        dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           RoFormerBlock, non_cumulative=True, past_only=True,
                           use_softmax=use_softmax, concat_head=False,
-                          vq_codes=25000, vq_start_iter=500)
+                          full_correction=True, **kwargs)
+
+def make_roformer_look_ahead_nocat_pastonly(vocab_size, n_embed, n_layers, block_size,
+                                            dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          full_correction=True, no_self_embed=True, **kwargs)
 
 def make_joformer_fixed_look_ahead(vocab_size, n_embed, n_layers, block_size,
-                                    dropout, use_softmax=False):
+                                    dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=True, past_only=True,
-                          use_softmax=use_softmax)
+                          use_softmax=use_softmax, **kwargs)
 
 def make_joformer_fixed_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
-                                          dropout, use_softmax=False):
+                                          dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=True, past_only=True,
-                          use_softmax=use_softmax, concat_head=False)
+                          use_softmax=use_softmax, concat_head=False, **kwargs)
 
 def make_joformer_fixed_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
-                                        dropout, use_softmax=False):
+                                        dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=True, past_only=True,
-                          use_softmax=use_softmax, concat_head=False, mlp_head=True)
+                          use_softmax=use_softmax, concat_head=False, mlp_head=True, **kwargs)
 
 def make_joformer_learned_look_ahead(vocab_size, n_embed, n_layers, block_size,
-                                      dropout, use_softmax=False):
+                                      dropout, use_softmax=False, **kwargs):
     return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
                                   dropout, non_cumulative=True, past_only=True,
-                                  use_softmax=use_softmax)
+                                  use_softmax=use_softmax, **kwargs)
 
 def make_joformer_learned_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
-                                            dropout, use_softmax=False):
+                                            dropout, use_softmax=False, **kwargs):
     return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
                                   dropout, non_cumulative=True, past_only=True,
-                                  use_softmax=use_softmax, concat_head=False)
+                                  use_softmax=use_softmax, concat_head=False, **kwargs)
 
 def make_joformer_learned_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
-                                          dropout, use_softmax=False):
+                                          dropout, use_softmax=False, **kwargs):
     return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
                                   dropout, non_cumulative=True, past_only=True,
-                                  use_softmax=use_softmax, concat_head=False, mlp_head=True)
+                                  use_softmax=use_softmax, concat_head=False, mlp_head=True, **kwargs)
 
 def make_joformer_projected_look_ahead(vocab_size, n_embed, n_layers, block_size,
-                                        dropout, use_softmax=False):
+                                        dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerProjectedBlockCausal, non_cumulative=True,
-                          past_only=True, use_softmax=use_softmax)
+                          past_only=True, use_softmax=use_softmax, **kwargs)
 
 def make_joformer_projected_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
-                                              dropout, use_softmax=False):
+                                              dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerProjectedBlockCausal, non_cumulative=True,
-                          past_only=True, use_softmax=use_softmax, concat_head=False)
+                          past_only=True, use_softmax=use_softmax, concat_head=False, **kwargs)
 
 def make_joformer_projected_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
-                                            dropout, use_softmax=False):
+                                            dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerProjectedBlockCausal, non_cumulative=True,
-                          past_only=True, use_softmax=use_softmax, concat_head=False, mlp_head=True)
+                          past_only=True, use_softmax=use_softmax, concat_head=False, mlp_head=True, **kwargs)
+
+# --- Look-ahead with rotation-corrected shift (JoFormer blocks only) ---
+
+def make_joformer_fixed_look_ahead_corrected(vocab_size, n_embed, n_layers, block_size,
+                                              dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerFixedBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, correct_rotation=True, **kwargs)
+
+def make_joformer_fixed_look_ahead_nocat_corrected(vocab_size, n_embed, n_layers, block_size,
+                                                    dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerFixedBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, correct_rotation=True, **kwargs)
+
+def make_joformer_fixed_look_ahead_mlp_corrected(vocab_size, n_embed, n_layers, block_size,
+                                                  dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerFixedBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, mlp_head=True, correct_rotation=True, **kwargs)
+
+def make_joformer_projected_look_ahead_corrected(vocab_size, n_embed, n_layers, block_size,
+                                                  dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerProjectedBlockCausal, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, correct_rotation=True, **kwargs)
+
+def make_joformer_projected_look_ahead_nocat_corrected(vocab_size, n_embed, n_layers, block_size,
+                                                        dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerProjectedBlockCausal, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, correct_rotation=True, **kwargs)
+
+def make_joformer_projected_look_ahead_mlp_corrected(vocab_size, n_embed, n_layers, block_size,
+                                                      dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerProjectedBlockCausal, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, mlp_head=True, correct_rotation=True, **kwargs)
 
 # --- Baseline (Model B): cumulative + self-inclusive (shared weights) ---
 
 def make_roformer_baseline(vocab_size, n_embed, n_layers, block_size,
-                            dropout, use_softmax=False):
+                            dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           RoFormerBlock, non_cumulative=False, past_only=False,
-                          use_softmax=use_softmax)
+                          use_softmax=use_softmax, **kwargs)
 
 def make_joformer_fixed_baseline(vocab_size, n_embed, n_layers, block_size,
-                                  dropout, use_softmax=False):
+                                  dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=False, past_only=False,
-                          use_softmax=use_softmax)
+                          use_softmax=use_softmax, **kwargs)
 
 def make_joformer_learned_baseline(vocab_size, n_embed, n_layers, block_size,
-                                    dropout, use_softmax=False):
+                                    dropout, use_softmax=False, **kwargs):
     return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
                                   dropout, non_cumulative=False, past_only=False,
-                                  use_softmax=use_softmax)
+                                  use_softmax=use_softmax, **kwargs)
 
 def make_joformer_projected_baseline(vocab_size, n_embed, n_layers, block_size,
-                                      dropout, use_softmax=False):
+                                      dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerProjectedBlock, non_cumulative=False,
-                          past_only=False, use_softmax=use_softmax)
+                          past_only=False, use_softmax=use_softmax, **kwargs)
+
+# --- Stacked look-ahead (N units x K iterations) ---
+
+def make_roformer_stacked_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
+                                            dropout, use_softmax=False, n_units=None,
+                                            **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 RoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, **kwargs)
 
 # --- Ablation: non-cumulative + self-inclusive ---
 
 def make_joformer_fixed_noncum_only(vocab_size, n_embed, n_layers, block_size,
-                                     dropout, use_softmax=False):
+                                     dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=True, past_only=False,
-                          use_softmax=use_softmax)
+                          use_softmax=use_softmax, **kwargs)
 
 # --- Ablation: cumulative + past-only ---
 
 def make_joformer_fixed_pastonly_only(vocab_size, n_embed, n_layers, block_size,
-                                      dropout, use_softmax=False):
+                                      dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerFixedBlock, non_cumulative=False, past_only=True,
-                          use_softmax=use_softmax)
-
-# --- VQ variants: vector-quantized corrections for discrete convergence ---
-
+                          use_softmax=use_softmax, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -752,6 +1218,8 @@ MODEL_CLASSES = {
     'roformer_look_ahead':                make_roformer_look_ahead,
     'roformer_look_ahead_nocat':          make_roformer_look_ahead_nocat,
     'roformer_look_ahead_mlp':            make_roformer_look_ahead_mlp,
+    'roformer_look_ahead_nocat_full':     make_roformer_look_ahead_nocat_full,
+    'roformer_look_ahead_nocat_pastonly': make_roformer_look_ahead_nocat_pastonly,
     'joformer_fixed_look_ahead':          make_joformer_fixed_look_ahead,
     'joformer_fixed_look_ahead_nocat':    make_joformer_fixed_look_ahead_nocat,
     'joformer_fixed_look_ahead_mlp':      make_joformer_fixed_look_ahead_mlp,
@@ -762,18 +1230,26 @@ MODEL_CLASSES = {
     'joformer_projected_look_ahead_nocat': make_joformer_projected_look_ahead_nocat,
     'joformer_projected_look_ahead_mlp':  make_joformer_projected_look_ahead_mlp,
 
+    # Look-ahead with rotation-corrected shift (JoFormer only)
+    'joformer_fixed_look_ahead_corrected':          make_joformer_fixed_look_ahead_corrected,
+    'joformer_fixed_look_ahead_nocat_corrected':    make_joformer_fixed_look_ahead_nocat_corrected,
+    'joformer_fixed_look_ahead_mlp_corrected':      make_joformer_fixed_look_ahead_mlp_corrected,
+    'joformer_projected_look_ahead_corrected':      make_joformer_projected_look_ahead_corrected,
+    'joformer_projected_look_ahead_nocat_corrected': make_joformer_projected_look_ahead_nocat_corrected,
+    'joformer_projected_look_ahead_mlp_corrected':  make_joformer_projected_look_ahead_mlp_corrected,
+
     # Baseline variants (Model B: shared weights, cumulative, self-inclusive)
     'roformer_baseline':             make_roformer_baseline,
     'joformer_fixed_baseline':       make_joformer_fixed_baseline,
     'joformer_learned_baseline':     make_joformer_learned_baseline,
     'joformer_projected_baseline':   make_joformer_projected_baseline,
 
+    # Stacked look-ahead (N units x K iterations per unit)
+    'roformer_stacked_look_ahead_nocat': make_roformer_stacked_look_ahead_nocat,
+
     # Ablations (on joformer_fixed)
     'joformer_fixed_noncum_only':    make_joformer_fixed_noncum_only,
     'joformer_fixed_pastonly_only':   make_joformer_fixed_pastonly_only,
-
-    # VQ variants (vector-quantized corrections)
-    'roformer_look_ahead_nocat_vq':          make_roformer_look_ahead_nocat_vq,
 
     # Original joformer models (separate blocks, for reference)
     'roformer':            RoFormer,

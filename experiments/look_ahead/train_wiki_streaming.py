@@ -186,16 +186,19 @@ def get_batch(train_data, val_data, split, block_size, batch_size, device):
 @torch.no_grad()
 def estimate_loss(model, train_data, val_data, block_size, batch_size, device,
                   eval_iters=20):
-    """Estimate train/val loss."""
+    """Estimate train/val loss using fixed batches (seeded RNG)."""
     out = {}
     model.eval()
     for split in ['train', 'val']:
+        rng_state = torch.random.get_rng_state()
+        torch.manual_seed(42)
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(train_data, val_data, split,
                              block_size, batch_size, device)
             _, loss = model(X, Y)
             losses[k] = loss.item()
+        torch.random.set_rng_state(rng_state)
         out[split] = losses.mean().item()
     model.train()
     return out
@@ -206,12 +209,33 @@ def estimate_loss_at_depth(model, train_data, val_data, block_size, batch_size,
                            device, K, eval_iters=20):
     """Estimate val loss at inference depth K (Section 4.5)."""
     model.eval()
+    rng_state = torch.random.get_rng_state()
+    torch.manual_seed(42)
     losses = torch.zeros(eval_iters)
     for k in range(eval_iters):
         X, Y = get_batch(train_data, val_data, 'val',
                          block_size, batch_size, device)
         _, loss = model.forward_at_depth(X, K, Y)
         losses[k] = loss.item()
+    torch.random.set_rng_state(rng_state)
+    model.train()
+    return losses.mean().item()
+
+
+@torch.no_grad()
+def estimate_loss_sequential(model, train_data, val_data, block_size, batch_size,
+                             device, eval_iters=20):
+    """Estimate val loss for sequential eval (true autoregressive quality)."""
+    model.eval()
+    rng_state = torch.random.get_rng_state()
+    torch.manual_seed(42)
+    losses = torch.zeros(eval_iters)
+    for k in range(eval_iters):
+        X, Y = get_batch(train_data, val_data, 'val',
+                         block_size, batch_size, device)
+        _, loss = model.forward_sequential(X, Y)
+        losses[k] = loss.item()
+    torch.random.set_rng_state(rng_state)
     model.train()
     return losses.mean().item()
 
@@ -223,6 +247,8 @@ def compute_diagnostics(model, train_data, val_data, block_size, batch_size,
     model.eval()
     all_norms = []
     all_ratios = []
+    rng_state = torch.random.get_rng_state()
+    torch.manual_seed(42)
 
     for _ in range(n_batches):
         X, Y = get_batch(train_data, val_data, 'val',
@@ -232,6 +258,7 @@ def compute_diagnostics(model, train_data, val_data, block_size, batch_size,
         if diag['contraction_ratios']:
             all_ratios.append(diag['contraction_ratios'])
 
+    torch.random.set_rng_state(rng_state)
     model.train()
 
     # Average across batches
@@ -364,18 +391,28 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
 
     print(f"\n  [{model_name}] final val loss: {losses['val']:.4f} (PPL {val_ppl:.2f})")
 
-    # Depth sweep (Section 4.5)
+    # Depth sweep — parallel (Section 4.5)
     if hasattr(model, 'forward_at_depth'):
         depth_results = {}
-        for K in [1, 2, 3, 5, model.n_iters, model.n_iters * 2]:
-            K = min(K, 50)  # cap
+        depths = sorted(set(K for K in [1, 2, 3, 5, model.n_iters] if K <= model.n_iters))
+        for K in depths:
             val_loss_K = estimate_loss_at_depth(
                 model, train_data, val_data,
                 args.block_size, args.batch_size, device, K
             )
             ppl_K = math.exp(min(val_loss_K, 20))
             depth_results[K] = {'val_loss': val_loss_K, 'val_ppl': round(ppl_K, 2)}
-            print(f"  [{model_name}]   depth K={K}: val loss {val_loss_K:.4f} (PPL {ppl_K:.2f})")
+            print(f"  [{model_name}]   parallel K={K}: val loss {val_loss_K:.4f} (PPL {ppl_K:.2f})")
+
+        # Sequential eval (true autoregressive quality, K-independent)
+        if hasattr(model, 'forward_sequential'):
+            val_loss_seq = estimate_loss_sequential(
+                model, train_data, val_data,
+                args.block_size, args.batch_size, device
+            )
+            ppl_seq = math.exp(min(val_loss_seq, 20))
+            depth_results['sequential'] = {'val_loss': val_loss_seq, 'val_ppl': round(ppl_seq, 2)}
+            print(f"  [{model_name}]   sequential: val loss {val_loss_seq:.4f} (PPL {ppl_seq:.2f})")
 
     # Final generation
     try:
@@ -467,8 +504,21 @@ def run_training(args):
     for model_name in args.models:
         torch.manual_seed(args.seed)
         cls = MODEL_CLASSES[model_name]
+        # Build extra kwargs for look-ahead models (combiner, VQ)
+        # Original joformer classes don't accept these, so only pass to factories
+        extra_kwargs = {}
+        if not isinstance(cls, type):  # factory function, not a class
+            if args.combiner:
+                extra_kwargs['use_combiner'] = True
+            if args.convergence_weight > 0:
+                extra_kwargs['convergence_weight'] = args.convergence_weight
+            if args.d_block > 1:
+                extra_kwargs['d_block'] = args.d_block
+            if args.n_units > 0:
+                extra_kwargs['n_units'] = args.n_units
         model = cls(actual_vocab_size, args.n_embed, args.n_layers,
-                    args.block_size, args.dropout, use_softmax=args.softmax)
+                    args.block_size, args.dropout, use_softmax=args.softmax,
+                    **extra_kwargs)
         val_loss, val_ppl, ppl_log, extra = train_model(
             model_name, model, train_data, val_data, args, device, tokenizer
         )
@@ -487,8 +537,9 @@ def run_training(args):
         r = results[name]
         torch.manual_seed(args.seed)
         cls = MODEL_CLASSES[name]
+        ek = extra_kwargs if not isinstance(cls, type) else {}
         m = cls(actual_vocab_size, args.n_embed, args.n_layers,
-                args.block_size, args.dropout)
+                args.block_size, args.dropout, **ek)
         n_params = sum(p.numel() for p in m.parameters())
         print(f"{name:<20} {n_params:>10,} {r['val_loss']:>10.4f} {r['val_ppl']:>10.2f}")
     print(f"{'='*60}")
@@ -561,6 +612,15 @@ def add_training_args(parser):
                         help='Ignored (interface compat)')
     parser.add_argument('--cosine_decay', action='store_true',
                         help='Use cosine annealing LR schedule')
+    parser.add_argument('--combiner', action='store_true',
+                        help='Use learned combiner f(correction, original) instead of addition')
+    parser.add_argument('--convergence_weight', type=float, default=0.0,
+                        help='Weight for MSE convergence loss between consecutive iterations')
+    parser.add_argument('--n_units', type=int, default=0,
+                        help='Number of units for stacked look-ahead model (0=unused)')
+    parser.add_argument('--d_block', type=int, default=1,
+                        help='Number of sequential blocks per shared unit (D-block). '
+                             'D=1 is single shared block, D=N is standard transformer.')
 
 
 def main():
