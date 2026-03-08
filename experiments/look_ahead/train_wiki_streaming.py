@@ -516,6 +516,8 @@ def run_training(args):
                 extra_kwargs['d_block'] = args.d_block
             if args.n_units > 0:
                 extra_kwargs['n_units'] = args.n_units
+            if args.window_size > 0:
+                extra_kwargs['window_size'] = args.window_size
         model = cls(actual_vocab_size, args.n_embed, args.n_layers,
                     args.block_size, args.dropout, use_softmax=args.softmax,
                     **extra_kwargs)
@@ -621,6 +623,9 @@ def add_training_args(parser):
     parser.add_argument('--d_block', type=int, default=1,
                         help='Number of sequential blocks per shared unit (D-block). '
                              'D=1 is single shared block, D=N is standard transformer.')
+    parser.add_argument('--window_size', type=int, default=0,
+                        help='Sliding window size for windowed attention models. '
+                             '0 = no windowing (use full causal mask).')
 
 
 def main():

@@ -49,6 +49,13 @@ from train_wiki import (
     build_rotation_matrix, apply_rotation, apply_inverse_rotation,
 )
 
+# Windowed attention variants
+from windowed_attention import (
+    WindowedRoFormerBlock,
+    WindowedJoFormerProjectedBlockCausal,
+    WindowedRoFormer,
+)
+
 
 # ---------------------------------------------------------------------------
 # JoFormerProjectedBlock with causal angle shift for look-ahead architecture
@@ -126,7 +133,8 @@ class LookAheadModel(nn.Module):
                  use_softmax=False, concat_head=True, mlp_head=False,
                  use_combiner=False,
                  convergence_weight=0.0, d_block=1, correct_rotation=False,
-                 full_correction=False, no_self_embed=False):
+                 full_correction=False, no_self_embed=False, window_size=None,
+                 correction_head=False, additive_head=False, proj_head=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
@@ -136,6 +144,9 @@ class LookAheadModel(nn.Module):
         self.non_cumulative = non_cumulative
         self.past_only = past_only
         self.concat_head = concat_head
+        self.correction_head = correction_head  # head uses correction[t] (self-inclusive, size C)
+        self.additive_head = additive_head  # head uses processed_x[t] + correction[t]
+        self.proj_head = proj_head  # head uses Linear(2C→C)([processed_x; correction])
         self.correct_rotation = correct_rotation
         self.full_correction = full_correction
         self.no_self_embed = no_self_embed  # don't add tok_emb back, just use shifted output
@@ -144,8 +155,12 @@ class LookAheadModel(nn.Module):
         self.drop = nn.Dropout(dropout)
 
         # Shared-weight unit: D blocks with separate weights, iterated K times
+        block_kwargs = dict(n_embed=n_embed, block_size=block_size,
+                            dropout=dropout, use_softmax=use_softmax)
+        if window_size is not None:
+            block_kwargs['window_size'] = window_size
         self.blocks = nn.ModuleList([
-            block_cls(n_embed, block_size, dropout, use_softmax)
+            block_cls(**block_kwargs)
             for _ in range(d_block)
         ])
 
@@ -160,6 +175,10 @@ class LookAheadModel(nn.Module):
             )
 
         self.convergence_weight = convergence_weight
+
+        # Projection layer for proj_head: 2C → C
+        if proj_head:
+            self.head_proj = nn.Linear(2 * n_embed, n_embed)
 
         # Classification head
         head_in = 2 * n_embed if (past_only and concat_head) else n_embed
@@ -318,8 +337,16 @@ class LookAheadModel(nn.Module):
 
     def _build_output(self, processed_x, correction):
         """Build classification input from processed embeddings and correction."""
-        if self.past_only and correction is not None and self.concat_head:
-            return torch.cat([processed_x, correction], dim=2)  # (B, T, 2C)
+        if self.past_only and correction is not None:
+            if self.concat_head:
+                return torch.cat([processed_x, correction], dim=2)  # (B, T, 2C)
+            if self.correction_head:
+                return correction  # (B, T, C) — self-inclusive
+            if self.additive_head:
+                return processed_x + correction  # (B, T, C) — zero extra params
+            if self.proj_head:
+                cat = torch.cat([processed_x, correction], dim=2)  # (B, T, 2C)
+                return self.head_proj(cat)  # (B, T, C)
         return processed_x
 
     def _classify(self, output):
@@ -791,7 +818,9 @@ class StackedLookAheadModel(nn.Module):
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
                  block_cls, n_units, use_softmax=False,
-                 convergence_weight=0.0, full_correction=False):
+                 convergence_weight=0.0, full_correction=False,
+                 concat_head=False, correction_head=False,
+                 additive_head=False, proj_head=False, window_size=None):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
@@ -800,18 +829,31 @@ class StackedLookAheadModel(nn.Module):
         self.block_size = block_size
         self.convergence_weight = convergence_weight
         self.full_correction = full_correction
+        self.concat_head = concat_head
+        self.correction_head = correction_head
+        self.additive_head = additive_head
+        self.proj_head = proj_head
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.drop = nn.Dropout(dropout)
 
         # N units, each with its own block (separate weights between units)
+        block_kwargs = dict(n_embed=n_embed, block_size=block_size,
+                            dropout=dropout, use_softmax=use_softmax)
+        if window_size is not None:
+            block_kwargs['window_size'] = window_size
         self.units = nn.ModuleList([
-            block_cls(n_embed, block_size, dropout, use_softmax)
+            block_cls(**block_kwargs)
             for _ in range(n_units)
         ])
 
-        self.ln_f = nn.LayerNorm(n_embed)
-        self.head = nn.Linear(n_embed, vocab_size)
+        # Projection layer for proj_head: 2C → C
+        if proj_head:
+            self.head_proj = nn.Linear(2 * n_embed, n_embed)
+
+        head_in = 2 * n_embed if concat_head else n_embed
+        self.ln_f = nn.LayerNorm(head_in)
+        self.head = nn.Linear(head_in, vocab_size)
 
     def _apply_unit(self, block, x):
         """Apply one block and return correction."""
@@ -842,18 +884,33 @@ class StackedLookAheadModel(nn.Module):
         if self.convergence_weight > 0 and self.training and k_iters > 1:
             conv_loss = F.mse_loss(processed, prev_processed.detach())
 
-        return processed, conv_loss
+        return processed, correction, conv_loss
+
+    def _build_output(self, processed, correction):
+        if correction is not None:
+            if self.concat_head:
+                return torch.cat([processed, correction], dim=2)
+            if self.correction_head:
+                return correction
+            if self.additive_head:
+                return processed + correction
+            if self.proj_head:
+                cat = torch.cat([processed, correction], dim=2)
+                return self.head_proj(cat)
+        return processed
 
     def forward(self, idx, targets=None):
         tok_emb = self.drop(self.token_embedding_table(idx))
         h = tok_emb
         total_conv_loss = 0.0
+        correction = None
 
         for block in self.units:
-            h, conv_loss = self._run_unit(block, h, self.k_iters)
+            h, correction, conv_loss = self._run_unit(block, h, self.k_iters)
             total_conv_loss = total_conv_loss + conv_loss
 
-        logits = self.head(self.ln_f(h))
+        output = self._build_output(h, correction)
+        logits = self.head(self.ln_f(output))
 
         loss = None
         if targets is not None:
@@ -883,11 +940,13 @@ class StackedLookAheadModel(nn.Module):
         """Evaluate with K iterations per unit."""
         tok_emb = self.drop(self.token_embedding_table(idx))
         h = tok_emb
+        correction = None
 
         for block in self.units:
-            h, _ = self._run_unit(block, h, K)
+            h, correction, _ = self._run_unit(block, h, K)
 
-        logits = self.head(self.ln_f(h))
+        output = self._build_output(h, correction)
+        logits = self.head(self.ln_f(output))
 
         loss = None
         if targets is not None:
@@ -909,6 +968,7 @@ class StackedLookAheadModel(nn.Module):
         B, T, C = tok_emb.shape
         h = tok_emb
 
+        last_corr = None
         for block in self.units:
             anchor = h.clone()
             processed = h.clone()
@@ -920,9 +980,11 @@ class StackedLookAheadModel(nn.Module):
                     shifted = torch.cat([zero_pad, corr[:, :-1, :]], dim=1)
                     processed[:, t+1, :] = anchor[:, t+1, :] + shifted[:, t+1, :]
 
+            last_corr = corr
             h = processed
 
-        logits = self.head(self.ln_f(h))
+        output = self._build_output(h, last_corr)
+        logits = self.head(self.ln_f(output))
 
         loss = None
         if targets is not None:
@@ -962,10 +1024,12 @@ class StackedLookAheadModel(nn.Module):
                         unit_ratios.append((diff / prev_diff).item())
                 prev_correction = correction
 
+            last_corr = correction
             h = processed
             all_ratios.extend(unit_ratios)
 
-        logits = self.head(self.ln_f(h))
+        output = self._build_output(h, last_corr)
+        logits = self.head(self.ln_f(output))
 
         loss = None
         if targets is not None:
@@ -1044,6 +1108,27 @@ def make_roformer_look_ahead_nocat(vocab_size, n_embed, n_layers, block_size,
                           RoFormerBlock, non_cumulative=True, past_only=True,
                           use_softmax=use_softmax, concat_head=False, **kwargs)
 
+def make_roformer_look_ahead_corrhead(vocab_size, n_embed, n_layers, block_size,
+                                       dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          correction_head=True, **kwargs)
+
+def make_roformer_look_ahead_addhead(vocab_size, n_embed, n_layers, block_size,
+                                      dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          additive_head=True, **kwargs)
+
+def make_roformer_look_ahead_projhead(vocab_size, n_embed, n_layers, block_size,
+                                       dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          RoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          proj_head=True, **kwargs)
+
 def make_roformer_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
                                   dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
@@ -1076,6 +1161,13 @@ def make_joformer_fixed_look_ahead_nocat(vocab_size, n_embed, n_layers, block_si
                           JoFormerFixedBlock, non_cumulative=True, past_only=True,
                           use_softmax=use_softmax, concat_head=False, **kwargs)
 
+def make_joformer_fixed_look_ahead_corrhead(vocab_size, n_embed, n_layers, block_size,
+                                              dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerFixedBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          correction_head=True, **kwargs)
+
 def make_joformer_fixed_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
                                         dropout, use_softmax=False, **kwargs):
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
@@ -1094,6 +1186,13 @@ def make_joformer_learned_look_ahead_nocat(vocab_size, n_embed, n_layers, block_
                                   dropout, non_cumulative=True, past_only=True,
                                   use_softmax=use_softmax, concat_head=False, **kwargs)
 
+def make_joformer_learned_look_ahead_corrhead(vocab_size, n_embed, n_layers, block_size,
+                                                dropout, use_softmax=False, **kwargs):
+    return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
+                                  dropout, non_cumulative=True, past_only=True,
+                                  use_softmax=use_softmax, concat_head=False,
+                                  correction_head=True, **kwargs)
+
 def make_joformer_learned_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
                                           dropout, use_softmax=False, **kwargs):
     return LookAheadLearnedModel(vocab_size, n_embed, n_layers, block_size,
@@ -1111,6 +1210,13 @@ def make_joformer_projected_look_ahead_nocat(vocab_size, n_embed, n_layers, bloc
     return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                           JoFormerProjectedBlockCausal, non_cumulative=True,
                           past_only=True, use_softmax=use_softmax, concat_head=False, **kwargs)
+
+def make_joformer_projected_look_ahead_corrhead(vocab_size, n_embed, n_layers, block_size,
+                                                  dropout, use_softmax=False, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          JoFormerProjectedBlockCausal, non_cumulative=True,
+                          past_only=True, use_softmax=use_softmax, concat_head=False,
+                          correction_head=True, **kwargs)
 
 def make_joformer_projected_look_ahead_mlp(vocab_size, n_embed, n_layers, block_size,
                                             dropout, use_softmax=False, **kwargs):
@@ -1156,6 +1262,22 @@ def make_joformer_projected_look_ahead_mlp_corrected(vocab_size, n_embed, n_laye
                           JoFormerProjectedBlockCausal, non_cumulative=True, past_only=True,
                           use_softmax=use_softmax, concat_head=False, mlp_head=True, correct_rotation=True, **kwargs)
 
+# --- Windowed attention variants ---
+
+def make_roformer_look_ahead_nocat_windowed(vocab_size, n_embed, n_layers, block_size,
+                                             dropout, use_softmax=False, window_size=64, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          WindowedRoFormerBlock, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False,
+                          window_size=window_size, **kwargs)
+
+def make_joformer_projected_look_ahead_nocat_corrected_windowed(vocab_size, n_embed, n_layers, block_size,
+                                                                 dropout, use_softmax=False, window_size=64, **kwargs):
+    return LookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                          WindowedJoFormerProjectedBlockCausal, non_cumulative=True, past_only=True,
+                          use_softmax=use_softmax, concat_head=False, correct_rotation=True,
+                          window_size=window_size, **kwargs)
+
 # --- Baseline (Model B): cumulative + self-inclusive (shared weights) ---
 
 def make_roformer_baseline(vocab_size, n_embed, n_layers, block_size,
@@ -1192,6 +1314,82 @@ def make_roformer_stacked_look_ahead_nocat(vocab_size, n_embed, n_layers, block_
     return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
                                  RoFormerBlock, n_units=n_units,
                                  use_softmax=use_softmax, **kwargs)
+
+def make_roformer_stacked_look_ahead(vocab_size, n_embed, n_layers, block_size,
+                                      dropout, use_softmax=False, n_units=None,
+                                      **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 RoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, concat_head=True, **kwargs)
+
+def make_roformer_stacked_look_ahead_corrhead(vocab_size, n_embed, n_layers, block_size,
+                                                dropout, use_softmax=False, n_units=None,
+                                                **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 RoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, correction_head=True, **kwargs)
+
+def make_roformer_stacked_look_ahead_projhead(vocab_size, n_embed, n_layers, block_size,
+                                                dropout, use_softmax=False, n_units=None,
+                                                **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 RoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, proj_head=True, **kwargs)
+
+def make_roformer_stacked_look_ahead_addhead(vocab_size, n_embed, n_layers, block_size,
+                                               dropout, use_softmax=False, n_units=None,
+                                               **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 RoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, additive_head=True, **kwargs)
+
+def make_roformer_stacked_look_ahead_windowed(vocab_size, n_embed, n_layers, block_size,
+                                               dropout, use_softmax=False, n_units=None,
+                                               window_size=64, **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 WindowedRoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, concat_head=True,
+                                 window_size=window_size, **kwargs)
+
+def make_roformer_stacked_look_ahead_corrhead_windowed(vocab_size, n_embed, n_layers, block_size,
+                                                        dropout, use_softmax=False, n_units=None,
+                                                        window_size=64, **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 WindowedRoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, correction_head=True,
+                                 window_size=window_size, **kwargs)
+
+def make_roformer_stacked_look_ahead_addhead_windowed(vocab_size, n_embed, n_layers, block_size,
+                                                       dropout, use_softmax=False, n_units=None,
+                                                       window_size=64, **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 WindowedRoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, additive_head=True,
+                                 window_size=window_size, **kwargs)
+
+def make_roformer_stacked_look_ahead_projhead_windowed(vocab_size, n_embed, n_layers, block_size,
+                                                        dropout, use_softmax=False, n_units=None,
+                                                        window_size=64, **kwargs):
+    if n_units is None:
+        raise ValueError("n_units must be specified for stacked look-ahead model")
+    return StackedLookAheadModel(vocab_size, n_embed, n_layers, block_size, dropout,
+                                 WindowedRoFormerBlock, n_units=n_units,
+                                 use_softmax=use_softmax, proj_head=True,
+                                 window_size=window_size, **kwargs)
 
 # --- Ablation: non-cumulative + self-inclusive ---
 
@@ -1238,6 +1436,10 @@ MODEL_CLASSES = {
     'joformer_projected_look_ahead_nocat_corrected': make_joformer_projected_look_ahead_nocat_corrected,
     'joformer_projected_look_ahead_mlp_corrected':  make_joformer_projected_look_ahead_mlp_corrected,
 
+    # Windowed attention variants
+    'roformer_look_ahead_nocat_windowed': make_roformer_look_ahead_nocat_windowed,
+    'joformer_projected_look_ahead_nocat_corrected_windowed': make_joformer_projected_look_ahead_nocat_corrected_windowed,
+
     # Baseline variants (Model B: shared weights, cumulative, self-inclusive)
     'roformer_baseline':             make_roformer_baseline,
     'joformer_fixed_baseline':       make_joformer_fixed_baseline,
@@ -1246,6 +1448,22 @@ MODEL_CLASSES = {
 
     # Stacked look-ahead (N units x K iterations per unit)
     'roformer_stacked_look_ahead_nocat': make_roformer_stacked_look_ahead_nocat,
+    'roformer_stacked_look_ahead': make_roformer_stacked_look_ahead,
+    'roformer_stacked_look_ahead_corrhead': make_roformer_stacked_look_ahead_corrhead,
+    'roformer_stacked_look_ahead_projhead': make_roformer_stacked_look_ahead_projhead,
+    'roformer_stacked_look_ahead_addhead': make_roformer_stacked_look_ahead_addhead,
+    'roformer_stacked_look_ahead_windowed': make_roformer_stacked_look_ahead_windowed,
+    'roformer_stacked_look_ahead_corrhead_windowed': make_roformer_stacked_look_ahead_corrhead_windowed,
+    'roformer_stacked_look_ahead_addhead_windowed': make_roformer_stacked_look_ahead_addhead_windowed,
+    'roformer_stacked_look_ahead_projhead_windowed': make_roformer_stacked_look_ahead_projhead_windowed,
+
+    # Head variants (different ways to combine processed_x and correction)
+    'roformer_look_ahead_corrhead': make_roformer_look_ahead_corrhead,
+    'joformer_fixed_look_ahead_corrhead': make_joformer_fixed_look_ahead_corrhead,
+    'joformer_learned_look_ahead_corrhead': make_joformer_learned_look_ahead_corrhead,
+    'joformer_projected_look_ahead_corrhead': make_joformer_projected_look_ahead_corrhead,
+    'roformer_look_ahead_addhead': make_roformer_look_ahead_addhead,
+    'roformer_look_ahead_projhead': make_roformer_look_ahead_projhead,
 
     # Ablations (on joformer_fixed)
     'joformer_fixed_noncum_only':    make_joformer_fixed_noncum_only,
@@ -1256,4 +1474,7 @@ MODEL_CLASSES = {
     'joformer_fixed':      JoFormerFixed,
     'joformer_learned':    JoFormerLearned,
     'joformer_projected':  JoFormerProjected,
+
+    # Windowed standalone models
+    'roformer_windowed':   lambda vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False, window_size=64, **kwargs: WindowedRoFormer(vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=use_softmax, window_size=window_size),
 }
