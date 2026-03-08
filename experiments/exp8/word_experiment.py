@@ -608,7 +608,7 @@ class FeedForward(nn.Module):
 class RotaryAttention(nn.Module):
     """Attention with external angles. Supports both commutative and operator-based modes."""
 
-    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
@@ -617,6 +617,7 @@ class RotaryAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
         self.rotate_v = rotate_v
+        self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x, angles, causal=True, pad_mask=None):
@@ -640,8 +641,11 @@ class RotaryAttention(nn.Module):
             pad_mask_k = pad_mask.unsqueeze(1)
             wei = wei.masked_fill(~pad_mask_k, float('-inf'))
 
-        wei = torch.log(torch.exp(wei) + 1)
-        wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
+        if self.use_softmax:
+            wei = F.softmax(wei, dim=-1)
+        else:
+            wei = torch.log(torch.exp(wei) + 1)
+            wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
         wei = self.dropout(wei)
         out = wei @ v
 
@@ -654,9 +658,9 @@ class RotaryAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False):
+    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
         super().__init__()
-        self.sa_head = RotaryAttention(n_embed, block_size, dropout, rotate_v)
+        self.sa_head = RotaryAttention(n_embed, block_size, dropout, rotate_v, use_softmax)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -1270,6 +1274,272 @@ class ModelI(nn.Module):
             x = block(x, angles, causal=True, pad_mask=pad_mask)
         logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=-100)
+        return logits, loss
+
+    def predict_text(self, idx):
+        logits, _ = self.forward_text(idx)
+        return logits
+
+
+# ============================================================================
+# Model J/J': RoPE + Per-Relation Slot Angles, Native KG (2 slots)
+# ============================================================================
+
+class ModelJ(nn.Module):
+    """RoPE + per-relation named slot angles, native KG (no REL token).
+
+    Like Model G (per-relation slot angles) but with native KG format:
+    sequences are [head_tokens][tail_tokens] with NO relation token.
+    Each relation gets 2 learned slot angle vectors (HEAD and TAIL),
+    not 3 — the relation identity is encoded entirely in the slot angles.
+
+    Text: slot angles = 0 -> pure RoPE. Causal mask, NTP.
+    KG: 2 slots with per-relation learned slot angles. Positions reset per slot.
+        Bidirectional attention, MLM on tokens only.
+
+    rotate_v=False -> Model J
+    rotate_v=True  -> Model J'
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
+                 dropout=0.2, rotate_v=False, use_softmax=False):
+        super().__init__()
+        self.n_embed = n_embed
+        self.block_size = block_size
+        self.vocab_size = vocab_size
+
+        self.token_embedding = nn.Embedding(vocab_size, n_embed)
+
+        # Per-relation slot angle vectors: [n_relations, 2, n_embed//2]
+        # Slot 0 = HEAD, Slot 1 = TAIL (no REL slot)
+        self.slot_angles = nn.Parameter(torch.randn(n_relations, 2, n_embed // 2) * 0.1)
+
+        # RoPE base frequencies
+        self.register_buffer('base_freq',
+            1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
+            for _ in range(n_layers)
+        ])
+
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+
+        # Mapping from relation name to index (populated at runtime)
+        self.rel_to_idx = {}
+
+    def _rope_angles(self, T, device):
+        """Standard RoPE angles: position * base_freq. Shape: (1, T, C//2)."""
+        positions = torch.arange(T, device=device, dtype=torch.float)
+        angles = torch.outer(positions, self.base_freq)  # (T, C//2)
+        return angles.unsqueeze(0)  # (1, T, C//2)
+
+    def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
+        """KG angles: position_in_slot * base_freq + slot_angle[rel] (vectorized).
+
+        Native sequence layout: [head_tokens] [tail_tokens] (no relation token)
+        - HEAD slot: positions 0..h_len-1, angle = pos * base_freq + slot_angles[rel, 0]
+        - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[rel, 1]
+        """
+        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
+        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
+
+        # Slot assignment: 0=HEAD, 1=TAIL (no REL token)
+        slot_ids = torch.where(positions < h_lens_t, 0, 1)  # (B, T)
+
+        # Position within slot
+        pos_in_slot = torch.where(slot_ids == 0, positions, positions - h_lens_t)  # (B, T)
+
+        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+
+        # Per-relation slot angles
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, seq_len), slot_ids]  # (B, T, C//2)
+        return rope + slot_offset
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
+        B, T = idx.shape
+        pad_mask = (idx != 0)  # PAD = 0
+        x = self.token_embedding(idx)
+        angles = self._rope_angles(T, idx.device).expand(B, -1, -1)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        if targets is None:
+            return logits, None
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
+        """KG mode: slot-based RoPE with per-relation angles, bidirectional, MLM.
+
+        Native format: [head_tokens][tail_tokens], no relation token in sequence.
+        negate_angles is accepted for API compatibility but ignored.
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)  # PAD = 0
+
+        x = self.token_embedding(char_tokens)
+        angles = self._kg_angles(head_lens, T, B, rel_names, char_tokens.device)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def predict_text(self, idx):
+        logits, _ = self.forward_text(idx)
+        return logits
+
+
+# ============================================================================
+# Model K/K': Per-Layer Projected Angles + RoPE + Per-Relation Slot Angles
+# ============================================================================
+
+class ModelK(nn.Module):
+    """Per-layer projected angles + RoPE + per-relation slot angles, native KG.
+
+    Like Model J (RoPE + per-relation slot angles) but with an additional
+    per-layer projected angle from the residual stream (like Model I).
+
+    Total angle = projected_angle + RoPE + slot_angle
+
+    Journey from token i (pos p1) in slot s1 to token j (pos p2) in slot s2:
+        (proj_i + p1*freq + slot[rel,s1]) - (proj_j + p2*freq + slot[rel,s2])
+    The projected angles add per-token content-dependent geometry on top of
+    J's position+relation structure.
+
+    Text: angles = projected + RoPE (no slots). Causal mask, NTP.
+    KG: angles = projected + pos_in_slot * freq + slot_angle[rel, slot_id].
+        Native format [head_tokens][tail_tokens], bidirectional, MLM.
+
+    rotate_v=False -> Model K
+    rotate_v=True  -> Model K'
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
+                 dropout=0.2, rotate_v=False, use_softmax=False):
+        super().__init__()
+        self.n_embed = n_embed
+
+        self.token_embedding = nn.Embedding(vocab_size, n_embed)  # Full dim
+
+        # Per-layer angle projectors: extract angles from residual stream (like Model I)
+        self.angle_projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_embed, n_embed),
+                nn.GELU(),
+                nn.Linear(n_embed, n_embed // 2),
+            )
+            for _ in range(n_layers)
+        ])
+
+        # Per-relation slot angle vectors: [n_relations, 2, n_embed//2] (like Model J)
+        # Slot 0 = HEAD, Slot 1 = TAIL (no REL slot)
+        self.slot_angles = nn.Parameter(torch.randn(n_relations, 2, n_embed // 2) * 0.1)
+
+        # RoPE base frequencies (like Model J)
+        self.register_buffer('base_freq',
+            1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
+            for _ in range(n_layers)
+        ])
+
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+
+        # Mapping from relation name to index (populated at runtime)
+        self.rel_to_idx = {}
+
+    def _rope_angles(self, T, device):
+        """Standard RoPE angles: position * base_freq. Shape: (1, T, C//2)."""
+        positions = torch.arange(T, device=device, dtype=torch.float)
+        angles = torch.outer(positions, self.base_freq)  # (T, C//2)
+        return angles.unsqueeze(0)  # (1, T, C//2)
+
+    def _kg_angles(self, raw_angles, head_lens, rel_names, device):
+        """Combine projected angles + RoPE (per-slot positions) + slot angles for KG.
+
+        Args:
+            raw_angles: (B, T, C//2) from angle projector at this layer
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            device: torch device
+
+        Returns: (B, T, C//2) = projected + pos_in_slot*freq + slot_offset
+        """
+        B, T, D = raw_angles.shape
+
+        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)  # (B, T)
+        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
+
+        # Slot assignment: 0=HEAD, 1=TAIL
+        slot_ids = torch.where(positions < h_lens_t, 0, 1)  # (B, T)
+
+        # Position within slot (resets for tail)
+        pos_in_slot = torch.where(slot_ids == 0, positions, positions - h_lens_t)  # (B, T)
+
+        # RoPE from position within slot
+        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+
+        # Per-relation slot angles
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, T), slot_ids]  # (B, T, C//2)
+
+        return raw_angles + rope + slot_offset
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: projected angles + RoPE (no slots), causal, NTP."""
+        B, T = idx.shape
+        pad_mask = (idx != 0)
+        x = self.token_embedding(idx)
+        rope = self._rope_angles(T, idx.device).expand(B, -1, -1)
+
+        for l, block in enumerate(self.blocks):
+            projected = self.angle_projectors[l](x)  # (B, T, C//2)
+            angles = projected + rope
+            x = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        if targets is None:
+            return logits, None
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
+        """KG mode: projected + RoPE + slot angles, bidirectional, MLM.
+
+        Native format: [head_tokens][tail_tokens], no relation token in sequence.
+        negate_angles is accepted for API compatibility but ignored.
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+
+        x = self.token_embedding(char_tokens)
+
+        for l, block in enumerate(self.blocks):
+            raw_angles = self.angle_projectors[l](x)  # (B, T, C//2)
+            angles = self._kg_angles(raw_angles, head_lens, rel_names, char_tokens.device)
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
         return logits, loss
 
     def predict_text(self, idx):
@@ -2105,7 +2375,7 @@ def _forward_kg_eval(model, tokens, targets, head_lens, rel_names, model_type):
         logits, _ = model.forward_kg(tokens, targets, head_lens, rel_names)
     elif model_type in ("D", "F"):
         logits, _ = model.forward_kg(tokens, targets)
-    elif model_type in ("E", "H", "I"):
+    elif model_type in ("E", "H", "I", "J", "K"):
         logits, _ = model.forward_kg(tokens, targets, head_lens, rel_names)
     return logits
 
@@ -2270,7 +2540,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
 
     with torch.no_grad():
         for (head_len, tail_len), prompt_indices in groups.items():
-            if model_type in ("E", "H", "I"):
+            if model_type in ("E", "H", "I", "J", "K"):
                 seq_len = head_len + tail_len
             else:
                 seq_len = head_len + 1 + tail_len
@@ -2285,7 +2555,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                     hl_list, rn_list = [], []
                     for bi, pi in enumerate(sb):
                         ep = encoded_prompts[pi]
-                        if model_type in ("E", "H", "I"):
+                        if model_type in ("E", "H", "I", "J", "K"):
                             seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
                             mask_pos = head_len + t_idx
                         else:
@@ -2299,7 +2569,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                         rn_list.append(ep["rel_name"])
                     tokens, targets = tokens.to(config.device), targets.to(config.device)
                     logits = _forward_kg_eval(model, tokens, targets, hl_list, rn_list, model_type)
-                    mp = head_len + t_idx if model_type in ("E", "H", "I") else head_len + 1 + t_idx
+                    mp = head_len + t_idx if model_type in ("E", "H", "I", "J", "K") else head_len + 1 + t_idx
                     for bi, pi in enumerate(sb):
                         ep = encoded_prompts[pi]
                         sl = logits[bi, mp, :]
@@ -2318,7 +2588,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                 hl_list, rn_list = [], []
                 for bi, pi in enumerate(sb):
                     ep = encoded_prompts[pi]
-                    if model_type in ("E", "H", "I"):
+                    if model_type in ("E", "H", "I", "J", "K"):
                         seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
                         for ti in range(tail_len):
                             pos = head_len + ti
@@ -2339,7 +2609,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                 for bi, pi in enumerate(sb):
                     ep = encoded_prompts[pi]
                     for ti in range(tail_len):
-                        mp = head_len + ti if model_type in ("E", "H", "I") else head_len + 1 + ti
+                        mp = head_len + ti if model_type in ("E", "H", "I", "J", "K") else head_len + 1 + ti
                         if torch.argmax(logits[bi, mp, :]).item() != ep["tail_tokens"][ti]:
                             hit1s[pi] = 0
                             break
@@ -2606,20 +2876,22 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
 # ============================================================================
 
 MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'",
-               "F", "F'", "G", "G'", "H", "H'", "I", "I'"]
+               "F", "F'", "G", "G'", "H", "H'", "I", "I'", "J", "J'", "K", "K'"]
 
 LINEARIZED_MODELS = {"B", "B'", "C", "C'"}
 SLOTTED_KG_MODELS = {"A", "A'", "G", "G'"}
 NATIVE_KG_MODELS = {"E", "E'", "H", "H'", "I", "I'"}
 FLAT_KG_MODELS = {"D", "D'", "F", "F'"}
+NATIVE_SLOTS_KG_MODELS = {"J", "J'", "K", "K'"}
 
 
-def create_model(name, vocab_size, config, n_relations=8):
+def create_model(name, vocab_size, config, n_relations=8, use_softmax=False):
     """Create a model by name."""
     n_e = config.n_embed
     n_l = config.n_layers
     bs = config.block_size
     d = config.dropout
+    sm = use_softmax
 
     if name == "A":    return ModelA(vocab_size, n_e, n_l, bs, d, rotate_v=False)
     elif name == "A'": return ModelA(vocab_size, n_e, n_l, bs, d, rotate_v=True)
@@ -2639,6 +2911,10 @@ def create_model(name, vocab_size, config, n_relations=8):
     elif name == "H'": return ModelH(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=True)
     elif name == "I":  return ModelI(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=False)
     elif name == "I'": return ModelI(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=True)
+    elif name == "J":  return ModelJ(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=False, use_softmax=sm)
+    elif name == "J'": return ModelJ(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=True, use_softmax=sm)
+    elif name == "K":  return ModelK(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=False, use_softmax=sm)
+    elif name == "K'": return ModelK(vocab_size, n_e, n_l, bs, n_relations=n_relations, dropout=d, rotate_v=True, use_softmax=sm)
     else: raise ValueError(f"Unknown model: {name}")
 
 
@@ -2655,7 +2931,7 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
                    kg_only=False, causal_kg=False, inverse_kg=False, kg_as_text=False,
                    wordnet_path=None, framenet_path=None, bats_dir=None,
                    google_analogies_path=None, word_analogies_path=None,
-                   tokenizer_path=None, args=None):
+                   tokenizer_path=None, args=None, use_softmax=False):
     """Run one experiment with a given seed."""
     if models_to_run is None:
         models_to_run = MODEL_NAMES
@@ -2709,7 +2985,7 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     for name in models_to_run:
-        model = create_model(name, vocab.size, cfg, n_relations=n_relations)
+        model = create_model(name, vocab.size, cfg, n_relations=n_relations, use_softmax=use_softmax)
         model.vocab = vocab
 
         # Set rel_to_idx on models that need it
@@ -2763,6 +3039,10 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
                 _, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
                                                   name=name, kg_batch_fn="flat",
                                                   resume_optimizer_state=resume_opt, kg_only=kg_only)
+            elif name in NATIVE_SLOTS_KG_MODELS:
+                _, opt_state = train_model_mixed(model, text_base, kg_dataset, cfg,
+                                                  name=name, kg_batch_fn="native",
+                                                  resume_optimizer_state=resume_opt, kg_only=kg_only)
             cfg.max_iters = orig_max_iters
             total_iters = iters_done + remaining
 
@@ -2785,7 +3065,7 @@ def run_experiment(wiki_path, wiki_lines, vocab_size, seed=42, models_to_run=Non
             linearized_relation_results[name] = lrs
 
         base_name = name.replace("'", "")
-        if not kg_as_text and base_name in ("A", "D", "E", "F", "G", "H", "I"):
+        if not kg_as_text and base_name in ("A", "D", "E", "F", "G", "H", "I", "J", "K"):
             if causal_kg and base_name in ("E", "H", "I"):
                 ks, krs, _ = evaluate_model_kg_causal(model, kg_eval_prompts, vocab, cfg, model_name=name)
             else:
@@ -2829,7 +3109,7 @@ def print_comparison_table(results, exp_name, models):
 
 
 def print_kg_comparison_table(kg_results, exp_name, models):
-    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
+    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I", "J", "K")]
     if not kg_models:
         return
     print(f"\n{'='*120}")
@@ -2872,6 +3152,8 @@ def main():
     parser.add_argument("--causal_kg", action="store_true")
     parser.add_argument("--inverse_kg", action="store_true")
     parser.add_argument("--kg_as_text", action="store_true")
+    parser.add_argument("--softmax", action="store_true",
+                        help="Use softmax attention instead of log(exp(x)+1)")
     # Data paths (relative to script directory)
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _data_dir = os.path.join(_script_dir, "data")
@@ -2977,7 +3259,7 @@ def main():
     # Normalize model names
     normalized = []
     for m in models:
-        if m.endswith("p") and len(m) == 2 and m[0] in "ABCDEFGHI":
+        if m.endswith("p") and len(m) == 2 and m[0] in "ABCDEFGHIJK":
             normalized.append(m[0] + "'")
         else:
             normalized.append(m)
@@ -3010,7 +3292,8 @@ def main():
             wordnet_path=args.wordnet_path, framenet_path=args.framenet_path,
             bats_dir=args.bats_dir, google_analogies_path=args.google_analogies,
             word_analogies_path=args.word_analogies,
-            tokenizer_path=args.tokenizer_path, args=args)
+            tokenizer_path=args.tokenizer_path, args=args,
+            use_softmax=args.softmax)
         seed_results_list.append(res)
         seed_kg_results_list.append(kg_res)
         seed_lin_results_list.append(lin_res)
@@ -3032,7 +3315,7 @@ def main():
             avg_results[model_name][tier] = metrics
 
     avg_kg_results = {}
-    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
+    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I", "J", "K")]
     for model_name in kg_models:
         avg_kg_results[model_name] = {}
         for tier in ALL_TIERS:
