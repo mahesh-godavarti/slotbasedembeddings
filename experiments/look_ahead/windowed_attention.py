@@ -11,9 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'joformer'))
-from train_wiki import (
+from blocks import (
     FeedForward,
     build_rotation_matrix, apply_rotation, apply_inverse_rotation,
 )
@@ -203,6 +201,3 @@ class WindowedRoFormer(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
-        if return_raw_angles:
-            return x_proj, raw_angles
-        return x_proj

@@ -185,7 +185,7 @@ def get_batch(train_data, val_data, split, block_size, batch_size, device):
 
 @torch.no_grad()
 def estimate_loss(model, train_data, val_data, block_size, batch_size, device,
-                  eval_iters=20):
+                  eval_iters=20, amp_dtype=None):
     """Estimate train/val loss using fixed batches (seeded RNG)."""
     out = {}
     model.eval()
@@ -196,7 +196,11 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, device,
         for k in range(eval_iters):
             X, Y = get_batch(train_data, val_data, split,
                              block_size, batch_size, device)
-            _, loss = model(X, Y)
+            if amp_dtype is not None:
+                with torch.autocast('cuda', dtype=amp_dtype):
+                    _, loss = model(X, Y)
+            else:
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         torch.random.set_rng_state(rng_state)
         out[split] = losses.mean().item()
@@ -206,7 +210,7 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, device,
 
 @torch.no_grad()
 def estimate_loss_at_depth(model, train_data, val_data, block_size, batch_size,
-                           device, K, eval_iters=20):
+                           device, K, eval_iters=20, amp_dtype=None):
     """Estimate val loss at inference depth K (Section 4.5)."""
     model.eval()
     rng_state = torch.random.get_rng_state()
@@ -215,7 +219,11 @@ def estimate_loss_at_depth(model, train_data, val_data, block_size, batch_size,
     for k in range(eval_iters):
         X, Y = get_batch(train_data, val_data, 'val',
                          block_size, batch_size, device)
-        _, loss = model.forward_at_depth(X, K, Y)
+        if amp_dtype is not None:
+            with torch.autocast('cuda', dtype=amp_dtype):
+                _, loss = model.forward_at_depth(X, K, Y)
+        else:
+            _, loss = model.forward_at_depth(X, K, Y)
         losses[k] = loss.item()
     torch.random.set_rng_state(rng_state)
     model.train()
@@ -224,7 +232,7 @@ def estimate_loss_at_depth(model, train_data, val_data, block_size, batch_size,
 
 @torch.no_grad()
 def estimate_loss_sequential(model, train_data, val_data, block_size, batch_size,
-                             device, eval_iters=20):
+                             device, eval_iters=20, amp_dtype=None):
     """Estimate val loss for sequential eval (true autoregressive quality)."""
     model.eval()
     rng_state = torch.random.get_rng_state()
@@ -233,7 +241,11 @@ def estimate_loss_sequential(model, train_data, val_data, block_size, batch_size
     for k in range(eval_iters):
         X, Y = get_batch(train_data, val_data, 'val',
                          block_size, batch_size, device)
-        _, loss = model.forward_sequential(X, Y)
+        if amp_dtype is not None:
+            with torch.autocast('cuda', dtype=amp_dtype):
+                _, loss = model.forward_sequential(X, Y)
+        else:
+            _, loss = model.forward_sequential(X, Y)
         losses[k] = loss.item()
     torch.random.set_rng_state(rng_state)
     model.train()
@@ -242,7 +254,7 @@ def estimate_loss_sequential(model, train_data, val_data, block_size, batch_size
 
 @torch.no_grad()
 def compute_diagnostics(model, train_data, val_data, block_size, batch_size,
-                        device, n_batches=5):
+                        device, n_batches=5, amp_dtype=None):
     """Compute convergence diagnostics (Section 4.6)."""
     model.eval()
     all_norms = []
@@ -253,7 +265,11 @@ def compute_diagnostics(model, train_data, val_data, block_size, batch_size,
     for _ in range(n_batches):
         X, Y = get_batch(train_data, val_data, 'val',
                          block_size, batch_size, device)
-        _, _, diag = model.forward_with_diagnostics(X, Y)
+        if amp_dtype is not None:
+            with torch.autocast('cuda', dtype=amp_dtype):
+                _, _, diag = model.forward_with_diagnostics(X, Y)
+        else:
+            _, _, diag = model.forward_with_diagnostics(X, Y)
         all_norms.append(diag['correction_norms'])
         if diag['contraction_ratios']:
             all_ratios.append(diag['contraction_ratios'])
@@ -290,6 +306,11 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters)
                  if args.cosine_decay else None)
+    use_amp = getattr(args, 'amp', False) and device == 'cuda'
+    amp_dtype = torch.bfloat16
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
+    if use_amp:
+        print(f"  [{model_name}] AMP enabled (bfloat16)")
     model.to(device)
     model.train()
 
@@ -302,12 +323,15 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     ppl_log = {"iter": [], "train_ppl": [], "val_ppl": []}
     diagnostics_log = []
 
+    eval_amp_dtype = amp_dtype if use_amp else None
+
     pbar = tqdm(range(args.max_iters), desc=model_name)
     for it in pbar:
         # Eval
         if it % args.eval_interval == 0 or it == args.max_iters - 1:
             losses = estimate_loss(model, train_data, val_data,
-                                   args.block_size, args.batch_size, device)
+                                   args.block_size, args.batch_size, device,
+                                   amp_dtype=eval_amp_dtype)
             train_ppl = math.exp(min(losses['train'], 20))
             val_ppl = math.exp(min(losses['val'], 20))
             ppl_log["iter"].append(it)
@@ -338,7 +362,8 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
             if hasattr(model, 'forward_with_diagnostics'):
                 diag = compute_diagnostics(model, train_data, val_data,
                                            args.block_size, args.batch_size,
-                                           device, n_batches=3)
+                                           device, n_batches=3,
+                                           amp_dtype=eval_amp_dtype)
                 diagnostics_log.append({'iter': it, **diag})
                 if diag['empirical_L'] is not None:
                     ratios_str = [f'{r:.4f}' for r in diag['avg_contraction_ratios']]
@@ -371,22 +396,34 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
         # Train step
         xb, yb = get_batch(train_data, val_data, "train",
                            args.block_size, args.batch_size, device)
-        _, loss = model(xb, yb)
+        if use_amp:
+            with torch.autocast('cuda', dtype=amp_dtype):
+                _, loss = model(xb, yb)
+        else:
+            _, loss = model(xb, yb)
 
         if torch.isnan(loss):
             tqdm.write(f"  [{model_name}] NaN loss at iter {it}, stopping early.")
             break
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         if scheduler:
             scheduler.step()
 
     # --- Final evaluation ---
     losses = estimate_loss(model, train_data, val_data,
-                           args.block_size, args.batch_size, device)
+                           args.block_size, args.batch_size, device,
+                           amp_dtype=eval_amp_dtype)
     val_ppl = math.exp(min(losses['val'], 20))
 
     print(f"\n  [{model_name}] final val loss: {losses['val']:.4f} (PPL {val_ppl:.2f})")
@@ -394,11 +431,14 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     # Depth sweep — parallel (Section 4.5)
     if hasattr(model, 'forward_at_depth'):
         depth_results = {}
-        depths = sorted(set(K for K in [1, 2, 3, 5, model.n_iters] if K <= model.n_iters))
+        max_K = getattr(model, 'n_iters', None) or getattr(model, 'k_iters', None)
+        eval_max_K = max_K * 2  # evaluate up to 2x training K to check convergence
+        depths = sorted(set(K for K in [1, 2, 3, 5, max_K, eval_max_K] if K <= eval_max_K))
         for K in depths:
             val_loss_K = estimate_loss_at_depth(
                 model, train_data, val_data,
-                args.block_size, args.batch_size, device, K
+                args.block_size, args.batch_size, device, K,
+                amp_dtype=eval_amp_dtype
             )
             ppl_K = math.exp(min(val_loss_K, 20))
             depth_results[K] = {'val_loss': val_loss_K, 'val_ppl': round(ppl_K, 2)}
@@ -408,7 +448,8 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
         if hasattr(model, 'forward_sequential'):
             val_loss_seq = estimate_loss_sequential(
                 model, train_data, val_data,
-                args.block_size, args.batch_size, device
+                args.block_size, args.batch_size, device,
+                amp_dtype=eval_amp_dtype
             )
             ppl_seq = math.exp(min(val_loss_seq, 20))
             depth_results['sequential'] = {'val_loss': val_loss_seq, 'val_ppl': round(ppl_seq, 2)}
@@ -514,6 +555,8 @@ def run_training(args):
                 extra_kwargs['convergence_weight'] = args.convergence_weight
             if args.d_block > 1:
                 extra_kwargs['d_block'] = args.d_block
+            if args.k_min > 0:
+                extra_kwargs['k_min'] = args.k_min
             if args.n_units > 0:
                 extra_kwargs['n_units'] = args.n_units
             if args.window_size > 0:
@@ -582,8 +625,8 @@ def run_training(args):
 def add_training_args(parser):
     """Add training-specific arguments."""
     parser.add_argument('--models', nargs='+',
-                        default=['joformer_fixed_look_ahead',
-                                 'joformer_fixed_baseline'],
+                        default=['block_head_corr_ffn',
+                                 'roformer'],
                         choices=list(MODEL_CLASSES.keys()),
                         help='Which models to train')
     parser.add_argument('--n_embed', type=int, default=200,
@@ -621,11 +664,16 @@ def add_training_args(parser):
     parser.add_argument('--n_units', type=int, default=0,
                         help='Number of units for stacked look-ahead model (0=unused)')
     parser.add_argument('--d_block', type=int, default=1,
-                        help='Number of sequential blocks per shared unit (D-block). '
-                             'D=1 is single shared block, D=N is standard transformer.')
+                        help='Deep block_head depth: D distinct blocks per iteration step, '
+                             'shared across iterations. D=1 is single shared block (default).')
+    parser.add_argument('--k_min', type=int, default=0,
+                        help='Random K training: sample K ~ Uniform(k_min, n_layers) each batch. '
+                             '0 = disabled (always use n_layers).')
     parser.add_argument('--window_size', type=int, default=0,
                         help='Sliding window size for windowed attention models. '
                              '0 = no windowing (use full causal mask).')
+    parser.add_argument('--amp', action='store_true',
+                        help='Use automatic mixed precision (bfloat16)')
 
 
 def main():

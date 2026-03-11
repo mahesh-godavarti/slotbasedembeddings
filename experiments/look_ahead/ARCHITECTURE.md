@@ -417,21 +417,39 @@ The stacked model is NOT a standard transformer at K=1 because of the iterative 
 
 ## The Corrhead Problem: Token Identity in Abelian vs Non-Abelian Attention
 
-### Head variants
+### Head variants: input vs output vs delta
 
-The look-ahead architecture produces two signals at each position t:
-- `processed_x[t] = tok_emb[t] + shifted_correction[t-1]` — past-only context, clean token identity
-- `correction[t]` — self-inclusive context (attention sees positions 0..t), noisy token identity
+The block at position t produces three related signals:
+- **input**: `processed_x[t]` = tok_emb[t] + shifted_correction[t-1]
+- **output**: `z[t]` = block(processed_x)[t] = processed_x[t] + attn(...) + ffn(...)
+- **delta**: `correction[t]` = z[t] - processed_x[t] = attn(...) + ffn(...)
 
-Different head variants choose what to feed the classification head:
+These three are related by: **output = input + delta**. The head variant determines which signal the classification head sees:
 
-| Head | Input | Params (C=50, V=16000) | Token identity | Context |
+| Head | Head sees | Signal | Token identity | Context |
 |---|---|---|---|---|
-| nocat | `processed_x[t]` | 1,646,750 | Clean (coefficient 1) | Past-only |
-| corrhead | `correction[t]` | 1,646,750 | Variable scaling | Self-inclusive |
-| addhead | `processed_x[t] + correction[t]` | 1,646,750 | Clean (coefficient 1) | Both |
-| projhead | `Linear(2C→C)([proc; corr])` | 1,651,800 | Learned | Both |
-| concat | `[proc; corr]` → `Linear(2C, V)` | 2,446,850 | Both signals | Both |
+| nocat | input (`processed_x`) | tok_emb + shifted correction | Coefficient 1 (from tok_emb) | Past-only |
+| block_head | output (`z`) | block(processed_x) | Coefficient 1 (from residual) | Self-inclusive |
+| corrhead | delta (`z - processed_x`) | attn + ffn contributions | Variable w[t,t] | Self-inclusive |
+| block_head_ffn | output + FFN | z + head_ffn(z) | Coefficient 1 (from residual) | Self-inclusive + enriched |
+| addhead | input + delta | processed_x + correction = z | Coefficient 1 (from residual) | Both |
+| projhead | learned mix | Linear(2C→C)([proc; corr]) | Learned | Both |
+| concat | both signals | [proc; corr] → Linear(2C, V) | Both signals | Both |
+
+**The key insight**: corrhead is the only variant that strips away the residual connection. The delta `z - processed_x` removes the input entirely, leaving only the attention and FFN contributions. Token t's identity in this signal depends on the self-attention weight w[t,t], which varies with context.
+
+Both nocat and block_head preserve token identity with coefficient 1, but they see different things:
+- **nocat** sees the **input** to the block — tok_emb enriched by the previous position's correction (past-only context)
+- **block_head** sees the **output** of the block — the full transformation including self-inclusive attention and FFN
+
+Note that **addhead ≠ block_head**. After the iteration loop:
+- `processed_x[t]` = tok_emb[t] + correction_K[t-1] (post-loop, uses latest correction shifted)
+- `z[t]` = block(input_K)[t], where input_K[t] = tok_emb[t] + correction_{K-1}[t-1] (pre-update input)
+
+So addhead[t] = tok_emb[t] + correction_K[t-1] + correction_K[t], while
+block_head[t] = tok_emb[t] + correction_{K-1}[t-1] + correction_K[t].
+
+The t-1 correction comes from different iterations (K vs K-1). They only match at convergence.
 
 ### The variable scaling problem
 
@@ -539,15 +557,312 @@ head_input[t] = head_ffn(ln3(z[t]))
 - Extra FFN before head adds ~8C² + 5C params
 - Most conservative change — existing iteration dynamics preserved
 
-### Comparison
+### All Variants (including baseline)
 
-| Variant | Iteration block | Correction | Head input | Extra params | FFN in loop? |
+| Variant | Iteration loop | Head sees | FLOPs/tok | 100K PPL |
+|---|---|---|---|---|
+| nocat (baseline) | block (attn+FFN), corr = delta | `processed_x` | 12C² | 91.85 |
+| attn_corr_ffn | attn only, FFN makes correction | `y` (attention output) | 12C² | 91.58 |
+| attn_head_ffn | attn only, raw delta correction | `y + head_ffn(y)` | 12C² | 93.88 |
+| block_head | block (attn+FFN), corr = delta | `z` (block output) | 12C² | 90.29 |
+| block_head_ffn | block (attn+FFN), corr = delta | `z + head_ffn(z)` | 20C² | 84.53 |
+| **block_head_corr_ffn** | block + FFN correction from z | `z` (block output) | 20C² | **84.20** |
+| **block_head_corr_ffn_concat** | block + FFN corr from concat(shift(z), tok_emb) | `z` (block output) | 24C² | **80.42** |
+| **block_head_corr_ffn_add** | block + FFN corr from shift(z) + tok_emb | `z` (block output) | 20C² | *pending* |
+| ~~block_head_corr_ffn_concat v1~~ | concat with processed_x (BROKEN) | `z` (block output) | 24C² | 80.44 (BROKEN) |
+
+Key findings:
+- **attn_corr_ffn ≈ nocat** — splitting attention/FFN doesn't help
+- **attn_head_ffn worst** — raw attention delta is a poor correction signal
+- **block_head_ffn** was the clear winner of original variants
+- **block_head_corr_ffn matches block_head_ffn** with no extra head FFN — the correction FFN is the key
+- **block_head_corr_ffn_concat** (v2, fixed with tok_emb) — best D=1 result: 80.42 PPL, seq K=1 gap only 0.09
+- **block_head_corr_ffn_add** — same FLOPs as corr_ffn, token-aware via addition. Experiment pending.
+
+## Variant 4: Block + Correction FFN (block_head_corr_ffn) — Current Best
+
+### Architecture
+
+```
+z[t] = block(processed_x)[t]              # standard block (attn + FFN + residuals)
+correction[t] = corr_ffn(ln_corr(z))[t]   # separate FFN generates correction from z
+processed_x[t] = tok_emb[t] + shift(correction)[t]
+head_input[t] = z[t]                       # head sees block output directly
+```
+
+### Why this works
+
+The key insight: **separate the correction generation from the block's own FFN**. The block's internal FFN refines the attention output for representation quality (and its residual preserves token identity for the head). A separate `corr_ffn` then reads this rich representation to produce a correction for the next position.
+
+This is equivalent to block_head_ffn in FLOPs (20C² per iteration) but cleaner:
+- block_head_ffn: block produces correction via delta, FFN enriches output for head
+- block_head_corr_ffn: block produces output for head, FFN generates correction from output
+
+The correction FFN `corr_ffn(ln(z))` is a standard FFN: `Linear(C→4C) → GELU → Dropout → Linear(4C→C) → Dropout`. It adds 8C² + 5C params.
+
+### FLOP analysis
+
+```
+Per iteration:  block = 12C²,  corr_ffn = 8C²  →  total = 20C²
+Roformer N=3:   3 × (12C² + 4C²) = 48C²  (but only 36C² if no FFN double-count)
+```
+
+**FLOP matching**: block_head_corr_ffn D=1 K=5 at 20C² matches roformer N=1 at 12C². To match roformer_head_ffn N=3 (44C²), use deep D=3 at 3×(12C²+8C²/3) ≈ 44C².
+
+### Results (C=50, K=5, block_size=256, 100K iters)
+
+| Model | Params | Val PPL | Seq K=1 | L |
+|---|---|---|---|---|
+| block_head_corr_ffn | ~1,651K | 84.20 | 84.22 | 0.94 |
+| block_head_ffn | ~1,657K | 84.53 | 84.57 | 1.20 |
+| roformer N=5 | 1,769K | 70.89 | — | — |
+
+block_head_corr_ffn slightly outperforms block_head_ffn with similar params.
+
+### Sequential K=1 equations
+
+At sequential inference, position t is fully processed before moving to t+1:
+
+```
+For each position t = 0, 1, ..., T-1:
+    z[t] = block(processed_x)[t]         # block output at position t
+    correction[t] = corr_ffn(ln(z))[t]   # correction from z at position t
+    if t < T-1:
+        processed_x[t+1] = tok_emb[t+1] + correction[t]
+    head_input[t] = z[t]
+```
+
+Position t gets a contextualized input `tok_emb[t] + correction[t-1]` where correction[t-1] was computed from the fully processed z at position t-1. This matches the parallel K>1 regime where later iterations see contextualized inputs.
+
+## The Token-Blind Correction Problem (FAILED: Concat Variant)
+
+### The observation
+
+In block_head_corr_ffn, the correction at position t contextualizes position t+1:
+
+```
+correction[t] = corr_ffn(ln(z[t]))
+processed_x[t+1] = tok_emb[t+1] + correction[t]
+```
+
+The correction is completely independent of what token is at position t+1. The same correction is applied regardless of the predicted token. This is different from a regular transformer, where each layer's output depends on the current token's embedding.
+
+### The attempted fix: concat variant
+
+Make the correction see both past context AND current token identity:
+
+```
+z[t] = block(processed_x)[t]
+shifted_z[t] = z[t-1]                             # past context (shifted)
+ffn_input[t] = concat(ln_corr(shifted_z[t]), processed_x[t])    # 2C input
+correction[t] = corr_ffn(ffn_input[t])             # now correction knows the current token
+processed_x[t] = tok_emb[t] + correction[t]       # NO shift needed — shift is inside
+head_input[t] = z[t]
+```
+
+### Results (C=50, K=5, block_size=256, 100K iters)
+
+| Model | Params | Val PPL (K=5) | Seq K=1 | Gap (seq vs val) | L |
 |---|---|---|---|---|---|
-| 1: Attn + Corr FFN | attention only | ffn(y) | y (attn output) | none | yes (corr FFN) |
-| 2: Attn + Head FFN | attention only | attn delta | ffn(y) | none | no |
-| 3: Block + Head FFN | attn + FFN | block delta | extra_ffn(block_out) | ~8C² + 5C | standard FFN yes |
+| corr_ffn_concat | 1,677,100 | **80.44** | 84.80 | **+4.4** | 0.71 |
+| corr_ffn (baseline) | 1,651,600 | 84.32 | 84.55 | +0.2 | 0.88 |
 
-All three give the head a signal with stable token identity (coefficient 1 from residual).
+### Why it fails: circular dependency breaks sequential K=1
+
+The concat variant shows a 3.9 PPL improvement in parallel K=5 training (80.44 vs 84.32). But **sequential K=1 is 84.80 — worse than the baseline's val PPL.** The 4 PPL "improvement" is an illusion.
+
+The root cause is a **circular dependency**. In the iteration loop during training:
+
+```
+for k in 1..K:
+    z = block(processed_x)
+    shifted_z = shift(z)
+    correction = corr_ffn(concat(ln(shifted_z), processed_x))  # sees processed_x
+    processed_x = tok_emb + correction                          # updates processed_x
+```
+
+At each iteration, `processed_x` is updated, and the next iteration's correction sees the *refined* `processed_x`. Over K=5 iterations, `processed_x` converges to a stable point where the correction and `processed_x` are mutually consistent.
+
+At sequential K=1 inference, there is no iterative refinement. The correction at position t sees `processed_x[t]` which is `tok_emb[t] + correction_from_prev_position` — a single-pass value that has NOT been iteratively refined. The corr_ffn was trained on refined `processed_x` (iterations 2..K) but gets unrefined `processed_x` at inference. This is out of distribution.
+
+**Why corr_ffn doesn't have this problem:** In the original corr_ffn, `correction[t] = corr_ffn(ln(z[t]))`. The correction depends on `z[t]`, not on `processed_x[t+1]`. At sequential K=1, once position t is fully processed, `z[t]` is fully determined — there is no dependency on the target position's state. The correction is a clean function of the finalized source position.
+
+**The key principle:** The correction must be a function of *already-finalized* quantities only. Any dependency on the target position's current state creates a circular dependency that requires iterative refinement to resolve — breaking the K=1 sequential inference guarantee.
+
+### Lesson learned
+
+Token-blind corrections are a real limitation of the architecture, but the fix cannot introduce dependencies on `processed_x` at the target position. Any future attempt to make corrections token-aware must find a way to incorporate the target token's identity without creating a circular dependency. The correction must depend only on *already-finalized* quantities.
+
+### Fix 1: Concat with tok_emb (block_head_corr_ffn_concat v2)
+
+Replace `processed_x` with `tok_emb` in the concat — `tok_emb` is constant (no circular dependency):
+
+```
+z[t] = block(processed_x)[t]
+shifted_z[t] = z[t-1]
+correction[t] = corr_ffn(concat(ln_corr(shifted_z[t]), tok_emb[t]))   # tok_emb, NOT processed_x
+processed_x[t] = tok_emb[t] + correction[t]
+head_input[t] = z[t]
+```
+
+corr_ffn input is 2C: Linear(2C→4C)→GELU→Linear(4C→C). Total: 24C² per iteration (vs 20C² for corr_ffn).
+
+**Results (C=50, K=5, block_size=256, 100K iters):**
+
+| Model | Params | Val PPL (K=5) | Seq K=1 | Gap | L |
+|---|---|---|---|---|---|
+| corr_ffn_concat v2 (tok_emb) | 1,677,100 | **80.42** | **80.51** | **+0.09** | 0.71 |
+| ~~corr_ffn_concat v1 (processed_x)~~ | 1,677,100 | 80.44 | 84.80 | +4.4 | 0.71 |
+| corr_ffn (token-blind baseline) | 1,651,600 | 84.32 | 84.55 | +0.2 | 0.88 |
+
+The tok_emb fix eliminates the circular dependency completely. Sequential K=1 matches val PPL (gap 0.09). The 4 PPL improvement over token-blind corr_ffn is now real.
+
+### Parameter and FLOP comparison: concat v2 vs roformer_head_ffn (single layer)
+
+At N=1 / K=1 (single layer each), concat v2 and roformer_head_ffn have nearly identical structure. The only difference is the correction FFN input width.
+
+**roformer_head_ffn N=1:**
+```
+Embeddings:  2VC           (token_embedding + lm_head)
+Block:       12C²          (attention 4C² + FFN 8C²)
+head_ffn:    8C²           (C → 4C → C)
+────────────────────────────
+Total:       2VC + 20C²
+```
+
+**D=1 concat v2 K=1:**
+```
+Embeddings:  2VC           (token_embedding + head)
+Block:       12C²          (attention 4C² + FFN 8C²)
+corr_ffn:    12C²          (2C → 4C → C, wider input from concat)
+────────────────────────────
+Total:       2VC + 24C²
+```
+
+**Difference: 4C²** — the corr_ffn takes 2C input (concat of shifted z and tok_emb) vs head_ffn's C input. This gives corr_ffn 12C² vs head_ffn 8C².
+
+The relative overhead depends on the embedding-to-block ratio:
+
+```
+Extra fraction = 4C² / (2VC + 20C²) = 4C / (2V + 20C)
+```
+
+| C | V | Extra params | Overhead |
+|---|---|---|---|
+| 50 | 16000 | 10K | 0.6% |
+| 100 | 16000 | 40K | 1.1% |
+| 446 | 16000 | 796K | 4.4% |
+| C → ∞ | V | — | → 20% |
+
+At practical C (50-446), the overhead is small (0.6-4.4%) because embeddings (2VC) dominate. In the limit C >> V, the overhead approaches 4/20 = 20%.
+
+**Inference FLOPs per token (sequential K=1):**
+
+| Model | FLOPs/token |
+|---|---|
+| roformer_head_ffn N=1 | 20C² |
+| D=1 concat v2 K=1 | 24C² |
+| roformer_head_ffn N=3 | 44C² |
+| roformer_head_ffn N=6 | 80C² |
+
+D=1 concat v2 costs 24C² per token at inference — 20% more than a single roformer_head_ffn layer, but 45% less than N=3 and 70% less than N=6. The question is whether one shared-weight block with contextualized inputs (from the correction mechanism) can match the quality of multiple separate-weight layers.
+
+### Fix 2: Add tok_emb (block_head_corr_ffn_add)
+
+Instead of concatenating shifted_z and tok_emb (requiring 2C→4C FFN), add them before the FFN:
+
+```
+z[t] = block(processed_x)[t]
+shifted_z[t] = z[t-1]
+correction[t] = corr_ffn(ln_corr(shifted_z[t] + tok_emb[t]))   # addition, not concat
+processed_x[t] = tok_emb[t] + correction[t]
+head_input[t] = z[t]
+```
+
+corr_ffn input is C: standard FeedForward (C→4C→C). Total: **20C² per iteration** — same as token-blind corr_ffn.
+
+**Properties:**
+- Same params/FLOPs as corr_ffn (20C²) — zero overhead
+- Token-aware: corr_ffn sees both past context and current token identity
+- No circular dependency: tok_emb is constant
+- Question: does addition provide enough signal vs concatenation?
+
+**Status: experiment pending.**
+
+## Training Optimization: K=5 and Random K
+
+### K=5 matches K=10
+
+Training with K=5 iterations instead of K=10 gives nearly identical results with 2x faster training:
+
+| Config | 100K Val PPL | Seq K=1 | L |
+|---|---|---|---|
+| K=10, cw=0 | 84.16 | 84.18 | 0.94 |
+| K=5, cw=0 | 84.32 | 84.55 | 0.88 |
+| K=10, random K (k_min=2), cw=0 | 84.41 | 84.36 | 0.72 |
+
+K=5 loses only 0.16 PPL vs K=10. **Recommendation: use K=5 for all experiments.**
+
+### Random K training
+
+Sample K ~ Uniform(k_min, K_max) each batch during training. At eval, always use full K.
+
+**Motivation:** Expose the block to a range of contextualization depths during training. Some batches use K=2 (minimal context), others use K=10 (full). This should make the block more robust to varying levels of contextualization.
+
+**Results (C=50, K=10, k_min=2, cw=0, 100K iters):**
+
+| Metric | Random K | Fixed K=10 |
+|---|---|---|
+| Val PPL | 84.41 | 84.16 |
+| Parallel K=1 | 117.93 | 131.10 |
+| Sequential K=1 | 84.36 | 84.18 |
+| L (contraction) | 0.72 | 0.94 |
+
+Key findings:
+- **Costs only 0.25 PPL** at full K (84.41 vs 84.16)
+- **Dramatically improves parallel K=1** (118 vs 131) — block handles raw inputs better
+- **Does NOT improve sequential K=1** (84.36 vs 84.18) — sequential already gets contextualized inputs
+- **Improves convergence** (L=0.72 vs 0.94) — block learns to converge faster since it sometimes only gets 2 iterations
+
+### Convergence weight ablation
+
+The convergence weight (MSE loss between last two iterations) makes negligible difference:
+
+| Config | Val PPL | Seq K=1 |
+|---|---|---|
+| cw=0.0 | 84.16 | 84.18 |
+| cw=0.1 | 84.20 | 84.22 |
+
+Recommendation: use cw=0 to simplify.
+
+## Depth at Scale: D=3 Results
+
+### D=3 at C=446 (FLOP-matched vs roformer_head_ffn N=3)
+
+Deep D=3 block_head_corr_ffn at C=446 is FLOP-matched against roformer_head_ffn N=3 at C=446 (both ~44C² FLOPs/token). The D=3 model also has similar total params.
+
+| Iter | D=3 C=446 | roformer_head_ffn N=3 C=446 |
+|---|---|---|
+| 5K | 38.95 | 41.60 |
+| 10K | 31.36 | 33.62 |
+| 15K | 29.07 | 30.96 |
+| 20K | 27.57 | 29.48 |
+| 25K | 26.87 | 28.36 |
+| 30K | 26.30 | 27.70 |
+| 35K | 26.47 | 29.00 |
+| 40K | 25.95 | 28.52 |
+
+**D=3 leads roformer_head_ffn by ~2.6 PPL at C=446, and the gap is stable/widening.** This is the first clear evidence that look-ahead depth can beat standard transformers at scale.
+
+### Scale changes the dynamics
+
+| C | D=3 vs roformer_head_ffn N=3 gap | Notes |
+|---|---|---|
+| C=50 | +1.5 (D=3 behind) | D=3 76.83 vs rhf 75.32 at 100K |
+| C=74 | +0.6 (D=3 behind, gap widening) | D=3 62.23 vs rhf 61.60 at 85K |
+| C=446 | -2.6 (D=3 ahead, gap stable) | D=3 25.95 vs rhf 28.52 at 40K |
+
+At C=50 and C=74, D=3 loses to roformer_head_ffn. At C=446, D=3 wins by 2.6 PPL and the gap is stable. The crossover point is somewhere between C=74 and C=446. **The iterative training advantage only manifests at sufficiently large C.**
 
 ## Earlier Proposal: Scaled Full Output (No Delta Subtraction)
 
@@ -636,6 +951,68 @@ context. The scaling α is the missing piece.
 - Does the non-cumulative fixed-point property still hold with scaled full outputs?
 - How does the convergence behavior change when the iteration uses full outputs vs deltas?
 
+## The Importance of L (Empirical Contraction Constant)
+
+### What L measures
+
+The empirical contraction constant L is the ratio of successive correction differences:
+
+```
+L = ||correction_K - correction_{K-1}|| / ||correction_{K-1} - correction_{K-2}||
+```
+
+L < 1 means the iterations are contracting — each iteration changes the correction less than the
+previous one. L ≈ 0 means rapid convergence; L ≈ 1 means barely converging; L > 1 means diverging.
+
+### L does NOT predict short-sequence performance
+
+At block_size=256 evaluation, all models achieve sequential K=1 ≈ val PPL regardless of L:
+
+| Model | L | Val PPL | Seq K=1 |
+|---|---|---|---|
+| block_head_ffn | 0.66 | 121.56 | 121.57 |
+| attn_corr_ffn | 0.53 | 128.96 | 129.14 |
+| nocat | 0.99 | 128.43 | 128.48 |
+| attn_head_ffn | 0.53 | 139.10 | 139.10 |
+
+The model with the worst L (nocat, 0.99) matches sequential just as well as the best L (attn_head_ffn, 0.53). And the best L doesn't predict the best PPL — attn_head_ffn has L=0.53 but the worst PPL (139.10).
+
+Within the training block_size, sequential K=1 works for all models because left-to-right processing gives each position fully converged predecessors. L is irrelevant here.
+
+### Where L should matter: long-form generation
+
+The real test for L is generation far beyond the training block_size. During training, the model
+processes sequences of length block_size (e.g. 256). At sequential inference generating 1000+ tokens,
+the chain of contextualizations extends far beyond anything seen during training.
+
+At each step, the correction is slightly imperfect — it doesn't perfectly match the converged fixed
+point. This error propagates to the next position's input, which produces another slightly imperfect
+correction, and so on. The question is: do these errors accumulate or wash out?
+
+**L predicts the error accumulation rate.** If the iteration map is a contraction with constant L,
+then a perturbation of size ε in the input produces a perturbation of size L·ε in the output. Over
+a chain of T positions:
+
+- **L = 0.5**: errors decay. After T steps, accumulated error ~ ε/(1-L) = 2ε. Bounded regardless of T.
+- **L = 0.99**: errors barely decay. After T steps, accumulated error ~ T·ε. Grows linearly with sequence length.
+- **L ≥ 1.0**: errors amplify. Generation eventually diverges from the training distribution.
+
+A model with L=0.5 should generate stable, coherent text at any length. A model with L=0.99 will
+gradually drift from the learned distribution as the sequence grows longer, producing increasingly
+degraded output.
+
+### Implications
+
+1. **L is a stability metric, not a quality metric.** It tells you how far you can push the model
+   at inference, not how good the model is within its training distribution.
+
+2. **Must test at long sequences to validate.** Evaluating at block_size=256 won't reveal L-related
+   degradation. Need to generate 1000+ tokens and check whether perplexity degrades vs. block_size
+   evaluation. This test has not been done yet.
+
+3. **Low L is insurance.** Two models with similar PPL at block_size=256 may behave very differently
+   at sequence length 10,000. The one with lower L is safer for deployment.
+
 ## Summary of Key Insights
 
 1. **K=1 at inference**: Sequential processing from autoregressive generation + KV caching makes K>1 unnecessary when K is large during training. Training depth K is a training-only hyperparameter.
@@ -648,6 +1025,16 @@ context. The scaling α is the missing piece.
 
 5. **Parallel vs sequential eval**: For K>>1, parallel K=1 is pessimistic (unit sees raw embeddings). Sequential K=1 matches parallel K=N. For smaller K, the match is approximate.
 
-6. **Convergence loss helps**: MSE between last two iterations' outputs (weight 0.1) improves L with minimal PPL cost.
+6. **Convergence loss is unnecessary**: cw=0.1 vs cw=0.0 makes negligible difference (<0.1 PPL). Use cw=0.
 
 7. **Additive correction is important**: Learned combiner `f(correction, original)` hurts K=1 quality (91.5% gap). The additive `x_0 + correction` constrains the iteration to be contraction-like.
+
+8. **block_head_corr_ffn is the best variant**: Separate correction FFN from the block's own FFN. The block produces `z` for the head (clean signal with residual). The corr_ffn generates corrections from `z` for the next position. Matches block_head_ffn with a cleaner architecture.
+
+9. **Token-blind corrections are a constraint, not a bug**: The correction at position t cannot depend on `processed_x[t+1]` without creating a circular dependency that breaks sequential K=1. The concat variant showed 4 PPL improvement in training but failed at inference (seq K=1 gap of 4.4 PPL). Corrections must be functions of already-finalized quantities only.
+
+10. **K=5 matches K=10**: Only 0.16 PPL difference with 2x faster training. Use K=5.
+
+11. **Random K improves convergence but not sequential PPL**: Sampling K during training (k_min=2) improves L (0.72 vs 0.94) and parallel K=1 but not sequential K=1. Useful for robustness, not strictly necessary.
+
+12. **Depth matters at scale**: D=3 look-ahead beats roformer_head_ffn N=3 by 2.6 PPL at C=446 but loses by 0.6-1.5 PPL at C=50-74. The crossover is between C=74 and C=446.
