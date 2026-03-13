@@ -338,6 +338,16 @@ out = h + ffn(ln2(h))        # FFN + residual
 ```
 Within a D-block unit, each sub-block uses these standard residuals. The look-ahead correction is extracted only from the last block: `correction = block_D(h) - h`.
 
+### Nosub variant (FAILED): correction = z instead of z - x
+
+Instead of subtracting the input (`correction = z - x`), use the full block output (`correction = z`). The hypothesis was that passing the full representation as the correction would be richer than just the delta.
+
+**D=4 C=108 results:** Nosub (51.25 PPL) beat block_head (52.22 PPL) by ~1 PPL, with better convergence properties (no overshoot at K=10). This looked promising.
+
+**Stacked N=4 C=108: catastrophic failure.** PPL at 30K: 99.21 (vs 60.09 for block_head). The model barely learned. The problem: in stacked models, each unit resets to its anchor (`processed_x = anchor + shift(correction)`). With correction=z, the full block output magnitude accumulates across units — the correction is not a clean delta relative to the anchor, so the reset mechanism breaks down. With correction=z-x, the subtraction keeps the correction as a bounded delta that the anchor reset can handle.
+
+**Verdict:** Nosub provides a small benefit for D>1 (single unit) but is catastrophic for stacked (multiple units). Not worth pursuing — the subtraction is essential for the non-cumulative reset mechanism.
+
 ## The Core Mechanism: Why Sequential K=1 Works
 
 ### The contextualized embedding feedback loop
@@ -634,6 +644,343 @@ For each position t = 0, 1, ..., T-1:
 
 Position t gets a contextualized input `tok_emb[t] + correction[t-1]` where correction[t-1] was computed from the fully processed z at position t-1. This matches the parallel K>1 regime where later iterations see contextualized inputs.
 
+## Variant 6: Synced Head (attn_corr_ffn_sync)
+
+### Motivation: head and correction in sync
+
+In block_head variants, the head sees `z` (block output) while the correction is derived from `z` separately. The head and the iterative process operate on different signals:
+- The correction contextualizes the *next* position's input
+- The head classifies from the block's output
+- These two tasks share the same block but have no direct alignment
+
+In attn_corr_ffn, the head sees `h = x + attn(x)` (the attention residual), while the correction is `corr_ffn(ln(h))`. Again, the head and correction are decoupled.
+
+The sync variant aligns them: **the head sees exactly `processed_x + correction`** — the same correction signal that drives the iterative process, but applied at the current position (unshifted) rather than the next position (shifted).
+
+### Equations
+
+```
+h[t] = processed_x[t] + attn(ln1(processed_x))[t]     # attention + residual
+correction[t] = corr_ffn(ln2(h))[t]                     # FFN generates correction
+head_input[t] = processed_x[t] + correction[t]          # self-inclusive (unshifted)
+processed_x[t+1] = tok_emb[t+1] + correction[t]        # past-only (shifted)
+```
+
+### Side-by-side comparison
+
+```
+                attn_corr_ffn          attn_corr_ffn_sync        block_head
+                ─────────────          ──────────────────        ──────────
+Step 1:     h = x + attn(ln1(x))    h = x + attn(ln1(x))     h = x + attn(ln1(x))
+Step 2:     corr = corr_ffn(ln2(h)) corr = corr_ffn(ln2(h))  z = h + ffn(ln2(h))
+Head:       h                       x + corr                  z = h + ffn(ln2(h))
+Correction: corr                    corr                      z - x
+```
+
+Key differences:
+- **attn_corr_ffn**: Head sees `h` (attention output). Correction and head are decoupled.
+- **attn_corr_ffn_sync**: Head sees `x + correction`. The head sees exactly what the iterative process produces (before shifting). Head and correction are aligned.
+- **block_head**: Head sees `z = h + ffn(h)`. The FFN contributes to both the head signal and (implicitly) the correction. Entangled.
+
+### Why sync might work better
+
+At each position t, the sync head sees `processed_x[t] + correction[t]`:
+- `processed_x[t] = tok_emb[t] + correction[t-1]` carries token identity + past context
+- `correction[t] = corr_ffn(ln2(h[t]))` carries self-inclusive context from attention
+
+Together, `processed_x[t] + correction[t]` is exactly what `processed_x[t+1]` *would be* if the correction weren't shifted. The head classifies from the same representation that the model is learning to produce as contextualized embeddings. There is no gap between "what the model optimizes the correction for" and "what the head classifies from."
+
+In block_head, the head sees `z` which includes the FFN residual from `h`. This is a richer signal, but the FFN must serve double duty: enriching the head input AND producing a correction (via `z - x`). These two objectives can conflict.
+
+In the sync variant, the FFN (corr_ffn) has a single clear objective: produce corrections. The head directly evaluates the quality of those corrections.
+
+### Parameters and FLOPs
+
+Same as a standard roformer block: **12C² per D**.
+
+| Component | Params |
+|---|---|
+| Attention (Q, K, V, O) | 4C² |
+| corr_ffn (C→4C→C) | 8C² |
+| 2 LayerNorms | 4C |
+| **Total per D** | **12C² + 4C** |
+
+Param and FLOP matched to roformer at the same N=D:
+- D=4 sync = roformer N=4 = 48C² inference FLOPs
+
+### D>1 (deep) variant
+
+With d_block=D, the model has D separate-weight (attn, corr_ffn) pairs applied sequentially per iteration. Each pair d:
+
+```
+h_d = x_d + attn_d(ln1_d(x_d))
+correction_d = corr_ffn_d(ln2_d(h_d))
+x_{d+1} = x_d + correction_d           # within-iteration: unshifted, self-inclusive
+```
+
+Only the last pair's correction gets shifted for the next iteration:
+
+```
+processed_x = tok_emb + shift(correction_D)
+```
+
+The intermediate pairs (d < D) pass `x_d + correction_d` directly to the next pair — no shift, no reset to tok_emb. This builds up representation depth within the iteration while maintaining the past-only shift between iterations.
+
+**Status: running.** D=4 C=108 (48C² FLOPs, ~4M params) comparing against roformer N=4 C=108.
+
+### Deep vs Stacked: Self-Inclusive Correction Asymmetry
+
+The corr_ffn produces a **self-inclusive correction** at each position: correction[t] is informed by position t itself (through causal attention including the diagonal). But the past-only shift means correction[t] only enters processed_x at position t+1, never at position t. The head compensates by seeing correction[t] directly (sync: `processed_x[t] + correction[t]`).
+
+This creates a fundamental asymmetry between deep (D>1) and stacked models:
+
+**Deep (D>1, single unit):** Within an iteration, the D blocks are applied sequentially *without shifting*:
+```
+x_1 = x_0 + correction_0     # block 1 sees self-inclusive output of block 0
+x_2 = x_1 + correction_1     # block 2 sees self-inclusive output of block 1
+...
+```
+Block d>0 already sees the self-inclusive correction from block d-1. The corr_ffn's self-inclusive signal becomes **redundant** — the later blocks in the chain get this information "for free" from the residual stream.
+
+**Stacked (N units):** Between units, the correction is shifted and anchor resets:
+```
+Unit 0 output: h[t] = anchor_0[t] + correction_0[t-1]    # past-only
+Unit 1 anchor: anchor_1[t] = h[t]                          # no self-inclusive correction from unit 0
+Unit 1 output: h[t] = anchor_1[t] + correction_1[t-1]     # still past-only
+```
+Across all N units, position t accumulates `tok_emb[t] + Σ correction_i[t-1]` — corrections from position t-1 of each unit, **never from position t itself**. The self-inclusive correction only appears at the head.
+
+**Consequence:** The corr_ffn's self-inclusive signal retains its value in stacked models (each unit boundary re-introduces the past-only constraint) but may lose value in deep models (within-iteration blocks already propagate self-inclusive information).
+
+### Hybrid: Deep + Stacked
+
+This asymmetry suggests combining both: **d_block=2 with n_units=2** gives 4 total blocks (48C², param-matched to d_block=4 or roformer N=4), but splits them as 2 deep blocks per unit × 2 stacked units.
+
+Benefits:
+- Each unit has D=2 depth for within-iteration processing
+- The stacked boundary between units preserves the corr_ffn's self-inclusive advantage (anchor reset + shift)
+- More unit boundaries = more chances for the shift mechanism to propagate corrections
+
+The general family: d_block × n_units = N total blocks. At one extreme (d_block=N, n_units=1) all blocks are deep. At the other extreme (d_block=1, n_units=N) all blocks are stacked. The hybrid explores the middle ground.
+
+## Variant 7: Block-Aligned Look-Ahead (block_aligned)
+
+### Motivation
+
+The block_head and block_aligned architectures share the same attention, the same FFN, the same classifier, and the same z computation. They differ in exactly one place: **what gets shifted to the next position**.
+
+### Side-by-side equations (K=3 example)
+
+Where `f(x, c) = x + c + ffn(ln2(x + c))` (standard residual block formula).
+
+**block_head:**
+```
+init:  processed_x = tok_emb
+
+k=0:   attn_corr_0 = attn(ln1(tok_emb))
+       z_0 = f(tok_emb, attn_corr_0)
+       correction_0 = z_0 - tok_emb = attn_corr_0 + ffn(ln2(tok_emb + attn_corr_0))
+       processed_x_1 = tok_emb + shift(correction_0)
+
+k=1:   attn_corr_1 = attn(ln1(processed_x_1))
+       z_1 = f(processed_x_1, attn_corr_1)
+       correction_1 = z_1 - processed_x_1 = attn_corr_1 + ffn(ln2(processed_x_1 + attn_corr_1))
+       processed_x_2 = tok_emb + shift(correction_1)
+
+k=2:   attn_corr_2 = attn(ln1(processed_x_2))
+       z_2 = f(processed_x_2, attn_corr_2)
+       correction_2 = z_2 - processed_x_2 = attn_corr_2 + ffn(ln2(processed_x_2 + attn_corr_2))
+       processed_x_3 = tok_emb + shift(correction_2)
+
+classifier: head(ln_f(z_2))
+```
+
+**block_aligned:**
+```
+init:  processed_x = tok_emb
+
+k=0:   attn_corr_0 = attn(ln1(tok_emb))
+       z_0 = f(tok_emb, attn_corr_0)
+       processed_x_1 = f(tok_emb, shift(attn_corr_0))
+
+k=1:   attn_corr_1 = attn(ln1(processed_x_1))
+       z_1 = f(processed_x_1, attn_corr_1)
+       processed_x_2 = f(tok_emb, shift(attn_corr_1))
+
+k=2:   attn_corr_2 = attn(ln1(processed_x_2))
+       z_2 = f(processed_x_2, attn_corr_2)
+       processed_x_3 = f(tok_emb, shift(attn_corr_2))
+
+classifier: head(ln_f(z_2))
+```
+
+### The only difference: step 3
+
+Expanding the step 3 equations for a specific position t:
+
+| | block_head | block_aligned |
+|---|---|---|
+| What gets shifted | `correction = attn_corr + ffn(ln2(processed_x + attn_corr))` | `attn_corr` (raw attention output) |
+| Next processed_x[t] | `tok_emb[t] + correction[t-1]` | `tok_emb[t] + attn_corr[t-1] + ffn(ln2(tok_emb[t] + attn_corr[t-1]))` |
+
+Everything else is identical: same init, same attn, same z, same classifier.
+
+The FFN input differs:
+- **block_head**: FFN was evaluated at the source position with `ln2(processed_x[t-1] + attn_corr[t-1])`. Its output is shifted as-is to position t.
+- **block_aligned**: FFN is re-evaluated at the destination position with `ln2(tok_emb[t] + attn_corr[t-1])`. The new token's identity is baked into the FFN computation.
+
+### block_aligned_light variant
+
+The classifier's z computation (`f(processed_x, attn_corr)`) applies FFN a second time. Since processed_x already has FFN baked in from step 3, the light variant skips this: classifier sees `processed_x + attn_corr` directly, saving 8C² FLOPs at classification.
+
+### Parameters and FLOPs
+
+All three are 12C² per D (same as roformer):
+- block_head: 12C² params, 12C² FLOPs per iteration
+- block_aligned: 12C² params, 12C² FLOPs per iteration (FFN runs in step 3, z computed at classifier only)
+- block_aligned_light: 12C² params, 12C² FLOPs per iteration (skips FFN at classifier)
+
+### Results (C=50, K=5, k_min=2, block_size=256, 100K iters)
+
+| Model | 10K PPL | 100K PPL | Seq K=1 | L |
+|-------|---------|----------|---------|---|
+| block_head | 129.97 | 91.97 | 92.08 | 0.54 |
+| block_aligned | 133.98 | 94.71 | 94.73 | 0.58 |
+| block_aligned_light | 135.72 | 96.63 | 96.66 | 0.66 |
+
+block_head wins by 2.7 PPL over block_aligned. Shifting the full z is more effective than shifting raw attn_corr and re-applying FFN. The FFN processing from the current position carries useful information that is lost when only the attention output is shifted.
+
+## Variant 8: Tied and Pure Correction FFN Variants
+
+### Motivation: reducing correction FFN params
+
+The corr_ffn adds 8C² params (a full FFN) to generate corrections. Can we tie its weights to the block's own FFN, reducing total per-iteration cost from 20C² to 12C² (same as block_head/roformer)?
+
+Two orthogonal ideas:
+1. **Tied FFN**: Share weights between corr_ffn and block.ffn (saves 8C² params)
+2. **Pure residual pattern**: Use `f(tok_emb, shift(z))` instead of `f(processed_x, shift(z))` to build processed_x
+
+### Tied variant (corr_ffn_add_tied)
+
+```
+z[t] = block(processed_x)[t]                          # standard block
+shifted_z[t] = z[t-1]
+correction[t] = block.ffn(block.ln2(shifted_z[t] + tok_emb[t]))   # REUSE block's FFN and LN
+processed_x[t] = tok_emb[t] + correction[t]
+head_input[t] = z[t]
+```
+
+The block's FFN is called twice per iteration:
+1. Inside the block: `ffn(ln2(h))` where `h = processed_x + attn(ln1(processed_x))`
+2. As correction: `ffn(ln2(shift(z) + tok_emb))`
+
+Both calls go through `ln2` first, maintaining input structure consistency. The FFN sees layernorm'd inputs in both cases, but the actual distributions differ (attention residual vs shifted block output + token embedding).
+
+**Params: 12C²** — same as block_head and roformer.
+
+### Pure residual pattern (corr_ffn_add_pure)
+
+Instead of building processed_x from the previous iteration's processed_x:
+```
+# Standard (non-pure):
+processed_x = tok_emb + shift(z) + corr_ffn(ln_corr(processed_x_prev + shift(z)))
+```
+
+Use tok_emb as the anchor at every iteration:
+```
+# Pure:
+processed_x = tok_emb + shift(z) + corr_ffn(ln_corr(tok_emb + shift(z)))
+```
+
+The motivation is architectural consistency — the FFN always sees `tok_emb + shift(z)`, not a recursively accumulated processed_x. This also has a tied variant (`corr_ffn_add_tied_pure`, 12C²).
+
+### Results (C=50, K=5, k_min=2, block_size=256, 10K iters)
+
+| Model | FLOPs/iter | 10K PPL | Seq K=1 | L |
+|-------|-----------|---------|---------|---|
+| corr_ffn_add | 20C² | 120.96 | 120.95 | 0.44 |
+| corr_ffn_add_tied | 12C² | 129.43 | 129.44 | 0.42 |
+| block_head | 12C² | 129.97 | — | — |
+| add_pure | 20C² | 134.27 | 135.07 | 0.88 |
+| add_tied_pure | 12C² | 139.13 | 140.31 | 0.91 |
+
+### Why pure fails: the direct skip connection defeats contraction
+
+The pure pattern looks architecturally clean, but it contains a fatal flaw: the **direct skip connection from shift(z) to processed_x** creates a near-identity iteration map that prevents convergence.
+
+Expanding what `shift(z)` actually contains:
+
+```
+z = block(processed_x)
+  = processed_x + attn(ln1(processed_x)) + ffn(ln2(processed_x + attn(...)))
+  ≈ processed_x + delta                    (delta = attention + FFN contributions)
+```
+
+Due to the block's residual connections, z ≈ processed_x + delta. Therefore:
+
+```
+shift(z)[t] = z[t-1] ≈ processed_x[t-1] + delta[t-1]
+```
+
+In the pure pattern:
+```
+processed_x_new[t] = tok_emb[t] + shift(z)[t] + ffn(ln(tok_emb[t] + shift(z)[t]))
+                    = tok_emb[t] + [processed_x_old[t-1] + delta[t-1]] + ffn(...)
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                    previous iteration's processed_x leaks through
+```
+
+The previous iteration's `processed_x[t-1]` enters the new `processed_x[t]` through the direct `shift(z)` path. This creates a near-identity coupling between iterations: if `processed_x` changes by ε, z changes by approximately ε (due to the residual), and `shift(z)` carries that ε directly into the next iteration's `processed_x`. The Lipschitz constant of the iteration map is close to 1.
+
+**How block_head avoids this:** Block_head extracts `correction = z - processed_x`, which cancels the identity component:
+```
+correction = z - processed_x = attn_delta + ffn_delta      (bounded, no identity leak)
+processed_x_new = tok_emb + shift(correction)               (contractive)
+```
+
+The subtraction `z - processed_x` is essential — it strips out `processed_x` from z, leaving only the attention and FFN deltas. Shifting a bounded delta is naturally contractive.
+
+**How corr_ffn_add avoids this:** The standard (non-pure) corr_ffn_add routes `shift(z)` through the FFN bottleneck only — no direct skip:
+```
+correction = corr_ffn(ln_corr(shift(z) + tok_emb))         (FFN compresses z)
+processed_x_new = tok_emb + correction                      (contractive)
+```
+
+Even though shift(z) contains the identity component, the FFN can learn to extract only the relevant delta and discard the `processed_x` residual. The bottleneck (C → 4C → C with nonlinearity) naturally compresses the signal, keeping L well below 1.
+
+**Pure has no such mechanism.** The direct `shift(z)` path bypasses both the subtraction (block_head's approach) and the FFN bottleneck (corr_ffn_add's approach). No matter what the FFN learns, the identity component of z propagates directly into processed_x, keeping L ≈ 1.
+
+The convergence diagnostics confirm this precisely: L ≈ 0.88–0.91 for pure variants vs L ≈ 0.42–0.44 for non-pure.
+
+### The contraction principle for look-ahead architectures
+
+This analysis reveals a general design principle: **any variant that passes `shift(z)` directly into `processed_x` (without subtracting the identity or routing through a bottleneck) will fail to converge.**
+
+The three mechanisms for achieving contraction:
+
+| Mechanism | Example | How it removes identity | Cost |
+|-----------|---------|------------------------|------|
+| Delta extraction | block_head: `z - processed_x` | Explicit subtraction | 0 (free) |
+| FFN bottleneck | corr_ffn_add: `ffn(ln(shift(z) + tok_emb))` | FFN learns to compress | 8C² |
+| Both | corr_ffn: `ffn(ln(z))` (no shift(z) in processed_x) | FFN on z, no direct path | 8C² |
+
+Block_head achieves contraction for free via the subtraction. The corr_ffn variants pay 8C² for a learnable bottleneck that can extract richer corrections than a simple delta. The pure pattern uses neither mechanism.
+
+### Tied ≈ block_head: the correction FFN matters
+
+At 12C², corr_ffn_add_tied (129.43) essentially matches block_head (129.97). This makes sense: tying the FFN removes the correction's independent capacity. The shared FFN must serve double duty — enriching the representation inside the block AND generating corrections — but these tasks may require different transformations. With shared weights, the FFN compromises between the two objectives, leaving it no better than block_head's simple delta extraction.
+
+The separate corr_ffn earns its 8C²: the 20C² → 12C² reduction costs ~9 PPL (120.96 → 129.43). The correction FFN needs independent weights to specialize for correction generation.
+
+### Summary
+
+| Idea | Result | Why |
+|------|--------|-----|
+| Tied FFN (save 8C²) | Recovers block_head performance | Shared weights can't specialize; dual-objective compromise |
+| Pure residual (tok_emb anchor) | L ≈ 0.9, +13 PPL | Direct shift(z) skip defeats contraction |
+| Tied + pure | Worst of both worlds | Both failure modes compound |
+| **Implication** | block_head is optimal at 12C² | Delta subtraction is the cheapest contraction mechanism |
+
 ## The Token-Blind Correction Problem (FAILED: Concat Variant)
 
 ### The observation
@@ -766,6 +1113,41 @@ At practical C (50-446), the overhead is small (0.6-4.4%) because embeddings (2V
 | roformer_head_ffn N=6 | 80C² |
 
 D=1 concat v2 costs 24C² per token at inference — 20% more than a single roformer_head_ffn layer, but 45% less than N=3 and 70% less than N=6. The question is whether one shared-weight block with contextualized inputs (from the correction mechanism) can match the quality of multiple separate-weight layers.
+
+### Why the concat advantage vanishes at D>1 and stacked n_units>1
+
+**Setup.** Both non-concat and concat v2 produce a correction that contextualizes the next iteration's input. The key difference is what the correction at position t depends on:
+
+- **Non-concat (corr_ffn)**: `correction[t] = corr_ffn(z[t])`, then shifted right.
+  - Position t receives: `processed_x[t] = tok_emb[t] + corr_ffn(z[t-1])`
+  - The correction applied at t depends **only on z[t-1]** — the past. It is completely unaware of processed_x[t]. It does not see tok_emb[t] or anything about position t.
+
+- **Concat v2**: `correction[t] = corr_ffn(z[t-1], tok_emb[t])`, applied directly at t.
+  - Position t receives: `processed_x[t] = tok_emb[t] + corr_ffn(z[t-1], tok_emb[t])`
+  - The correction applied at t depends on **z[t-1] (past) plus tok_emb[t] (current token)**. It is aware of the token at position t.
+
+In both cases, tok_emb[t] appears in processed_x through the addition. But in non-concat, the correction cannot depend on position t at all — it is purely a function of the past. In concat, the correction is a function of both past context and current token identity, enabling token-dependent corrections (e.g., "given context X, if the token is Y, apply correction Z").
+
+**Why concat helps at D=1.** With a single shared-weight block, the block has limited capacity (one self-attention + one FFN). A token-dependent correction gives it a better starting point — the correction can tailor processed_x to the specific token at position t, rather than providing a generic context-only signal that the block must then reconcile with tok_emb[t].
+
+**Why concat may not help at D>1.** With D separate-weight blocks processing the sequence, there are D layers of self-attention that each attend to position t (causal masking includes self). Even though the correction at position t is completely unaware of position t (in non-concat), the D blocks have ample capacity to handle the token identity that enters processed_x through the additive tok_emb[t]. The blocks themselves compute the context × token interactions that concat's corr_ffn would have provided. The extra 4C² params in concat's wider FFN (12C² vs 8C²) become redundant.
+
+**Why concat may not help at stacked n_units>1.** In stacked models, each unit runs K iterations with its own corr_ffn. Unit 1 operates on tok_emb — same situation as D=1, so concat helps here. But unit 2's input is unit 1's output h1, which is already token-aware (from K iterations of self-attention). Unit 2's non-concat corr_ffn sees z[t-1] computed from token-aware inputs — so even without explicit tok_emb[t], the correction is indirectly aware of token identities. The concat channel becomes redundant for units beyond the first.
+
+**Summary:**
+
+| Architecture | Correction sees position t? | Blocks compensate? | Concat value |
+|---|---|---|---|
+| D=1 | Only with concat (tok_emb[t]) | 1 block, limited | High |
+| D>1 | Only with concat (tok_emb[t]) | D blocks, ample | Low |
+| Stacked unit 1 | Only with concat (tok_emb[t]) | 1 shared block, limited | High |
+| Stacked units 2+ | Indirectly (token-aware input) | 1 shared block | Low |
+
+**Empirical evidence (D=3 C=446, big machine):**
+
+Non-concat (K=10) pulls ahead of concat v2 (K=5) by ~0.3 PPL at 70K iters. However, there are two confounds: (1) K=5 vs K=10 training depth, (2) random K training in concat v2. A control experiment is planned: non-concat with K=5 + random K to isolate the architectural effect.
+
+**Implication:** At D>1 or stacked n_units>1, prefer the simpler non-concat architecture. It saves 4C² params and FLOPs in the corr_ffn without sacrificing quality. The concat overhead (20% more corr_ffn compute) is only justified at D=1.
 
 ### Fix 2: Add tok_emb (block_head_corr_ffn_add)
 
