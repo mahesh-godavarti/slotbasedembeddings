@@ -354,7 +354,8 @@ class JoFormerLearnedAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
         self.use_softmax = use_softmax
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        max_len = block_size * 2  # KG sequences may exceed block_size
+        self.register_buffer('tril', torch.tril(torch.ones(max_len, max_len)))
 
     def forward(self, x, angles):
         """x: (B,T,C), angles: (B,T,C//2) — already cumsum'd."""
