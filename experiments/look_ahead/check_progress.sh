@@ -9,11 +9,11 @@
 OUTPUT="${1:-/tmp/claude-1000/-home-ubuntu/tasks/b3jnvwyw9.output}"
 
 echo "=== Current progress ==="
-tr '\r' '\n' < "$OUTPUT" | grep -oP '\d+/100000.*?val_ppl=[\d.]+' | tail -1
+tr '\r' '\n' < "$OUTPUT" | grep -oP '\d+/\d+.*?val_ppl=[\d.]+' | tail -1
 
 echo ""
 echo "=== Val PPL at each eval point ==="
-tr '\r' '\n' < "$OUTPUT" | grep -oP '\d+/100000.*?val_ppl=[\d.]+' | python3 -c "
+tr '\r' '\n' < "$OUTPUT" | grep -oP '\d+/\d+.*?val_ppl=[\d.]+' | python3 -c "
 import sys
 prev_ppl = None
 for line in sys.stdin:

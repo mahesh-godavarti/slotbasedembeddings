@@ -69,7 +69,8 @@ class SplitBlockLookAhead(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
-                 use_softmax=False, convergence_weight=0.0, k_min=0, **kwargs):
+                 use_softmax=False, convergence_weight=0.0, k_min=0,
+                 head_sees_px=False, **kwargs):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
@@ -77,6 +78,7 @@ class SplitBlockLookAhead(nn.Module):
         self.block_size = block_size
         self.convergence_weight = convergence_weight
         self.k_min = k_min  # 0 = disabled (always use n_iters), >0 = sample K ~ Uniform(k_min, n_iters)
+        self.head_sees_px = head_sees_px
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.drop = nn.Dropout(dropout)
@@ -130,7 +132,7 @@ class SplitBlockLookAhead(nn.Module):
             n_iters = self.n_iters
 
         processed_x, y, aux_loss = self._run_iterations(tok_emb, n_iters)
-        head_input = self._get_head_input(y)
+        head_input = processed_x if self.head_sees_px else self._get_head_input(y)
         logits = self.head(self.ln_f(head_input))
 
         loss = None
@@ -146,7 +148,7 @@ class SplitBlockLookAhead(nn.Module):
         """Evaluate at inference depth K."""
         tok_emb = self.drop(self.token_embedding_table(idx))
         processed_x, y, _ = self._run_iterations(tok_emb, K)
-        head_input = self._get_head_input(y)
+        head_input = processed_x if self.head_sees_px else self._get_head_input(y)
         logits = self.head(self.ln_f(head_input))
 
         loss = None
@@ -178,7 +180,7 @@ class SplitBlockLookAhead(nn.Module):
             if t < T - 1:
                 processed_x[:, t+1, :] = tok_emb[:, t+1, :] + correction_full[:, t, :]
 
-        head_input = self._get_head_input(y)
+        head_input = processed_x if self.head_sees_px else self._get_head_input(y)
         logits = self.head(self.ln_f(head_input))
 
         loss = None
@@ -224,7 +226,7 @@ class SplitBlockLookAhead(nn.Module):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        head_input = self._get_head_input(y)
+        head_input = processed_x if self.head_sees_px else self._get_head_input(y)
         logits = self.head(self.ln_f(head_input))
 
         loss = None
@@ -266,7 +268,7 @@ class SplitBlockLookAhead(nn.Module):
             if i < prime_tokens:
                 processed_x, y, _ = self._run_iterations(tok_emb, self.n_iters)
                 eff_corr = processed_x - tok_emb
-                head_input = self._get_head_input(y)
+                head_input = processed_x if self.head_sees_px else self._get_head_input(y)
             else:
                 ec = eff_corr
                 if ec.shape[1] >= T:
@@ -278,7 +280,7 @@ class SplitBlockLookAhead(nn.Module):
                 processed_x = tok_emb + ec
                 y, correction = self._iteration_step(processed_x)
                 eff_corr = torch.cat([zero, correction[:, :-1, :]], dim=1)
-                head_input = self._get_head_input(y)
+                head_input = processed_x if self.head_sees_px else self._get_head_input(y)
 
             logits = self.head(self.ln_f(head_input))
             probs = F.softmax(logits[:, -1, :], dim=-1)
@@ -1281,7 +1283,7 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
     """block_head with FFN correction from concat of shifted z and tok_emb.
 
     z = block(processed_x)
-    correction = corr_ffn(concat(ln_corr(shift(z)), tok_emb))
+    correction = corr_ffn(ln_corr(concat(shift(z), tok_emb)))
     processed_x = tok_emb + correction
     head sees z
 
@@ -1289,6 +1291,7 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
     past context (z[t-1]) and current token identity (tok_emb[t]).
     tok_emb is used instead of processed_x to avoid circular dependency
     that breaks sequential K=1 inference.
+    Joint LN over full 2C concatenation (not separate LN on shifted_z only).
     corr_ffn input is 2C: Linear(2C→4C)→GELU→Linear(4C→C). Total: 24C².
 
     Supports deep block_head (D>1) via d_block parameter.
@@ -1319,7 +1322,7 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
             nn.Linear(4 * n_embed, n_embed),
             nn.Dropout(dropout),
         )
-        self.ln_corr = nn.LayerNorm(n_embed)
+        self.ln_corr = nn.LayerNorm(2 * n_embed)  # joint LN over full 2C concat
         self.ln_f = nn.LayerNorm(n_embed)
         self.head = nn.Linear(n_embed, vocab_size)
 
@@ -1346,8 +1349,8 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
             zero = torch.zeros(B, 1, C, device=tok_emb.device)
             shifted_z = torch.cat([zero, z[:, :-1, :]], dim=1)
 
-            # corr_ffn sees concat(ln(shifted_z), tok_emb) — tok_emb is constant, no circular dep
-            ffn_input = torch.cat([self.ln_corr(shifted_z), tok_emb], dim=-1)
+            # corr_ffn sees ln(concat(shifted_z, tok_emb)) — joint LN over full 2C
+            ffn_input = self.ln_corr(torch.cat([shifted_z, tok_emb], dim=-1))
             correction = self.corr_ffn(ffn_input)
 
             # Non-cumulative: reset to tok_emb
@@ -1398,15 +1401,16 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
 
             z_all[:, t, :] = z[:, t, :]
 
-            # Correction for t+1: corr_ffn sees concat(ln(z[t]), tok_emb[t+1])
+            # Correction for t+1: corr_ffn sees ln(concat(z[t], tok_emb[t+1]))
             if t < T - 1:
-                shifted_z_t1 = self.ln_corr(z[:, t, :])  # z from position t
+                shifted_z_t1 = z[:, t, :]  # z from position t
                 te_t1 = tok_emb[:, t+1, :]  # constant tok_emb at t+1
-                ffn_input = torch.cat([shifted_z_t1, te_t1], dim=-1)
+                ffn_input = self.ln_corr(torch.cat([shifted_z_t1, te_t1], dim=-1))
                 correction_t1 = self.corr_ffn(ffn_input)
                 processed_x[:, t+1, :] = tok_emb[:, t+1, :] + correction_t1
 
-        logits = self.head(self.ln_f(z_all))
+        head_input = processed_x if self.head_sees_px else z_all
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -1439,7 +1443,7 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
 
             zero = torch.zeros(B, 1, C, device=tok_emb.device)
             shifted_z = torch.cat([zero, z[:, :-1, :]], dim=1)
-            ffn_input = torch.cat([self.ln_corr(shifted_z), tok_emb], dim=-1)
+            ffn_input = self.ln_corr(torch.cat([shifted_z, tok_emb], dim=-1))
             correction = self.corr_ffn(ffn_input)
             processed_x = tok_emb + correction
 
@@ -1459,7 +1463,8 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        logits = self.head(self.ln_f(z))
+        head_input = processed_x if self.head_sees_px else z
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -1596,7 +1601,8 @@ class BlockHeadCorrFFNAddModel(SplitBlockLookAhead):
                 correction_t1 = self.corr_ffn(add_input)
                 processed_x[:, t+1, :] = tok_emb[:, t+1, :] + correction_t1
 
-        logits = self.head(self.ln_f(z_all))
+        head_input = processed_x if self.head_sees_px else z_all
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -1648,7 +1654,8 @@ class BlockHeadCorrFFNAddModel(SplitBlockLookAhead):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        logits = self.head(self.ln_f(z))
+        head_input = processed_x if self.head_sees_px else z
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -1787,7 +1794,8 @@ class BlockHeadCorrFFNAddPureModel(BlockHeadCorrFFNAddModel):
                 h = tok_emb[:, t+1, :] + z_t
                 processed_x[:, t+1, :] = h + self.corr_ffn(self.ln_corr(h))
 
-        logits = self.head(self.ln_f(z_all))
+        head_input = processed_x if self.head_sees_px else z_all
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -1840,7 +1848,8 @@ class BlockHeadCorrFFNAddPureModel(BlockHeadCorrFFNAddModel):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        logits = self.head(self.ln_f(z))
+        head_input = processed_x if self.head_sees_px else z
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -1997,7 +2006,8 @@ class BlockHeadRecomputeModel(SplitBlockLookAhead):
                 h = tok_emb[:, t+1, :] + delta_t
                 processed_x[:, t+1, :] = h + ffn(ln2(h))
 
-        logits = self.head(self.ln_f(z_all))
+        head_input = processed_x if self.head_sees_px else z_all
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -2048,7 +2058,8 @@ class BlockHeadRecomputeModel(SplitBlockLookAhead):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        logits = self.head(self.ln_f(z))
+        head_input = processed_x if self.head_sees_px else z
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -2170,7 +2181,8 @@ class BlockHeadRecomputeSepModel(SplitBlockLookAhead):
                 h = tok_emb[:, t+1, :] + delta_t
                 processed_x[:, t+1, :] = h + self.corr_ffn(self.ln_corr(h))
 
-        logits = self.head(self.ln_f(z_all))
+        head_input = processed_x if self.head_sees_px else z_all
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -2219,7 +2231,8 @@ class BlockHeadRecomputeSepModel(SplitBlockLookAhead):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        logits = self.head(self.ln_f(z))
+        head_input = processed_x if self.head_sees_px else z
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -2411,7 +2424,8 @@ class BlockHeadDeltaFFNAddModel(SplitBlockLookAhead):
                 correction_t1 = self.corr_ffn(add_input)
                 processed_x[:, t+1, :] = tok_emb[:, t+1, :] + correction_t1
 
-        logits = self.head(self.ln_f(z_all))
+        head_input = processed_x if self.head_sees_px else z_all
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -2464,7 +2478,8 @@ class BlockHeadDeltaFFNAddModel(SplitBlockLookAhead):
             prev_prev_correction = prev_correction
             prev_correction = correction.clone()
 
-        logits = self.head(self.ln_f(z))
+        head_input = processed_x if self.head_sees_px else z
+        logits = self.head(self.ln_f(head_input))
 
         loss = None
         if targets is not None:
@@ -3978,6 +3993,11 @@ MODEL_CLASSES = {
     'block_head_corr_ffn': _make_factory(BlockHeadCorrFFNModel),
     'block_head_corr_ffn_concat': _make_factory(BlockHeadCorrFFNConcatModel),
     'block_head_corr_ffn_add': _make_factory(BlockHeadCorrFFNAddModel),
+    # NOTE: _px variants are duds. head sees processed_x instead of z — loses 4.2 PPL vs baseline.
+    # Tested corr_ffn_add_px D=1 C=50 K=5: 86.82 vs corr_ffn_add 82.59. Do not use.
+    'block_head_corr_ffn_px': _make_factory(BlockHeadCorrFFNModel, head_sees_px=True),
+    'block_head_corr_ffn_concat_px': _make_factory(BlockHeadCorrFFNConcatModel, head_sees_px=True),
+    'block_head_corr_ffn_add_px': _make_factory(BlockHeadCorrFFNAddModel, head_sees_px=True),
     'block_head_corr_ffn_tied': _make_factory(BlockHeadCorrFFNTiedModel),
     'block_head_corr_ffn_add_tied': _make_factory(BlockHeadCorrFFNAddTiedModel),
     'block_head_corr_ffn_add_pure': _make_factory(BlockHeadCorrFFNAddPureModel),
