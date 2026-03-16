@@ -20,7 +20,7 @@ class ExperimentConfig:
     learning_rate: float = 6e-4
     min_lr: float = 6e-5
     warmup_steps: int = 2000
-    max_steps: int = 100_000
+    max_steps: int = 10_000
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
     weight_decay: float = 0.1
@@ -33,7 +33,7 @@ class ExperimentConfig:
     seq_length: int = 1024
 
     # Evaluation
-    eval_interval: int = 5000
+    eval_interval: int = 1000
     eval_steps: int = 200
 
     # Logging

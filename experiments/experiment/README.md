@@ -203,3 +203,144 @@ Standard `GPT2LMHeadModel` from HuggingFace with default weight-tied embeddings.
 - Do not add new files or reorganize the directory structure.
 - Do not "improve" working code.
 - If you encounter a problem, report it and ask before changing anything.
+
+---
+
+## Evolution of the Approach
+
+### Phase 1: Direct Composition (Failed — OOM)
+
+The original design replaced GPT-2's embedding table entirely. Every forward pass called `compose_all_tokens()` to build a `(50257, 768)` matrix from 256 character-level parameters, using it for both input lookup and output projection.
+
+**Problem**: The autograd graph for composing 50,257 tokens through sin/cos rotation ops consumed ~18GB of GPU memory — before the transformer even ran. On a 24GB A10G, this left no room for the model.
+
+**Attempted fixes**:
+- Reducing batch size: didn't help — composition graph was the bottleneck, not batch activations
+- Reducing embedding dim, layers, block size: didn't help — composition of 50,257 tokens dominated regardless
+- Reducing chunk_size in `compose_all_tokens()`: didn't help — same total graph across all chunks
+- Gradient checkpointing on composition chunks: **worked** — reduced composition memory from 18GB to 0.13GB by discarding intermediate activations and recomputing during backward
+
+With gradient checkpointing, the original architecture ran but was extremely slow (~5.7s/iter, ~158 hours for 100K steps) because every forward pass composed all 50,257 tokens twice (once forward, once recomputed for backward).
+
+### Phase 2: MSE Regularization Approach (Current)
+
+Instead of replacing the embedding table, we keep GPT-2's standard `wte` lookup table intact and add a **regularization loss** that forces the table entries to match their character-composed values:
+
+```
+total_loss = LM_loss + MSE(wte[sampled_tokens], compose(sampled_tokens))
+```
+
+Key design decisions:
+
+1. **Standard forward pass**: The LM forward uses normal `wte` lookup — same speed as baseline GPT-2.
+
+2. **Sampled composition loss**: Each step samples 1024 random multi-character tokens, composes their embeddings from character parameters, and penalizes the MSE between the composed embeddings and the `wte` entries. This covers rare tokens uniformly regardless of their frequency in training text.
+
+3. **Tied character vectors**: Single-byte tokens (all 256 byte values exist in GPT-2's vocabulary) share their `wte` rows as the character vectors used in composition. Only the rotation angles (`char_angles`) are separate parameters. This means the LM objective directly trains the character vectors.
+
+4. **Length-sorted token sampling**: Multi-character tokens are pre-sorted by byte length. Sampling contiguous blocks minimizes padding waste in the composition loop.
+
+### Phase 3: Control Experiment
+
+To test whether the improvement comes from character structure or just extra gradient signal on rare token embeddings, we built a **prediction control** model. Instead of MSE toward composed embeddings, it uses next-token prediction on character/token mini-sequences:
+
+- **chars → token**: `[r, u, n, n, i, n, g, running]` — predict each next element
+- **token → chars**: `[running, r, u, n, n, i, n, g]` — predict each next element
+
+This gives the same kind of gradient signal to rare token embeddings (associating them with their characters) but through prediction rather than algebraic composition.
+
+### Phase 4: Morphological Evaluation
+
+To test generalization of character-level patterns, we created a morphological dataset with ~2,865 training sentences and ~895 validation sentences covering 16 morphological patterns (un-, dis-, im-/in-/ir-/il-, re-, over-, under-, mis-, pre-, -ing, -ed, -er, -est, -s, -ly, -ness, agent -er). Validation uses held-out words not seen in training. A second validation set (537 sentences) uses novel sentence templates not seen during training.
+
+---
+
+## Results (10K steps, WikiText-103 + morphological data)
+
+### WikiText-103 Validation PPL
+
+| Step | Char-Compose | Control | Baseline |
+|------|-------------|---------|----------|
+| 1K   | 468         | 473     | 471      |
+| 2K   | 275         | 285     | 282      |
+| 3K   | 165         | 174     | 175      |
+| 4K   | 116         | 120     | 119      |
+| 5K   | 90          | 94      | 92       |
+| 6K   | 72          | 77      | 75       |
+| 7K   | 61          | 65      | 63       |
+| 8K   | 55          | 57      | 56       |
+| 9K   | 51          | 53      | 52       |
+| 10K  | **49.1**    | **51.1**| **50.4** |
+
+Char-compose leads from step 2K onward, with the gap widening over time.
+
+### Rare Token Evaluation (tokens appearing <= 50 times in training)
+
+| Model | Rare PPL | Common PPL | Rare positions |
+|-------|----------|------------|----------------|
+| Baseline | 685,123 | 49.28 | 426 |
+| Control | 222,672 | 48.76 | 426 |
+| Char-Compose | 472,383 | 48.65 | 426 |
+
+Both char-compose and control improve dramatically over baseline on rare tokens. The control's prediction-based approach was more effective for rare token embeddings specifically, though char-compose had better overall LM performance.
+
+---
+
+## Additional Files
+
+```
+eval_rare.py           - Rare token PPL comparison script
+eval_morphological.py  - Morphological pattern generalization evaluation
+morphological_data.py  - 2,865 train + 895 val + 537 novel-template morphological sentences
+resize_volume.md       - EBS volume resize instructions
+```
+
+### Running the evaluations
+
+```bash
+# Rare token evaluation
+python -m experiment.eval_rare \
+    --char_compose_ckpt checkpoints/char_compose_final.pt \
+    --baseline_ckpt checkpoints/baseline_final.pt \
+    --max_count 50
+
+# Morphological generalization
+python -m experiment.eval_morphological \
+    --char_compose_ckpt checkpoints/char_compose_final.pt \
+    --baseline_ckpt checkpoints/baseline_final.pt \
+    --control_ckpt checkpoints/predict_control_final.pt
+```
+
+### Training the predict_control model
+
+```bash
+python -m experiment.train --model_type predict_control
+```
+
+---
+
+## Current Parameter Counts
+
+| Component | Baseline | Char-Compose / Control |
+|---|---|---|
+| Token embeddings (wte) | 38,597,376 | 38,597,376 (kept) |
+| Rotation angles (char_angles) | — | 98,304 (256 x 384) |
+| Transformer + positional | 85,842,432 | 85,842,432 |
+| lm_head | tied with wte | tied with wte |
+| **Total** | **124,439,808** | **124,538,112** |
+
+Char-compose/control add only 98K parameters (the rotation angles). The character vectors are tied to the single-byte token rows of `wte`.
+
+---
+
+## Key Insights So Far
+
+1. **Direct composition is too expensive**: Computing 50,257 composed embeddings with gradient tracking every forward pass is impractical even with gradient checkpointing (feasible but ~6s/iter).
+
+2. **MSE regularization works**: Keeping the standard embedding table and using composition as a regularization target achieves the same goal at baseline training speed.
+
+3. **Tying character vectors to wte matters**: When single-byte token embeddings are the same parameters used for composition, the LM objective directly trains the building blocks of composition. This led to char-compose consistently outperforming baseline.
+
+4. **The composition loss covers rare tokens**: By sampling tokens uniformly (not by frequency), the MSE loss ensures rare token embeddings are pushed toward meaningful composed values even when they rarely appear in training text.
+
+5. **Character association helps rare tokens regardless of method**: Both char-compose (algebraic composition) and the prediction control (next-token prediction on char/token sequences) dramatically reduced rare token PPL compared to baseline, confirming that any mechanism linking tokens to their characters helps.

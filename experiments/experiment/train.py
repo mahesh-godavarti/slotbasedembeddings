@@ -3,6 +3,7 @@ import math
 import time
 import argparse
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2Tokenizer
@@ -11,6 +12,7 @@ from tqdm import tqdm
 
 from .config import ExperimentConfig, baseline_config, char_compose_config
 from .model import create_model, count_parameters
+from .morphological_data import get_train_sentences
 
 
 class TokenizedDataset(Dataset):
@@ -30,13 +32,52 @@ class TokenizedDataset(Dataset):
 
 
 def load_wikitext(config: ExperimentConfig, split: str = "train"):
-    """Load and tokenize WikiText-103."""
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    dataset = load_dataset(config.dataset_name, config.dataset_config, split=split)
+    """Load and tokenize WikiText-103. Caches tokenized data to disk."""
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"{config.dataset_config}_{split}.bin")
 
-    # Concatenate all text and tokenize
-    all_text = "\n".join(dataset["text"])
-    token_ids = tokenizer.encode(all_text, return_tensors="pt").squeeze(0)
+    if os.path.exists(cache_path):
+        print(f"  Loading cached tokens from {cache_path}")
+        token_ids = torch.from_numpy(
+            np.memmap(cache_path, dtype=np.int32, mode='r').copy()
+        ).long()
+    else:
+        print(f"  Tokenizing {split} split (one-time, will cache to {cache_path})...")
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        dataset = load_dataset(config.dataset_name, config.dataset_config, split=split)
+
+        # Tokenize in chunks to avoid OOM
+        all_ids = []
+        batch_texts = []
+        for i, example in enumerate(tqdm(dataset, desc=f"Tokenizing {split}")):
+            text = example["text"].strip()
+            if text:
+                batch_texts.append(text)
+            if len(batch_texts) >= 1000:
+                for t in batch_texts:
+                    all_ids.extend(tokenizer.encode(t))
+                batch_texts = []
+        if batch_texts:
+            for t in batch_texts:
+                all_ids.extend(tokenizer.encode(t))
+
+        # Save to disk as int32 binary
+        arr = np.array(all_ids, dtype=np.int32)
+        with open(cache_path, 'wb') as f:
+            f.write(arr.tobytes())
+        print(f"  Cached {len(arr):,} tokens to {cache_path}")
+        token_ids = torch.from_numpy(arr).long()
+
+    # Mix in morphological training sentences for training split
+    if split == "train":
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        morph_sents = get_train_sentences()
+        morph_ids = []
+        for s in morph_sents:
+            morph_ids.extend(tokenizer.encode(s))
+        print(f"  Mixed in {len(morph_sents)} morphological sentences ({len(morph_ids)} tokens)")
+        token_ids = torch.cat([token_ids, torch.tensor(morph_ids, dtype=torch.long)])
 
     return TokenizedDataset(token_ids, config.seq_length)
 
@@ -164,6 +205,11 @@ def train(config: ExperimentConfig):
 
         # Logging
         train_loss = loss.item() * config.gradient_accumulation_steps
+        if isinstance(outputs, dict) and step % 200 == 0:
+            lm_loss = outputs.get("lm_loss")
+            aux_loss = outputs.get("aux_loss")
+            if lm_loss is not None and aux_loss is not None:
+                print(f"\n  step {step}: lm={lm_loss.item():.4f}, aux={aux_loss.item():.6f}")
         pbar.set_postfix(loss=f"{train_loss:.4f}")
         pbar.update(1)
 
@@ -215,7 +261,7 @@ def train(config: ExperimentConfig):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="char_compose",
-                        choices=["baseline", "char_compose"])
+                        choices=["baseline", "char_compose", "predict_control"])
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--use_wandb", action="store_true")
@@ -224,6 +270,9 @@ def main():
 
     if args.model_type == "baseline":
         config = baseline_config()
+    elif args.model_type == "predict_control":
+        from .config import ExperimentConfig
+        config = ExperimentConfig(model_type="predict_control", run_name="predict_control")
     else:
         config = char_compose_config()
 

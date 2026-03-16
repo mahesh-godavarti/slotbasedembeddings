@@ -89,6 +89,109 @@ def compare_models(baseline_path: str, char_compose_path: str):
     print("=" * 60)
 
 
+def evaluate_rare_tokens(model, config, device, min_count=0, max_count=5):
+    """Evaluate perplexity specifically on positions where the target token is rare.
+
+    Finds tokens that appear <= max_count times in training data,
+    then measures loss only at positions predicting those tokens.
+    This is where char-compose should shine vs baseline.
+    """
+    from collections import Counter
+    from transformers import GPT2Tokenizer
+    import numpy as np
+
+    print(f"\n--- Rare Token Evaluation (train count <= {max_count}) ---")
+
+    # Count token frequencies in training data
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    cache_path = os.path.join(cache_dir, f"{config.dataset_config}_train.bin")
+
+    if os.path.exists(cache_path):
+        train_ids = np.memmap(cache_path, dtype=np.int32, mode='r')
+    else:
+        print("  Training cache not found, skipping rare token eval.")
+        return None
+
+    # Count frequencies
+    print("  Counting token frequencies in training data...")
+    counts = Counter(train_ids.tolist())
+    rare_tokens = set(tid for tid, c in counts.items() if min_count <= c <= max_count)
+    all_tokens = set(range(config.vocab_size))
+    unseen_tokens = all_tokens - set(counts.keys())
+    rare_tokens |= unseen_tokens
+
+    print(f"  Vocab size: {config.vocab_size}")
+    print(f"  Tokens seen in training: {len(counts)}")
+    print(f"  Rare tokens (count <= {max_count}): {len(rare_tokens)}")
+
+    # Load test data
+    test_dataset = load_wikitext(config, split="test")
+    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False,
+                             num_workers=0, pin_memory=True, drop_last=True)
+
+    # Evaluate: compute loss only at positions where the target is a rare token
+    model.eval()
+    rare_total_loss = 0.0
+    rare_total_count = 0
+    common_total_loss = 0.0
+    common_total_count = 0
+
+    rare_tokens_tensor = torch.zeros(config.vocab_size, dtype=torch.bool, device=device)
+    for tid in rare_tokens:
+        if tid < config.vocab_size:
+            rare_tokens_tensor[tid] = True
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Rare token eval"):
+            input_ids = batch.to(device)
+            labels = input_ids[:, 1:]  # targets
+            inputs = input_ids[:, :-1]
+
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                outputs = model(input_ids, labels=input_ids.clone())
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+
+            # Per-token cross entropy
+            shift_logits = logits[:, :-1, :].contiguous()
+            per_token_loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                labels.contiguous().view(-1),
+                reduction='none'
+            ).view(labels.shape)
+
+            # Mask for rare vs common
+            rare_mask = rare_tokens_tensor[labels]
+            common_mask = ~rare_mask
+
+            if rare_mask.any():
+                rare_total_loss += per_token_loss[rare_mask].sum().item()
+                rare_total_count += rare_mask.sum().item()
+            if common_mask.any():
+                common_total_loss += per_token_loss[common_mask].sum().item()
+                common_total_count += common_mask.sum().item()
+
+    results = {}
+    if rare_total_count > 0:
+        rare_avg = rare_total_loss / rare_total_count
+        rare_ppl = math.exp(min(rare_avg, 20))
+        results['rare_loss'] = rare_avg
+        results['rare_ppl'] = rare_ppl
+        results['rare_count'] = rare_total_count
+        print(f"  Rare tokens:   loss={rare_avg:.4f}, PPL={rare_ppl:.2f} ({rare_total_count} positions)")
+    else:
+        print(f"  No rare tokens found in test set.")
+
+    if common_total_count > 0:
+        common_avg = common_total_loss / common_total_count
+        common_ppl = math.exp(min(common_avg, 20))
+        results['common_loss'] = common_avg
+        results['common_ppl'] = common_ppl
+        results['common_count'] = common_total_count
+        print(f"  Common tokens: loss={common_avg:.4f}, PPL={common_ppl:.2f} ({common_total_count} positions)")
+
+    return results
+
+
 def cosine_similarity_check(model, tokenizer_name="gpt2"):
     """Check that tokens sharing character prefixes have higher similarity."""
     from transformers import GPT2Tokenizer
