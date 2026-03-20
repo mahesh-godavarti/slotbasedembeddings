@@ -158,7 +158,7 @@ class SplitBlockLookAhead(nn.Module):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         """Sequential evaluation: process positions one at a time."""
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
@@ -541,7 +541,7 @@ class JoFormerLearnedSyncModel(SplitBlockLookAhead):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -854,7 +854,7 @@ class BlockAlignedModel(nn.Module):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -1018,7 +1018,7 @@ class BlockAlignedPureModel(BlockAlignedModel):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -1378,7 +1378,7 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
     def _get_head_input(self, z):
         return z
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         """Sequential evaluation: process positions one at a time."""
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
@@ -1387,10 +1387,29 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
         B, T, C = tok_emb.shape
 
         processed_x = tok_emb.clone()
+        # Initialize position 0 to match parallel mode: corr_ffn(ln(concat(zeros, tok_emb[0])))
+        zero_0 = torch.zeros(B, 1, C, device=tok_emb.device)
+        ffn_input_0 = self.ln_corr(torch.cat([zero_0, tok_emb[:, :1, :]], dim=-1))
+        init_corr_0 = self.corr_ffn(ffn_input_0)
+        processed_x[:, 0, :] = tok_emb[:, 0, :] + init_corr_0.squeeze(1)
         z_all = torch.zeros_like(tok_emb)
 
         for t in range(T):
-            # Run block on full sequence (causal attention handles masking)
+            for _k in range(seq_k):
+                if self.d_block > 1:
+                    h = processed_x
+                    for block in self.blocks:
+                        h = block(h)
+                    z = h
+                else:
+                    z = self.block(processed_x)
+
+                if t > 0:
+                    ffn_input = self.ln_corr(torch.cat([z[:, t-1, :], tok_emb[:, t, :]], dim=-1))
+                    correction_t = self.corr_ffn(ffn_input)
+                    processed_x[:, t, :] = tok_emb[:, t, :] + correction_t
+
+            # Final block pass after last correction update
             if self.d_block > 1:
                 h = processed_x
                 for block in self.blocks:
@@ -1403,8 +1422,8 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
 
             # Correction for t+1: corr_ffn sees ln(concat(z[t], tok_emb[t+1]))
             if t < T - 1:
-                shifted_z_t1 = z[:, t, :]  # z from position t
-                te_t1 = tok_emb[:, t+1, :]  # constant tok_emb at t+1
+                shifted_z_t1 = z[:, t, :]
+                te_t1 = tok_emb[:, t+1, :]
                 ffn_input = self.ln_corr(torch.cat([shifted_z_t1, te_t1], dim=-1))
                 correction_t1 = self.corr_ffn(ffn_input)
                 processed_x[:, t+1, :] = tok_emb[:, t+1, :] + correction_t1
@@ -1572,8 +1591,13 @@ class BlockHeadCorrFFNAddModel(SplitBlockLookAhead):
     def _get_head_input(self, z):
         return z
 
-    def forward_sequential(self, idx, targets=None):
-        """Sequential evaluation: process positions one at a time."""
+    def forward_sequential(self, idx, targets=None, seq_k=1):
+        """Sequential evaluation: process positions one at a time.
+
+        seq_k: number of times each position is processed through all D blocks.
+        seq_k=1 is standard sequential inference.
+        seq_k=2 means each position gets a second pass after its correction is refined.
+        """
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -1581,10 +1605,29 @@ class BlockHeadCorrFFNAddModel(SplitBlockLookAhead):
         B, T, C = tok_emb.shape
 
         processed_x = tok_emb.clone()
+        # Initialize position 0 to match parallel mode: corr_ffn(ln(zeros + tok_emb[0]))
+        init_corr_0 = self.corr_ffn(self.ln_corr(torch.zeros(B, 1, C, device=tok_emb.device) + tok_emb[:, :1, :]))
+        processed_x[:, 0, :] = tok_emb[:, 0, :] + init_corr_0.squeeze(1)
         z_all = torch.zeros_like(tok_emb)
 
         for t in range(T):
-            # Run block on full sequence (causal attention handles masking)
+            for _k in range(seq_k):
+                # Run block on full sequence (causal attention handles masking)
+                if self.d_block > 1:
+                    h = processed_x
+                    for block in self.blocks:
+                        h = block(h)
+                    z = h
+                else:
+                    z = self.block(processed_x)
+
+                # Update correction for current position from its predecessor
+                if t > 0:
+                    add_input = self.ln_corr(z[:, t-1, :] + tok_emb[:, t, :])
+                    correction_t = self.corr_ffn(add_input)
+                    processed_x[:, t, :] = tok_emb[:, t, :] + correction_t
+
+            # Final block pass after last correction update
             if self.d_block > 1:
                 h = processed_x
                 for block in self.blocks:
@@ -1767,7 +1810,7 @@ class BlockHeadCorrFFNAddPureModel(BlockHeadCorrFFNAddModel):
 
         return processed_x, z, total_conv_loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -1775,6 +1818,9 @@ class BlockHeadCorrFFNAddPureModel(BlockHeadCorrFFNAddModel):
         B, T, C = tok_emb.shape
 
         processed_x = tok_emb.clone()
+        # Initialize position 0 to match parallel mode: tok_emb[0] + zeros + corr_ffn(ln(tok_emb[0] + zeros))
+        h0 = tok_emb[:, :1, :] + torch.zeros(B, 1, C, device=tok_emb.device)
+        processed_x[:, 0, :] = (h0 + self.corr_ffn(self.ln_corr(h0))).squeeze(1)
         z_all = torch.zeros_like(tok_emb)
 
         for t in range(T):
@@ -1985,7 +2031,7 @@ class BlockHeadRecomputeModel(SplitBlockLookAhead):
 
         return processed_x, z, total_conv_loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -1994,6 +2040,9 @@ class BlockHeadRecomputeModel(SplitBlockLookAhead):
         _, ffn, ln2 = self._get_block_and_last_ffn()
 
         processed_x = tok_emb.clone()
+        # Initialize position 0 to match parallel mode: h = tok_emb[0] + zeros; processed_x = h + ffn(ln2(h))
+        h0 = tok_emb[:, :1, :]
+        processed_x[:, 0, :] = (h0 + ffn(ln2(h0))).squeeze(1)
         z_all = torch.zeros_like(tok_emb)
 
         for t in range(T):
@@ -2161,7 +2210,7 @@ class BlockHeadRecomputeSepModel(SplitBlockLookAhead):
 
         return processed_x, z, total_conv_loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -2169,6 +2218,9 @@ class BlockHeadRecomputeSepModel(SplitBlockLookAhead):
         B, T, C = tok_emb.shape
 
         processed_x = tok_emb.clone()
+        # Initialize position 0 to match parallel mode: h = tok_emb[0] + zeros; processed_x = h + corr_ffn(ln_corr(h))
+        h0 = tok_emb[:, :1, :]
+        processed_x[:, 0, :] = (h0 + self.corr_ffn(self.ln_corr(h0))).squeeze(1)
         z_all = torch.zeros_like(tok_emb)
 
         for t in range(T):
@@ -2395,7 +2447,7 @@ class BlockHeadDeltaFFNAddModel(SplitBlockLookAhead):
     def _get_head_input(self, z):
         return z
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         """Sequential evaluation: process positions one at a time."""
         if self.n_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
@@ -2404,9 +2456,29 @@ class BlockHeadDeltaFFNAddModel(SplitBlockLookAhead):
         B, T, C = tok_emb.shape
 
         processed_x = tok_emb.clone()
+        # Initialize position 0 to match parallel mode: corr_ffn(ln(zeros + tok_emb[0]))
+        init_corr_0 = self.corr_ffn(self.ln_corr(torch.zeros(B, 1, C, device=tok_emb.device) + tok_emb[:, :1, :]))
+        processed_x[:, 0, :] = tok_emb[:, 0, :] + init_corr_0.squeeze(1)
         z_all = torch.zeros_like(tok_emb)
 
         for t in range(T):
+            for _k in range(seq_k):
+                if self.d_block > 1:
+                    h = processed_x
+                    for block in self.blocks:
+                        h = block(h)
+                    z = h
+                else:
+                    z = self.block(processed_x)
+
+                # Update correction for current position from its predecessor
+                if t > 0:
+                    delta_t_prev = z[:, t-1, :] - processed_x[:, t-1, :]
+                    add_input = self.ln_corr(delta_t_prev + tok_emb[:, t, :])
+                    correction_t = self.corr_ffn(add_input)
+                    processed_x[:, t, :] = tok_emb[:, t, :] + correction_t
+
+            # Final block pass after last correction update
             if self.d_block > 1:
                 h = processed_x
                 for block in self.blocks:
@@ -2598,7 +2670,7 @@ class StackedSplitBlock(nn.Module):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.k_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -2993,7 +3065,7 @@ class StackedBlockHeadCorrFFNConcat(StackedSplitBlock):
 
         return processed, z, conv_loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.k_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -3005,6 +3077,11 @@ class StackedBlockHeadCorrFFNConcat(StackedSplitBlock):
         for i in range(self.n_units):
             anchor = h.clone()
             processed = h.clone()
+            # Initialize position 0 to match parallel mode: corr_ffn(concat(ln_corr(zeros), anchor[0]))
+            zero_0 = torch.zeros(B, 1, C, device=tok_emb.device)
+            ffn_input_0 = torch.cat([self.ln_corrs[i](zero_0), anchor[:, :1, :]], dim=-1)
+            init_corr_0 = self.corr_ffns[i](ffn_input_0)
+            processed[:, 0, :] = anchor[:, 0, :] + init_corr_0.squeeze(1)
 
             for t in range(T):
                 z = self._run_block(i, processed)
@@ -3015,7 +3092,7 @@ class StackedBlockHeadCorrFFNConcat(StackedSplitBlock):
 
                 if t < T - 1:
                     shifted_z_t1 = self.ln_corrs[i](z[:, t, :])
-                    anc_t1 = anchor[:, t+1, :]  # constant anchor, no circular dep
+                    anc_t1 = anchor[:, t+1, :]
                     ffn_input = torch.cat([shifted_z_t1, anc_t1], dim=-1)
                     correction_t1 = self.corr_ffns[i](ffn_input)
                     processed[:, t+1, :] = anchor[:, t+1, :] + correction_t1
@@ -3163,7 +3240,7 @@ class StackedBlockHeadCorrFFNAdd(StackedSplitBlock):
 
         return processed, z, conv_loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.k_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -3175,6 +3252,10 @@ class StackedBlockHeadCorrFFNAdd(StackedSplitBlock):
         for i in range(self.n_units):
             anchor = h.clone()
             processed = h.clone()
+            # Initialize position 0 to match parallel mode: corr_ffn(ln_corr(zeros + anchor[0]))
+            init_corr_0 = self.corr_ffns[i](self.ln_corrs[i](
+                torch.zeros(B, 1, C, device=tok_emb.device) + anchor[:, :1, :]))
+            processed[:, 0, :] = anchor[:, 0, :] + init_corr_0.squeeze(1)
 
             for t in range(T):
                 z = self._run_block(i, processed)
@@ -3405,7 +3486,7 @@ class StackedJoFormerLearnedSync(StackedSplitBlock):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.k_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 
@@ -3727,7 +3808,7 @@ class StackedBlockAligned(nn.Module):
             )
         return logits, loss
 
-    def forward_sequential(self, idx, targets=None):
+    def forward_sequential(self, idx, targets=None, seq_k=1):
         if self.k_iters <= 1:
             return self.forward_at_depth(idx, 1, targets)
 

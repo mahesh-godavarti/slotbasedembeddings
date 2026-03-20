@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import time
 
 import numpy as np
@@ -35,18 +36,8 @@ def main():
     meta_path = os.path.join(args.output_dir, 'wiki_tokens.meta')
     tok_path = os.path.join(args.output_dir, 'wiki_tokenizer.json')
 
-    # Step 1: Download OpenWebText
-    print("Loading OpenWebText from HuggingFace...")
-    t0 = time.time()
-    dataset = load_dataset("openwebtext", split="train", trust_remote_code=True)
-    print(f"  Loaded {len(dataset)} documents in {time.time()-t0:.1f}s")
-
-    if args.max_docs:
-        dataset = dataset.select(range(min(args.max_docs, len(dataset))))
-        print(f"  Limited to {len(dataset)} documents")
-
-    # Step 2: Train BPE tokenizer
-    print(f"\n[1/2] Training BPE tokenizer (vocab_size={args.vocab_size})...")
+    # Step 1: Train BPE tokenizer using streaming (no full download)
+    print(f"[1/3] Training BPE tokenizer (vocab_size={args.vocab_size})...")
     t0 = time.time()
 
     tokenizer = Tokenizer(models.BPE())
@@ -59,27 +50,35 @@ def main():
         show_progress=True,
     )
 
-    # Train on a subset of documents
-    n_train = min(args.tokenizer_train_docs, len(dataset))
-    print(f"  Training on {n_train} documents...")
+    # Stream documents for tokenizer training
+    n_train = args.tokenizer_train_docs
+    print(f"  Streaming {n_train} documents for tokenizer training...")
 
     def doc_iterator():
-        for i in range(n_train):
-            yield dataset[i]['text']
+        ds_stream = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
+        for i, example in enumerate(ds_stream):
+            if i >= n_train:
+                break
+            yield example['text']
 
     tokenizer.train_from_iterator(doc_iterator(), trainer=trainer)
     actual_vocab = tokenizer.get_vocab_size()
     print(f"  Vocab size: {actual_vocab}, trained in {time.time()-t0:.1f}s")
     tokenizer.save(tok_path)
 
-    # Step 3: Tokenize all documents to binary
-    print(f"\n[2/2] Tokenizing {len(dataset)} documents to binary...")
+    # Step 2: Tokenize all documents using streaming
+    print(f"\n[2/3] Tokenizing documents (streaming mode)...")
     t0 = time.time()
     total_tokens = 0
+    doc_count = 0
+
+    ds_stream = load_dataset("openwebtext", split="train", streaming=True, trust_remote_code=True)
 
     with open(bin_path, 'wb') as f:
-        for i in range(len(dataset)):
-            text = dataset[i]['text']
+        for example in ds_stream:
+            if args.max_docs and doc_count >= args.max_docs:
+                break
+            text = example['text']
             if text.strip():
                 enc = tokenizer.encode(text)
                 ids = enc.ids
@@ -87,30 +86,37 @@ def main():
                     chunk = np.array(ids, dtype=np.int32)
                     f.write(chunk.tobytes())
                     total_tokens += len(ids)
-            if (i + 1) % 100000 == 0:
+            doc_count += 1
+            if doc_count % 100000 == 0:
                 elapsed = time.time() - t0
-                rate = (i + 1) / elapsed
-                eta = (len(dataset) - i - 1) / rate
-                print(f"  {i+1}/{len(dataset)} docs, {total_tokens:,} tokens, "
-                      f"{rate:.0f} docs/s, ETA {eta/60:.0f}min")
+                rate = doc_count / elapsed
+                print(f"  {doc_count} docs, {total_tokens:,} tokens, "
+                      f"{rate:.0f} docs/s, {elapsed/60:.0f}min elapsed")
 
     dt = time.time() - t0
     file_size_gb = os.path.getsize(bin_path) / (1024**3)
-    print(f"  {total_tokens:,} tokens written in {dt:.1f}s")
+    print(f"  {total_tokens:,} tokens from {doc_count} docs in {dt:.1f}s")
     print(f"  Binary file: {bin_path} ({file_size_gb:.2f} GB)")
 
-    # Step 4: Save metadata
+    # Step 3: Save metadata and clean up HF cache
     meta = {
         'total_tokens': total_tokens,
         'vocab_size': actual_vocab,
         'source': 'openwebtext (HuggingFace)',
         'max_docs': args.max_docs,
-        'doc_count': len(dataset),
+        'doc_count': doc_count,
         'dtype': 'int32',
     }
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
     print(f"  Metadata saved to {meta_path}")
+
+    # Clean up HF cache
+    hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
+    if os.path.exists(hf_cache):
+        print(f"  Cleaning up HF cache ({hf_cache})...")
+        shutil.rmtree(hf_cache, ignore_errors=True)
+
     print(f"\nDone. Data ready at {args.output_dir}")
 
 

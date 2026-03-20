@@ -232,7 +232,7 @@ def estimate_loss_at_depth(model, train_data, val_data, block_size, batch_size,
 
 @torch.no_grad()
 def estimate_loss_sequential(model, train_data, val_data, block_size, batch_size,
-                             device, eval_iters=20, amp_dtype=None):
+                             device, eval_iters=20, amp_dtype=None, seq_k=1):
     """Estimate val loss for sequential eval (true autoregressive quality)."""
     model.eval()
     rng_state = torch.random.get_rng_state()
@@ -243,9 +243,9 @@ def estimate_loss_sequential(model, train_data, val_data, block_size, batch_size
                          block_size, batch_size, device)
         if amp_dtype is not None:
             with torch.autocast('cuda', dtype=amp_dtype):
-                _, loss = model.forward_sequential(X, Y)
+                _, loss = model.forward_sequential(X, Y, seq_k=seq_k)
         else:
-            _, loss = model.forward_sequential(X, Y)
+            _, loss = model.forward_sequential(X, Y, seq_k=seq_k)
         losses[k] = loss.item()
     torch.random.set_rng_state(rng_state)
     model.train()
@@ -444,16 +444,17 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
             depth_results[K] = {'val_loss': val_loss_K, 'val_ppl': round(ppl_K, 2)}
             print(f"  [{model_name}]   parallel K={K}: val loss {val_loss_K:.4f} (PPL {ppl_K:.2f})")
 
-        # Sequential eval (true autoregressive quality, K-independent)
+        # Sequential eval (true autoregressive quality)
         if hasattr(model, 'forward_sequential'):
-            val_loss_seq = estimate_loss_sequential(
-                model, train_data, val_data,
-                args.block_size, args.batch_size, device,
-                amp_dtype=eval_amp_dtype
-            )
-            ppl_seq = math.exp(min(val_loss_seq, 20))
-            depth_results['sequential'] = {'val_loss': val_loss_seq, 'val_ppl': round(ppl_seq, 2)}
-            print(f"  [{model_name}]   sequential: val loss {val_loss_seq:.4f} (PPL {ppl_seq:.2f})")
+            for seq_k in [1]:
+                val_loss_seq = estimate_loss_sequential(
+                    model, train_data, val_data,
+                    args.block_size, args.batch_size, device,
+                    amp_dtype=eval_amp_dtype, seq_k=seq_k
+                )
+                ppl_seq = math.exp(min(val_loss_seq, 20))
+                depth_results[f'sequential_k{seq_k}'] = {'val_loss': val_loss_seq, 'val_ppl': round(ppl_seq, 2)}
+                print(f"  [{model_name}]   sequential K={seq_k}: val loss {val_loss_seq:.4f} (PPL {ppl_seq:.2f})")
 
     # Final generation
     try:

@@ -296,22 +296,22 @@ D=3 add 200K final: **22.27 PPL**. Roformer N=5 200K in progress (130K, 22.60). 
 | 120K | 23.39                   | 22.80               | +0.59 |
 | 125K | 23.26                   | 22.76               | +0.50 |
 | 130K | 23.10                   | 22.60               | +0.50 |
-| 135K | 23.06                   |                     |       |
-| 140K | 22.96                   |                     |       |
-| 145K | 22.98                   |                     |       |
-| 150K | 22.83                   |                     |       |
-| 155K | 22.71                   |                     |       |
-| 160K | 22.68                   |                     |       |
-| 165K | 22.63                   |                     |       |
-| 170K | 22.58                   |                     |       |
-| 175K | 22.45                   |                     |       |
-| 180K | 22.40                   |                     |       |
+| 135K | 23.06                   | 22.57               | +0.49 |
+| 140K | 22.96                   | 22.54               | +0.42 |
+| 145K | 22.98                   | 22.42               | +0.56 |
+| 150K | 22.83                   | 22.34               | +0.49 |
+| 155K | 22.71                   | 22.30               | +0.41 |
+| 160K | 22.68                   | 22.22               | +0.46 |
+| 165K | 22.63                   | 22.15               | +0.48 |
+| 170K | 22.58                   | 22.11               | +0.47 |
+| 175K | 22.45                   | 22.05               | +0.40 |
+| 180K | 22.40                   | 22.00               | +0.40 |
 | 185K | 22.43                   |                     |       |
-| 190K | 22.42                   |                     |       |
-| 195K | 22.22                   |                     |       |
-| 200K | **22.27**               |                     |       |
+| 190K | 22.42                   | 21.92               | +0.50 |
+| 195K | 22.22                   | 21.88               | +0.34 |
+| 200K | **22.27**               | **21.83**           | **+0.44** |
 
-Gap narrowed from 1.47 at 5K to 0.50 at 130K. D=3 add uses 36% fewer FLOPs (44C² vs 60C²). Roformer N=5 200K still running — will complete the table.
+**Final at 200K: D=3 add 22.27 vs roformer N=5 21.83 — gap of 0.44 PPL.** D=3 add uses 36% fewer FLOPs (44C² vs 60C²). Gap narrowed from 1.47 at 5K to 0.44 at 200K but did not cross over.
 
 ### 48C² budget (roformer N=4 matched)
 
@@ -617,12 +617,37 @@ Depth sweep: K=1→30.27, K=2→21.45, K=3→20.60, K=5→20.41, K=10→20.41.
 
 **Conclusion:** D=1 cannot compete at param parity — D>1 is essential at large C.
 
+### D scaling vs N scaling analysis (Wiki, C=446, 100K iters)
+
+Comparing marginal PPL gains per additional 12C² of compute:
+
+| Step (+12C²) | Roformer | corr_ffn_add | Ratio |
+|--------------|----------|--------------|-------|
+| 3→4 (N or D) | 2.34 (27.19→24.85) | 1.56 (23.82→22.26) | 1.50× |
+| 4→5          | 1.62 (24.85→23.23) | 1.09 (22.26→21.17) | 1.49× |
+| 5→6          | 1.17 (23.23→22.06) | 0.77 (21.17→20.40) | 1.52× |
+
+Full FLOP-matched comparison:
+
+| corr_ffn_add | FLOPs | PPL | roformer | FLOPs | PPL | Gap (add wins by) |
+|--------------|-------|-----|----------|-------|-----|-------------------|
+| D=3          | 44C²  | 23.82 | N=4    | 48C²  | 24.85 | 1.03 PPL (fewer FLOPs) |
+| D=4          | 56C²  | 22.26 | N=5    | 60C²  | 23.23 | 0.97 PPL (fewer FLOPs) |
+| D=5          | 68C²  | 21.17 | N=6    | 72C²  | 22.06 | 0.89 PPL (fewer FLOPs) |
+
+**Roformer gains ~1.5× more PPL per additional layer than corr_ffn_add gains per additional D block.** This ratio is remarkably stable across all three steps.
+
+**The FLOP-matched advantage is shrinking: 1.03 → 0.97 → 0.89.** corr_ffn_add wins at every depth tested, but the margin narrows as depth increases. This is because corr_ffn_add starts from a better base (the 8C² correction FFN gives a strong initial advantage) but roformer extracts more value from each additional layer of unique weights.
+
+**Implication for deep scaling:** If the ~0.08 PPL/step narrowing continues, the advantage would erode to zero around D≈14 vs N≈15 (~176C² vs 180C²). At that depth, roformer would catch up. This suggests the shared-weight iterative mechanism is most advantageous at moderate depths (D=3–8) where the 8C² fixed overhead is amortized but hasn't yet been overcome by roformer's stronger per-layer gains. Very deep scaling may favor standard roformer.
+
 ### Key takeaways
 
 1. **block_head D=3 (27.32) ≈ roformer N=3 (27.19).** Stacked N=3 still running.
 2. **The corr_ffn is what wins.** It adds 8C² params/FLOPs but is paid only once (shared across K iterations). All corr_ffn variants beat the FLOP-matched roformer_head_ffn baseline.
 3. **D>1 is essential at large C.** D=1 trails roformer N=3 by 3-6 PPL at param parity.
 4. **Stacking pays the corr_ffn cost per unit** (N×8C²), making it expensive. D>1 with shared corr_ffn is more efficient.
+5. **Roformer scales better per layer than corr_ffn_add per D block** (1.5× more PPL gain per +12C²). The FLOP-matched advantage narrows with depth (1.03→0.97→0.89). The sweet spot for corr_ffn_add is moderate depth (D=3–8).
 
 ---
 
@@ -2159,6 +2184,23 @@ block_head_corr_ffn: correction = corr_ffn(ln(z)). block_head_delta_ffn: correct
 corr_ffn: best PPL, excellent sequential match (84.20 vs 84.17). L oscillates 0.75-0.99.
 delta_ffn: better convergence (L=0.98) but worse PPL. FFN on delta stabilizes but limits expressiveness.
 
+### D=1 C=50 corr_ffn_add vs delta_ffn_add (K=5, k_min=2, block_size=256, 10K iters)
+
+| Iter | corr_ffn_add | delta_ffn_add | Gap |
+|------|--------------|---------------|-------|
+| 1K   | 445.69       | 446.15        | +0.46 |
+| 2K   | 269.89       | 267.10        | -2.79 |
+| 3K   | 198.38       | 197.94        | -0.44 |
+| 4K   | 168.84       | 169.93        | +1.09 |
+| 5K   | 153.06       | 155.01        | +1.95 |
+| 6K   | 142.55       | 145.08        | +2.53 |
+| 7K   | 135.01       | 138.01        | +3.00 |
+| 8K   | 129.06       | 132.03        | +2.97 |
+| 9K   | 124.80       | 127.89        | +3.09 |
+| 10K  | 121.14       | 124.31        | +3.17 |
+
+corr_ffn_add wins by 3.17 PPL at 10K. Delta_ffn_add starts competitive but falls behind — shifting the delta (z - processed_x) instead of z directly loses information. The gap is widening at 10K, so it would likely be worse at 100K.
+
 ### D=1 C=50 variant comparison: corr_ffn_add, tied, pure variants (K=5, k_min=2, block_size=256, 10K iters)
 
 Testing whether tying the correction FFN to the block's FFN (saving 8C² params) or using a "pure" residual pattern (f(tok_emb, shift(z)) instead of f(processed_x, shift(z))) helps or hurts.
@@ -2451,3 +2493,280 @@ No k_min, no random K. Param-matched to roformer N=5 (60C²).
 
 Empirical L stable at ~0.005 — pristine convergence across all 3 units.
 Awaiting roformer N=5 C=446 baseline for comparison.
+
+---
+
+## OpenWebText C=1024 Experiments (vocab=32000)
+
+Scaling test on OpenWebText (~9.1B tokens, vocab=32000) with C=1024.
+All runs: block_size=256, batch_size=64, lr=2e-4, AMP (bfloat16), 100K iters.
+
+### Model configurations
+
+| Model | Params | FLOP budget | Notes |
+|-------|-------:|-------------|-------|
+| roformer N=6 | ~113M | 72C² | Baseline, 6 separate layers |
+| block_head_corr_ffn_add D=3 | ~112M | 44C² | 3 shared blocks × 5 iters, additive correction |
+
+### Roformer N=6 C=1024 OWT (completed)
+
+| Iter | Val PPL |
+|-----:|--------:|
+| 5K   | 88.14   |
+| 10K  | 68.00   |
+| 15K  | 60.11   |
+| 20K  | 55.80   |
+| 25K  | 52.80   |
+| 30K  | 50.75   |
+| 35K  | 48.91   |
+| 40K  | 47.72   |
+| 45K  | 46.39   |
+| 50K  | 45.56   |
+| 55K  | 44.72   |
+| 60K  | 44.05   |
+| 65K  | 43.39   |
+| 70K  | 42.84   |
+| 75K  | 42.42   |
+| 80K  | 41.80   |
+| 85K  | 41.42   |
+| 90K  | 40.97   |
+| 95K  | 40.78   |
+| 100K | 40.48   |
+
+### block_head_corr_ffn_add D=3 C=1024 OWT (completed)
+
+| Iter | Val PPL |
+|-----:|--------:|
+| 5K   | 102.37  |
+| 10K  | 77.40   |
+| 15K  | 67.51   |
+| 20K  | 61.68   |
+| 25K  | 58.10   |
+| 30K  | 55.39   |
+| 35K  | 53.32   |
+| 40K  | 51.77   |
+| 45K  | 50.12   |
+| 50K  | 48.96   |
+| 55K  | 47.86   |
+| 60K  | 46.94   |
+| 65K  | 46.38   |
+| 70K  | 45.60   |
+| 75K  | 45.00   |
+| 80K  | 44.31   |
+| 85K  | 43.87   |
+| 90K  | 43.47   |
+| 95K  | 42.95   |
+| 100K | 42.71   |
+
+Final diagnostics: val PPL 42.67, sequential K=1: 43.69 (1.0 PPL penalty), empirical L: 0.66, contraction ratios: [0.36, 0.43, 0.66].
+
+### block_head_corr_ffn_add D=4 C=1024 OWT (completed)
+
+56C² FLOPs — 22% fewer than roformer N=6 (72C²). n_layers=20, d_block=4, K=5.
+
+| Iter | Val PPL |
+|-----:|--------:|
+| 5K   | 95.16   |
+| 10K  | 72.02   |
+| 15K  | 63.09   |
+| 20K  | 57.83   |
+| 25K  | 54.29   |
+| 30K  | 51.97   |
+| 35K  | 49.96   |
+| 40K  | 48.71   |
+| 45K  | 46.93   |
+| 50K  | 46.16   |
+| 55K  | 45.25   |
+| 60K  | 44.45   |
+| 65K  | 43.70   |
+| 70K  | 43.02   |
+| 75K  | 42.31   |
+| 80K  | 41.97   |
+| 85K  | 41.46   |
+| 90K  | 40.96   |
+| 95K  | 40.60   |
+| 100K | 40.29   |
+
+### Head-to-head comparison (OWT C=1024)
+
+| Iter | Roformer N=6 (72C²) | D=3 Add (44C²) | D=4 Add (56C²) | D=5 Add (68C²) |
+|-----:|---------------------:|----------------:|----------------:|----------------:|
+| 5K   | 88.14                | 102.37          | 95.16           | 91.49           |
+| 10K  | 68.00                | 77.40           | 72.02           | 68.61           |
+| 15K  | 60.11                | 67.51           | 63.09           | 60.04           |
+| 20K  | 55.80                | 61.68           | 57.83           | 55.08           |
+| 25K  | 52.80                | 58.10           | 54.29           | 51.92           |
+| 30K  | 50.75                | 55.39           | 51.97           | 49.32           |
+| 35K  | 48.91                | 53.32           | 49.96           | 47.70           |
+| 40K  | 47.72                | 51.77           | 48.71           | 46.13           |
+| 45K  | 46.39                | 50.12           | 46.93           | 45.09           |
+| 50K  | 45.56                | 48.96           | 46.16           | 44.11           |
+| 55K  | 44.72                | 47.86           | 45.25           | 43.12           |
+| 60K  | 44.05                | 46.94           | 44.45           | 42.30           |
+| 65K  | 43.39                | 46.38           | 43.70           | 41.94           |
+| 70K  | 42.84                | 45.60           | 43.02           | 41.17           |
+| 75K  | 42.42                | 45.00           | 42.31           | 40.39           |
+| 80K  | 41.80                | 44.31           | 41.97           | 40.12           |
+| 85K  | 41.42                | 43.87           | 41.46           | 39.54           |
+| 90K  | 40.97                | 43.47           | 40.96           | 39.33           |
+| 95K  | 40.78                | 42.95           | 40.60           | 38.83           |
+| 100K | **40.48**            | 42.71           | **40.29**       | **38.61**       |
+
+**D=5 Add beats roformer N=6 at 100K: 38.61 vs 40.48 PPL with 6% fewer FLOPs (68C² vs 72C²).** Seq K=1 = 38.62 (zero penalty).
+**D=4 Add beats roformer N=6 at 100K: 40.29 vs 40.48 PPL with 22% fewer FLOPs (56C² vs 72C²).**
+D=3 Add finishes at 42.71 — 2.2 PPL behind with 39% fewer FLOPs (44C² vs 72C²).
+D=5 crossed roformer's final result at ~75K. D=4 crosses over at ~88K.
+
+### block_head_delta_ffn_add D=4 C=1024 OWT (completed)
+
+Same as corr_ffn_add but shifts delta (z - processed_x) instead of z.
+56C² FLOPs, n_layers=20, d_block=4, K=5.
+
+| Iter | Val PPL |
+|-----:|--------:|
+| 5K   | 95.60   |
+| 10K  | 72.31   |
+| 15K  | 63.56   |
+| 20K  | 57.84   |
+| 25K  | 54.42   |
+| 30K  | 52.10   |
+| 35K  | 49.93   |
+| 40K  | 48.65   |
+| 45K  | 46.95   |
+| 50K  | 46.20   |
+| 55K  | 45.41   |
+| 60K  | 44.65   |
+| 65K  | 43.76   |
+| 70K  | 43.10   |
+| 75K  | 42.42   |
+| 80K  | 42.09   |
+| 85K  | 41.45   |
+| 90K  | 41.09   |
+| 95K  | 40.75   |
+| 100K | 40.35   |
+
+Final diagnostics: val PPL 40.30, empirical L ~0.6, parallel K=5: 40.30, K=10: 40.31 (converged).
+Sequential eval crashed due to missing seq_k parameter (now fixed).
+
+**corr_ffn_add vs delta_ffn_add D=4 C=1024 OWT**: essentially identical (40.29 vs 40.35).
+Shifting delta instead of z makes no meaningful difference at this scale.
+
+### block_head_corr_ffn_add D=5 C=1024 OWT (completed)
+
+Settings: n_embed=1024, n_layers=25, d_block=5, K=5, k_min=2, block_size=256, batch_size=64, lr=2e-4, softmax, convergence_weight=0.1, amp
+FLOPs: (12×5+8)C² = 68C². Roformer N=6 = 72C² (6% more FLOPs).
+
+| Iter | D=5 corr_ffn_add (68C²) | Roformer N=6 (72C²) | Gap |
+|------|------------------------|---------------------|------|
+| 5K   | 91.49                  | 91.69               | -0.20 |
+| 10K  | 68.61                  | 68.41               | +0.20 |
+| 15K  | 60.04                  | 60.41               | -0.37 |
+| 20K  | 55.08                  | 55.69               | -0.61 |
+| 25K  | 51.92                  | 52.80               | -0.88 |
+| 30K  | 49.32                  | 50.75               | -1.43 |
+| 35K  | 47.70                  | 48.91               | -1.21 |
+| 40K  | 46.13                  | 47.72               | -1.59 |
+| 45K  | 45.09                  | 46.39               | -1.30 |
+| 50K  | 44.11                  | 45.56               | -1.45 |
+| 55K  | 43.12                  | 44.72               | -1.60 |
+| 60K  | 42.30                  | 44.05               | -1.75 |
+| 65K  | 41.94                  | 43.39               | -1.45 |
+| 70K  | 41.17                  | 42.84               | -1.67 |
+| 75K  | 40.39                  | 42.42               | -2.03 |
+| 80K  | 40.12                  | 41.80               | -1.68 |
+| 85K  | 39.54                  | 41.42               | -1.88 |
+| 90K  | 39.33                  | 40.97               | -1.64 |
+| 95K  | 38.83                  | 40.78               | -1.95 |
+| 100K | **38.61**              | **40.48**           | **-1.87** |
+
+D=5 corr_ffn_add (68C²) beats roformer N=6 (72C²) by **1.87 PPL** at 100K with **6% fewer FLOPs**.
+D=5 crossed roformer's final 100K result (40.48) at ~75K iters.
+Gap grew from near-zero at 5-10K to ~1.5-2.0 from 30K onwards.
+
+Depth diagnostics: parallel K=1→58.17, K=2→40.18, K=3→38.80, K=5→38.60, K=10→38.61.
+Sequential K=1 = 38.62, K=2 = 38.62. **Zero sequential penalty** (position 0 init fix working).
+Empirical L ≈ 0.55 (contraction ratios ~0.65-0.72, 0.45-0.55, 0.48-0.66 across 3 iterations).
+
+### block_head_corr_ffn_add D=8 C=768 OWT (completed)
+
+Settings: n_embed=768, n_layers=40, d_block=8, K=5, k_min=2, block_size=256, batch_size=64, lr=2e-4, softmax, convergence_weight=0.1, amp
+FLOPs: (12×8+8)C² = 104C². Absolute FLOPs: 104 × 768² = 61.3M.
+Compare: roformer N=6 C=1024 = 72 × 1024² = 75.5M FLOPs (19% more).
+
+| Iter | D=8 C=768 (61.3M FLOPs) | Roformer N=6 C=1024 (75.5M FLOPs) | Gap |
+|------|-------------------------|----------------------------------|------|
+| 5K   | 94.80                   | 91.69                            | +3.11 |
+| 10K  | 71.25                   | 68.41                            | +2.84 |
+| 15K  | 61.48                   | 60.41                            | +1.07 |
+| 20K  | 55.98                   | 55.69                            | +0.29 |
+| 25K  | 52.69                   | 52.80                            | -0.11 |
+| 30K  | 50.11                   | 50.75                            | -0.64 |
+| 35K  | 48.32                   | 48.91                            | -0.59 |
+| 40K  | 46.95                   | 47.72                            | -0.77 |
+| 45K  | 45.66                   | 46.39                            | -0.73 |
+| 50K  | 44.72                   | 45.56                            | -0.84 |
+| 55K  | 43.89                   | 44.72                            | -0.83 |
+| 60K  | 43.14                   | 44.05                            | -0.91 |
+| 65K  | 42.45                   | 43.39                            | -0.94 |
+| 70K  | 41.72                   | 42.84                            | -1.12 |
+| 75K  | 41.40                   | 42.42                            | -1.02 |
+| 80K  | 40.77                   | 41.80                            | -1.03 |
+| 85K  | 40.30                   | 41.42                            | -1.12 |
+| 90K  | 39.86                   | 40.97                            | -1.11 |
+| 95K  | 39.58                   | 40.78                            | -1.20 |
+| 100K | **39.10**               | **40.48**                        | **-1.38** |
+
+D=8 C=768 (61.3M FLOPs) beats roformer N=6 C=1024 (75.5M FLOPs) by **1.38 PPL with 19% fewer FLOPs**.
+Crossed over at ~25K. Seq K=1 = 39.10 (zero penalty).
+Depth diagnostics: parallel K=1→51.60, K=2→40.12, K=3→39.22, K=5=K=10=39.10.
+
+### Roformer N=12 C=768 OWT (completed)
+
+Settings: n_embed=768, n_layers=12, block_size=256, batch_size=64, lr=2e-4, softmax, amp
+FLOPs: 144C². Absolute FLOPs: 144 × 768² = 84.9M (38% more inference FLOPs than D=8).
+
+Final: **37.83 PPL**.
+
+### Roformer N=11 C=768 OWT (in progress)
+
+Settings: n_embed=768, n_layers=11, block_size=256, batch_size=64, lr=2e-4, softmax, amp
+FLOPs: 132C². Absolute FLOPs: 132 × 768² = 77.9M (27% more inference FLOPs than D=8).
+
+### D=8 vs N=11 vs N=12 head-to-head (all C=768 OWT)
+
+| Iter | D=8 (104C²) | N=11 (132C²) | N=12 (144C²) | D=8 vs N=11 | N=11 vs N=12 |
+|------|------------|-------------|-------------|-------------|-------------|
+| 5K   | 94.80      | 87.78       | 87.07       | +7.02       | +0.71       |
+| 10K  | 71.25      | 65.75       | 65.46       | +5.50       | +0.29       |
+| 15K  | 61.48      | 57.85       | 57.48       | +3.63       | +0.37       |
+| 20K  | 55.98      | 53.42       | 52.80       | +2.56       | +0.62       |
+| 25K  | 52.69      | 50.47       | 49.86       | +2.22       | +0.61       |
+| 30K  | 50.11      | 48.50       | 47.95       | +1.61       | +0.55       |
+| 35K  | 48.32      | 46.76       | 46.25       | +1.56       | +0.51       |
+| 40K  | 46.95      | 45.66       | 44.97       | +1.29       | +0.69       |
+| 45K  | 45.66      | —           | 43.94       |             |             |
+| 50K  | 44.72      | —           | 42.94       |             |             |
+| 55K  | 43.89      | —           | 42.15       |             |             |
+| 60K  | 43.14      | —           | 41.44       |             |             |
+| 65K  | 42.45      | —           | 40.96       |             |             |
+| 70K  | 41.72      | —           | 40.20       |             |             |
+| 75K  | 41.40      | —           | 39.74       |             |             |
+| 80K  | 40.77      | —           | 39.33       |             |             |
+| 85K  | 40.30      | —           | 39.02       |             |             |
+| 90K  | 39.86      | —           | 38.64       |             |             |
+| 95K  | 39.58      | —           | 38.23       |             |             |
+| 100K | **39.10**  | —           | **37.83**   |             |             |
+
+**N=11 vs N=12**: The 12th roformer layer (12C² extra, +9% FLOPs) adds only ~0.5 PPL — diminishing returns.
+**D=8 vs N=11**: Gap narrowing from 7.02 at 5K to 1.29 at 40K. D=8 uses 21% fewer inference FLOPs.
+**D=8 vs N=12**: Final gap 1.27 PPL. D=8 uses 38% fewer inference FLOPs.
+
+---
+
+## Future Work
+
+- **Multi-token prediction (MTP) via correction vectors**: The correction at position t already encodes contextual information from the sequence. This could be used to predict not just token t+1 but also t+2, t+3, etc., enabling speculative drafts from a single forward pass without a separate draft model. Requires retraining with multi-token prediction heads.
+
+- **Compatibility with Look-Ahead Decoding (Fu et al.)**: The sequential K=1 inference mode is incompatible with parallel speculation/verification (position t+1 depends on the correction from position t). However, two workarounds exist:
+  1. **Unrolled parallel mode**: Run the model in its training mode (K iterations, raw embeddings) which is a standard parallel forward pass, fully compatible with speculative decoding.
+  2. **MTP from corrections**: If multi-token prediction works, speculative tokens come from the model itself — no external draft model or parallel verification needed.
