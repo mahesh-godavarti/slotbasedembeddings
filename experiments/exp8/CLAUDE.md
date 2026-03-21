@@ -150,21 +150,17 @@ python format_results.py <logfile> [output.md]
 
 ## Key Rules
 
-- **Always stay available for chat**: Never block on long-running processes. Remain responsive.
-- **NEVER use TaskOutput to check on anything**: TaskOutput with `block=true` (the default) will hang indefinitely. This has caused Claude Code to get stuck multiple times. Just don't use it.
-- **NEVER use `run_in_background=true` for experiment commands that run longer than a few minutes**: The 10-minute timeout will kill long-running processes. Use `nohup ... > logfile 2>&1 &` instead.
-- **When checking log files, use Bash tool directly**: Run `tail -c 500 logfile ...` as a regular Bash command (not background). It returns instantly.
+- **Evaluation is per model**: Each model is evaluated immediately after training (not at the end of all models). Partial results are available in the log before the full run completes.
+
+- **Always stay available for chat**: Run experiments with `run_in_background=true`. Never block on TaskOutput or sleep.
 - **Use Bash tool directly for experiments, NOT Task agents**: Task agents can't get user permission approval.
+- **Never use `&` inside background commands**: `run_in_background=true` already handles backgrounding.
 - **Format PPL consistently**: Use fixed decimal format (21.61, not "6.4M"). Keep 2 decimal places.
 - **PPL aggregation**: Uses geometric mean (exp of mean log), NOT arithmetic mean.
 - **NumPy warning is harmless**: The NumPy 2.x compatibility warning when importing torch is safe to ignore.
 
 ### Checking background experiment progress
-Always use the Bash tool directly (NOT `run_in_background`, NOT `TaskOutput`) with this exact command:
+Always use this exact command:
 ```bash
 tail -c 500 <output_file> 2>/dev/null | tr '\r' '\n' | tail -1
 ```
-
-**Why this exact command**: tqdm progress bars use `\r` (carriage return) to overwrite the same line. The entire progress bar history is technically one enormous line with no `\n` newlines. If you try to Read the file or use `tail` without `tr '\r' '\n'`, you end up trying to process a single line that's hundreds of thousands of characters long — which causes the tool to hang or dump a massive buffer. The `tr '\r' '\n'` converts carriage returns to newlines so `tail -1` can grab just the last update.
-
-**CRITICAL**: Do NOT use `run_in_background=true` for the tail check. Do NOT use `TaskOutput` after running tail. Just run the tail command directly with the Bash tool — it returns instantly.
