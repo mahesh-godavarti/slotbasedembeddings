@@ -902,6 +902,40 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class FeedForwardAngles(nn.Module):
+    """FFN that outputs residual (C) + raw angles (C/2)."""
+    def __init__(self, n_embed, dropout=0.2):
+        super().__init__()
+        self.n_embed = n_embed
+        n_angles = n_embed // 2
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed + n_angles),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        out = self.net(x)
+        return out[..., :self.n_embed], out[..., self.n_embed:]
+
+
+class TransformerBlockAngles(nn.Module):
+    """Block where FFN produces both residual and angles for next layer."""
+    def __init__(self, n_embed, block_size, dropout=0.2, rotate_v=False, use_softmax=False):
+        super().__init__()
+        self.sa_head = RotaryAttention(n_embed, block_size, dropout, rotate_v, use_softmax)
+        self.ffn = FeedForwardAngles(n_embed, dropout)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x, angles, causal=True, pad_mask=None):
+        x = x + self.sa_head(self.ln1(x), angles, causal, pad_mask)
+        residual, raw_angles = self.ffn(self.ln2(x))
+        x = x + residual
+        return x, raw_angles
+
+
 # ============================================================================
 # Model A/A': RoPE + Slot Angles, Native KG
 # ============================================================================
@@ -2251,6 +2285,280 @@ class ModelK(nn.Module):
         return logits
 
 
+class ModelL(nn.Module):
+    """Merged FFN angles + cumsum. Like Model I but angles come from FFN output.
+
+    Instead of separate per-layer angle projector MLPs, the FFN in each
+    TransformerBlock outputs C + C/2 values. First C = residual, last C/2 = raw
+    angles for the next layer's attention. Layer 0 uses learnable initial angles.
+
+    Text: causal mask, next-token prediction.
+    KG: bidirectional attention on character tokens only, MLM.
+        Cumsum includes relation angle between head and tail chars.
+
+    rotate_v=False -> Model L
+    rotate_v=True  -> Model L'
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
+                 dropout=0.2, rotate_v=False, use_softmax=False):
+        super().__init__()
+        self.n_embed = n_embed
+        self.token_embedding = nn.Embedding(vocab_size, n_embed)
+
+        # NO angle_projectors — angles come from FFN
+        self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
+
+        # Learnable initial angles for layer 0, initialized to RoPE-like frequencies
+        self.initial_angles = nn.Parameter(torch.arange(n_embed // 2).float().unsqueeze(0).unsqueeze(0))
+
+        self.blocks = nn.ModuleList([
+            TransformerBlockAngles(n_embed, block_size, dropout, rotate_v, use_softmax)
+            for _ in range(n_layers)
+        ])
+
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+
+        # Mapping from relation name to index
+        self.rel_to_idx = {rel: i for i, rel in enumerate(KG_RELATIONS)}
+
+    def _cumsum_angles_text(self, raw_angles):
+        """Right-cumsum angles for text from raw angle tensor."""
+        angles = torch.flip(raw_angles, dims=(1,))
+        angles = torch.cumsum(angles, dim=1)
+        angles = torch.flip(angles, dims=(1,))
+        return angles
+
+    def _cumsum_angles_kg(self, raw_angles, head_lens, rel_names, device,
+                          negate_angles=None):
+        """Cumsum angles for KG with relation angle inserted between head and tail.
+
+        Args:
+            raw_angles: (B, T, C//2) raw angle values from the FFN
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            device: torch device
+            negate_angles: optional list of bool. If True for sample i,
+                           negate the relation angle (for inverse direction).
+        """
+        B, T, D = raw_angles.shape
+
+        # Build extended angle sequence with relation angle inserted
+        ext_angles = torch.zeros(B, T + 1, D, device=device)
+
+        for i in range(B):
+            h_len = head_lens[i]
+            rel_idx = self.rel_to_idx[rel_names[i]]
+
+            # Head char angles: positions 0..h_len-1
+            ext_angles[i, :h_len] = raw_angles[i, :h_len]
+
+            # Relation angle: position h_len (negated if inverse direction)
+            rel_angle = self.relation_angles[rel_idx]
+            if negate_angles is not None and negate_angles[i]:
+                rel_angle = -rel_angle
+            ext_angles[i, h_len] = rel_angle
+
+            # Tail char angles: positions h_len+1..
+            t_len = T - h_len
+            ext_angles[i, h_len + 1:h_len + 1 + t_len] = raw_angles[i, h_len:h_len + t_len]
+
+        # Right-cumsum on extended sequence
+        ext_cumsum = torch.flip(ext_angles, dims=(1,))
+        ext_cumsum = torch.cumsum(ext_cumsum, dim=1)
+        ext_cumsum = torch.flip(ext_cumsum, dims=(1,))
+
+        # Extract angles for actual char positions (skip the relation position)
+        angles = torch.zeros(B, T, D, device=device)
+        for i in range(B):
+            h_len = head_lens[i]
+            t_len = T - h_len
+            # Head positions
+            angles[i, :h_len] = ext_cumsum[i, :h_len]
+            # Tail positions (skip the relation entry at index h_len)
+            angles[i, h_len:h_len + t_len] = ext_cumsum[i, h_len + 1:h_len + 1 + t_len]
+
+        return angles
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: causal, next-token prediction."""
+        B, T = idx.shape
+        pad_mask = (idx != 0)
+        x = self.token_embedding(idx)
+
+        raw_angles = self.initial_angles.expand(B, T, -1)
+        for l, block in enumerate(self.blocks):
+            angles = self._cumsum_angles_text(raw_angles)
+            x, raw_angles = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        if targets is None:
+            return logits, None
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
+        """KG mode: bidirectional on char tokens only, MLM.
+        Relation angle is only in the cumsum, not in the attention sequence.
+
+        Args:
+            char_tokens: (B, T) character tokens (head + tail, no relation token), MLM masked
+            targets: (B, T) original tokens, -100 for non-masked
+            head_lens: list of head lengths
+            rel_names: list of relation strings
+            negate_angles: optional list of bool, True to negate relation angle
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+        x = self.token_embedding(char_tokens)
+
+        raw_angles = self.initial_angles.expand(B, T, -1)
+        for l, block in enumerate(self.blocks):
+            angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
+                                            char_tokens.device, negate_angles=negate_angles)
+            x, raw_angles = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
+        """KG mode with causal masking and next-token prediction."""
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+        x = self.token_embedding(char_tokens)
+
+        raw_angles = self.initial_angles.expand(B, T, -1)
+        for l, block in enumerate(self.blocks):
+            angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
+                                            char_tokens.device, negate_angles=negate_angles)
+            x, raw_angles = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def predict_text(self, idx):
+        logits, _ = self.forward_text(idx)
+        return logits
+
+
+class ModelM(nn.Module):
+    """Merged FFN angles + RoPE + slot angles. Like Model K but angles come from FFN.
+
+    Instead of separate per-layer angle projector MLPs, the FFN in each
+    TransformerBlock outputs C + C/2 values. First C = residual, last C/2 = raw
+    projected angles for the next layer's attention.
+
+    Total angle = FFN_angles + RoPE + slot_angle (for KG)
+    Text: angle = FFN_angles + RoPE (no slots). Layer 0 uses learnable initial + RoPE.
+
+    rotate_v=False -> Model M
+    rotate_v=True  -> Model M'
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
+                 dropout=0.2, rotate_v=False, use_softmax=False):
+        super().__init__()
+        self.n_embed = n_embed
+        self.token_embedding = nn.Embedding(vocab_size, n_embed)
+
+        # NO angle_projectors — angles come from FFN
+
+        # Per-relation slot angle vectors: [n_relations, 2, n_embed//2]
+        self.slot_angles = nn.Parameter(torch.randn(n_relations, 2, n_embed // 2) * 0.1)
+
+        # RoPE base frequencies
+        self.register_buffer('base_freq',
+            1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
+
+        self.blocks = nn.ModuleList([
+            TransformerBlockAngles(n_embed, block_size, dropout, rotate_v, use_softmax)
+            for _ in range(n_layers)
+        ])
+
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+
+        # Mapping from relation name to index
+        self.rel_to_idx = {rel: i for i, rel in enumerate(KG_RELATIONS)}
+
+        # Learnable initial angles for layer 0, initialized to RoPE-like frequencies
+        self.initial_angles = nn.Parameter(torch.arange(n_embed // 2).float().unsqueeze(0).unsqueeze(0))
+
+    def _rope_angles(self, T, device):
+        """Standard RoPE angles: position * base_freq. Shape: (1, T, C//2)."""
+        positions = torch.arange(T, device=device, dtype=torch.float)
+        angles = torch.outer(positions, self.base_freq)
+        return angles.unsqueeze(0)
+
+    def _kg_angles(self, raw_angles, head_lens, rel_names, device):
+        """Combine FFN angles + RoPE (per-slot positions) + slot angles for KG."""
+        B, T, D = raw_angles.shape
+
+        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)
+
+        slot_ids = torch.where(positions < h_lens_t, 0, 1)
+        pos_in_slot = torch.where(slot_ids == 0, positions, positions - h_lens_t)
+
+        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq
+
+        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)
+        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, T), slot_ids]
+
+        return raw_angles + rope + slot_offset
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: FFN angles + RoPE (no slots), causal, NTP."""
+        B, T = idx.shape
+        pad_mask = (idx != 0)
+        x = self.token_embedding(idx)
+        rope = self._rope_angles(T, idx.device).expand(B, -1, -1)
+        raw_angles = self.initial_angles.expand(B, T, -1)
+
+        for l, block in enumerate(self.blocks):
+            angles = raw_angles + rope
+            x, raw_angles = block(x, angles, causal=True, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        if targets is None:
+            return logits, None
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
+        """KG mode: FFN angles + RoPE + slot angles, bidirectional, MLM.
+
+        Native format: [head_chars][tail_chars], no relation token in sequence.
+        negate_angles is accepted for API compatibility but ignored.
+        """
+        B, T = char_tokens.shape
+        pad_mask = (char_tokens != 0)
+        x = self.token_embedding(char_tokens)
+        raw_angles = self.initial_angles.expand(B, T, -1)
+
+        for l, block in enumerate(self.blocks):
+            angles = self._kg_angles(raw_angles, head_lens, rel_names, char_tokens.device)
+            x, raw_angles = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def predict_text(self, idx):
+        logits, _ = self.forward_text(idx)
+        return logits
+
+
 # ============================================================================
 # Data Preparation
 # ============================================================================
@@ -3288,14 +3596,14 @@ def evaluate_model(model, eval_prompts, vocab, config, model_name="?"):
 # Model Factory
 # ============================================================================
 
-MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'", "F", "F'", "G", "G'", "H", "H'", "I", "I'", "J", "J'", "K", "K'"]
+MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'", "F", "F'", "G", "G'", "H", "H'", "I", "I'", "J", "J'", "K", "K'", "L", "L'", "M", "M'"]
 
 # Which models use linearized text (B/C family) vs structured KG (A/D/E family)
 LINEARIZED_MODELS = {"B", "B'", "C", "C'"}
 SLOTTED_KG_MODELS = {"A", "A'", "G", "G'"}    # use get_mlm_batch_slotted (3 slots: HEAD/REL/TAIL)
-NATIVE_KG_MODELS = {"E", "E'", "H", "H'", "I", "I'"}  # use get_mlm_batch_native (rel as angle operator only)
+NATIVE_KG_MODELS = {"E", "E'", "H", "H'", "I", "I'", "L", "L'"}  # use get_mlm_batch_native (rel as angle operator only)
 FLAT_KG_MODELS = {"D", "D'", "F", "F'"}       # use get_mlm_batch_flat (rel as token)
-NATIVE_SLOTS_KG_MODELS = {"J", "J'", "K", "K'"}  # use get_mlm_batch_native_slots (2 slots: HEAD/TAIL, no rel token)
+NATIVE_SLOTS_KG_MODELS = {"J", "J'", "K", "K'", "M", "M'"}  # use get_mlm_batch_native_slots (2 slots: HEAD/TAIL, no rel token)
 
 
 def create_model(name, vocab_size, config):
@@ -3350,6 +3658,14 @@ def create_model(name, vocab_size, config):
         return ModelK(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
     elif name == "K'":
         return ModelK(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
+    elif name == "L":
+        return ModelL(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
+    elif name == "L'":
+        return ModelL(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
+    elif name == "M":
+        return ModelM(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
+    elif name == "M'":
+        return ModelM(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
     else:
         raise ValueError(f"Unknown model name: {name}")
 
