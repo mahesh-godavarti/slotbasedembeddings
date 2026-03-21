@@ -939,11 +939,174 @@ class JoFormerProjectedKG(nn.Module):
         return idx
 
 
+class FeedForwardAngles(nn.Module):
+    """FFN that outputs residual (C) + raw angles (C/2)."""
+    def __init__(self, n_embed, dropout):
+        super().__init__()
+        self.n_embed = n_embed
+        n_angles = n_embed // 2
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.GELU(),
+            nn.Linear(4 * n_embed, n_embed + n_angles),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        out = self.net(x)
+        return out[..., :self.n_embed], out[..., self.n_embed:]
+
+
+class JoFormerProjectedMergedKGBlock(nn.Module):
+    """Projected-angle block where FFN produces both residual and angles.
+
+    Like JoFormerProjectedKGBlock but angles come from FFN output (C + C/2)
+    instead of a separate angle_proj MLP.
+    """
+
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+        super().__init__()
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
+        self.ffn = FeedForwardAngles(n_embed, dropout)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x, angles):
+        """
+        angles: (B, T, C//2) pre-computed angles for this layer.
+        Returns: (x, raw_angles) where raw_angles feed next layer.
+        """
+        x = x + self.sa_head(self.ln1(x), angles)
+        residual, raw_angles = self.ffn(self.ln2(x))
+        x = x + residual
+        return x, raw_angles
+
+
+class JoFormerProjectedMergedKG(nn.Module):
+    """JoFormer-Projected with merged FFN angles + KG angle-gap.
+
+    Like JoFormerProjectedKG but angles come from FFN output instead of
+    separate per-layer angle projector MLPs. FFN outputs C + C/2 values:
+    first C = residual, last C/2 = raw angles for next layer.
+    Layer 0 uses learnable initial angles.
+    Rotates Q, K, V (primed variant style).
+    """
+
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
+                 use_softmax=False, n_relations=1):
+        super().__init__()
+        self.block_size = block_size
+        self.n_embed = n_embed
+        self.n_layers = n_layers
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.blocks = nn.ModuleList(
+            [JoFormerProjectedMergedKGBlock(n_embed, block_size, dropout, use_softmax)
+             for _ in range(n_layers)]
+        )
+        self.ln_f = nn.LayerNorm(n_embed)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+        # Learnable initial angles for layer 0, initialized to RoPE-like frequencies
+        self.initial_angles = nn.Parameter(torch.arange(n_embed // 2).float().unsqueeze(0).unsqueeze(0))
+
+        # KG: learned angle vector per relation
+        self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
+        self.rel_to_idx = {}
+
+    def _cumsum_angles_text(self, raw_angles):
+        """Flip-cumsum-flip for text mode."""
+        angles = torch.flip(raw_angles, dims=(1,))
+        angles = torch.cumsum(angles, dim=1)
+        angles = torch.flip(angles, dims=(1,))
+        return angles
+
+    def _cumsum_angles_kg(self, raw_angles, head_lens, rel_names, device, negate_angles):
+        """Cumsum projected angles for KG with relation angle gap."""
+        B, T, D = raw_angles.shape
+
+        ext_angles = torch.zeros(B, T + 1, D, device=device)
+
+        for i in range(B):
+            h_len = head_lens[i]
+            ext_angles[i, :h_len] = raw_angles[i, :h_len]
+
+            rel_idx = self.rel_to_idx[rel_names[i]]
+            rel_angle = self.relation_angles[rel_idx]
+            if negate_angles[i]:
+                rel_angle = -rel_angle
+            ext_angles[i, h_len] = rel_angle
+
+            t_len = T - h_len
+            ext_angles[i, h_len + 1:h_len + 1 + t_len] = raw_angles[i, h_len:h_len + t_len]
+
+        ext_cumsum = torch.flip(ext_angles, dims=(1,))
+        ext_cumsum = torch.cumsum(ext_cumsum, dim=1)
+        ext_cumsum = torch.flip(ext_cumsum, dims=(1,))
+
+        angles = torch.zeros(B, T, D, device=device)
+        for i in range(B):
+            h_len = head_lens[i]
+            t_len = T - h_len
+            angles[i, :h_len] = ext_cumsum[i, :h_len]
+            angles[i, h_len:h_len + t_len] = ext_cumsum[i, h_len + 1:h_len + 1 + t_len]
+
+        return angles
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: angles propagate through FFN outputs, cumsum'd each layer."""
+        B, T = idx.shape
+        x = self.token_embedding_table(idx)
+        raw_angles = self.initial_angles.expand(B, T, -1)
+
+        for block in self.blocks:
+            angles = self._cumsum_angles_text(raw_angles)
+            x, raw_angles = block(x, angles)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if targets is None:
+            return logits, None
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, token_ids, targets, head_lens, rel_names, negate_angles):
+        """KG mode: angles from FFN + relation gap, cumsum'd each layer."""
+        B, T = token_ids.shape
+        x = self.token_embedding_table(token_ids)
+        raw_angles = self.initial_angles.expand(B, T, -1)
+
+        for block in self.blocks:
+            angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
+                                            token_ids.device, negate_angles)
+            x, raw_angles = block(x, angles)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward(self, idx, targets=None):
+        return self.forward_text(idx, targets)
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size:]
+            logits, _ = self.forward_text(idx_cond)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+
 # Model registry: text-only baselines imported from train_wiki.py + KG models
 KG_MODEL_CLASSES = {
     'joformer_learned_kg': JoFormerLearnedKG,
     'joformer_fixed_kg': JoFormerFixedKG,
     'joformer_projected_kg': JoFormerProjectedKG,
+    'joformer_projected_merged_kg': JoFormerProjectedMergedKG,
 }
 
 ALL_MODEL_CLASSES = {}

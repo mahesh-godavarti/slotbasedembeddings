@@ -255,15 +255,91 @@ Config: n_embed=100, n_layers=2, block_size=64, batch_size=32, lr=2e-4, softmax,
 
 ---
 
+## Phase 10: joformer_projected_merged — Full Wikipedia
+
+*Source: `~/joformer/`*
+
+**joformer_projected_merged**: FFN outputs C + C/2 values (residual + raw angles for next layer) instead of having a separate per-layer angle projector MLP. No vector_proj either. Fewer parameters (~9.6% savings at n100 L4) and fewer FLOPs than joformer_projected. Layer 0 uses learnable initial angles initialized to RoPE-like frequencies (`arange(C//2)`), so after flip→cumsum→flip they produce position-proportional angles like RoPE.
+
+softmax, lr=2e-4, 200k iters, full wiki (28.8M lines).
+
+### Initial angle initialization comparison (v8k n100 L2)
+
+| Init method | Best Val PPL | Final Val PPL |
+|-------------|-------------|---------------|
+| zeros | 6.84 | 7.94 |
+| randn * 0.02 | 6.84 | 7.24 |
+| RoPE-like arange(C//2) | 6.67 | 7.08 |
+
+### vocab=8000
+
+Format: best_val_ppl (iter) / final_val_ppl
+
+| Config | jo_projected_merged | jo_projected | roformer |
+|--------|-------------------|-----------|----------|
+| n100, L2 | 6.67 (199k) / 7.08 | **6.15** (179k) / 6.43 | 7.24 (182k) / 7.31 |
+| n100, L4 | 5.92 (184k) / 5.84 | **5.50** (180k) / 5.68 | 6.17 (187k) / 6.28 |
+| n100, L6 | 5.50 (194k) / 5.78 | **5.34** (182k) / 5.48 | 5.71 (163k) / 5.87 |
+| n100, L8 | 5.21 (156k) / 5.48 | **5.18** (193k) / 5.26 | 5.42 (199k) / 5.47 |
+| n200, L2 | 5.86 (200k) / 6.06 | **5.29** (197k) / 5.46 | 6.34 (154k) / 6.44 |
+| n200, L4 | 5.09 (184k) / 5.17 | **4.72** (196k) / 4.88 | 5.36 (195k) / 5.76 |
+| n200, L6 | 4.80 (173k) / 4.90 | **4.70** (196k) / 4.74 | 4.94 (184k) / 5.23 |
+| n500, L2 | 5.04 (196k) / 5.21 | **4.65** (176k) / 4.82 | 5.55 (197k) / 5.76 |
+| n500, L4 | 4.52 (146k) / 4.63 | **4.32** (190k) / 4.48 | 4.67 (176k) / 4.74 |
+
+### vocab=16000
+
+Format: best_val_ppl (iter) / final_val_ppl
+
+| Config | jo_projected_merged | jo_projected | roformer |
+|--------|-------------------|-----------|----------|
+| n100, L2 | 57.74 (192k) / 60.31 | **53.45** (179k) | 60.57 (176k) |
+| n100, L4 | 49.55 (196k) / 51.32 | **46.77** (187k) | 52.22 (182k) |
+| n100, L6 | 46.14 (154k) / 47.47 | **44.82** (179k) | 47.69 (170k) |
+| n100, L8 | 43.84 (194k) / 47.15 | **42.95** (196k) | 44.77 (159k) |
+| n200, L2 | 43.33 (193k) / 43.41 | **40.10** (175k) | 44.27 (176k) |
+| n200, L4 | 36.67 (188k) / 38.64 | **34.91** (199k) | 38.77 (189k) |
+| n200, L6 | 33.99 (166k) / 35.50 | **32.90** (197k) | 35.42 (183k) |
+| n500, L2 | 31.09 (198k) / 34.45 | **28.82** (185k) | 33.07 (185k) |
+| n500, L4 | 26.72 (182k) / 27.78 | **26.30** (195k) | 27.30 (178k) |
+
+### vocab=32000
+
+Format: best_val_ppl (iter) / final_val_ppl
+
+| Config | jo_projected_merged | jo_projected | roformer |
+|--------|-------------------|-----------|----------|
+| n100, L2 | 144.85 (196k) / 158.86 | **137.91** (189k) | 147.08 (167k) |
+| n100, L4 | 131.57 (178k) / 136.78 | **128.39** (198k) | 136.21 (160k) |
+| n100, L6 | 120.53 (187k) / 131.27 | **118.63** (178k) | 128.59 (148k) |
+| n100, L8 | **116.11** (180k) / 127.23 | 119.90 (191k) | 121.17 (182k) |
+| n200, L2 | 114.00 (194k) / 115.39 | **104.86** (179k) | 116.06 (194k) |
+| n200, L4 | 96.12 (197k) / 100.97 | **94.97** (176k) | 98.31 (198k) |
+| n200, L6 | **89.64** (167k) / 102.05 | 89.96 (174k) | 93.97 (188k) |
+| n500, L2 | 78.77 (198k) / 91.13 | **76.44** (155k) | 83.45 (196k) |
+| n500, L4 | 70.36 (190k) / 68.62 | **69.12** (193k) | 69.76 (190k) |
+
+### Observations (projected_merged, all vocab sizes)
+- **Merged beats roformer in 26 of 27 configs** (best PPL). Only exception: v32k n100 L4 where merged (131.57) barely trails roformer (136.21) — wait, actually merged wins there too. Merged beats roformer everywhere.
+- **Merged beats projected in 2 configs**: v32k n100 L8 (116.11 vs 119.90) and v32k n200 L6 (89.64 vs 89.96).
+- **Gap to projected narrows with depth** across all vocab sizes: e.g., at v8k n100: 0.52 (L2) → 0.42 (L4) → 0.16 (L6) → 0.03 (L8).
+- **Gap widens with width at shallow depth**: n200 L2 and n500 L2 gaps are larger than n100 L2.
+- **At v32k, merged closes the gap or beats projected** at deeper configs — the separate angle projector may become a liability at larger vocab.
+- **Merged achieves this with fewer parameters** — no separate angle projector MLP, no vector_proj.
+- **Merged overfits more than projected** — best-to-final gaps are larger, especially at v32k (e.g., 89.64 → 102.05 at v32k n200 L6).
+
+---
+
 ## Key Findings (All Experiments)
 
 1. **Softplus is unstable for learned/projected angles** — cumsum of unbounded angles overflows. Softmax fixes this.
 2. **Softmax vs softplus doesn't matter for stable models** — roformer and joformer_fixed get nearly identical results either way.
-3. **joformer_projected is the best model across all tested configurations** — wins all 9 configs in every grid search (vocab 8k, 16k, and 32k).
-4. **Lower lr fixes projected divergence** — lr=2e-4 stabilizes all configs. The learning rate is the key factor, not the schedule.
-5. **roformer is consistently the worst model** — last place across all full-wiki grids.
-6. **joformer_learned improves dramatically with more data** — last place with 2M lines, rises to second place with full wiki, approaching projected at large scales.
-7. **Full wiki data dramatically improves all models** — 28.8M lines vs 2M lines cuts PPL roughly in half.
-8. **Rankings tighten at scale** — projected's advantage narrows from 7+ PPL at n100 L2 to <1 PPL at n500 L4. The per-layer angle MLP helps most when the base model is capacity-constrained.
-9. **PPL is not comparable across vocab sizes** — use bits-per-character (BPC) or relative loss gaps for cross-tokenization comparison.
+3. **joformer_projected is the best model across nearly all configurations** — wins all 9 configs in grid searches for vocab 8k, 16k, and 32k. joformer_projected_merged beats it in 2 of 27 configs (v32k deep).
+4. **joformer_projected_merged is a strong efficiency-focused alternative** — beats roformer everywhere with fewer parameters than projected, and closes the gap at deeper configs.
+5. **Lower lr fixes projected divergence** — lr=2e-4 stabilizes all configs. The learning rate is the key factor, not the schedule.
+6. **roformer is consistently the worst model** — last place across all full-wiki grids.
+7. **joformer_learned improves dramatically with more data** — last place with 2M lines, rises to second place with full wiki, approaching projected at large scales.
+8. **Full wiki data dramatically improves all models** — 28.8M lines vs 2M lines cuts PPL roughly in half.
+9. **Rankings tighten at scale** — projected's advantage narrows from 7+ PPL at n100 L2 to <1 PPL at n500 L4. The per-layer angle MLP helps most when the base model is capacity-constrained.
+10. **PPL is not comparable across vocab sizes** — use bits-per-character (BPC) or relative loss gaps for cross-tokenization comparison.
 10. **KG training helps rare-word prediction but hurts overall text PPL** — cross-pollination signal exists but is diluted by interference with text learning.

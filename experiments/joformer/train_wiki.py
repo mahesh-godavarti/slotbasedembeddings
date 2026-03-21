@@ -507,6 +507,87 @@ class JoFormerProjected(nn.Module):
         return idx
 
 # ---------------------------------------------------------------------------
+# JoFormer-ProjectedMerged — angles from FFN output, not separate projector
+# Each block's FFN outputs C + C/2: first C = residual, last C/2 = raw angles
+# for the next layer. Layer 0 uses zero-initialized angles.
+# ---------------------------------------------------------------------------
+
+class FeedForwardAngles(nn.Module):
+    """FFN that outputs residual (C) + raw angles (C/2)."""
+    def __init__(self, n_embed, dropout):
+        super().__init__()
+        self.n_embed = n_embed
+        n_angles = n_embed // 2
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.GELU(),
+            nn.Linear(4 * n_embed, n_embed + n_angles),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        out = self.net(x)
+        return out[..., :self.n_embed], out[..., self.n_embed:]
+
+
+class JoFormerProjectedMergedBlock(nn.Module):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+        super().__init__()
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
+        self.ffn = FeedForwardAngles(n_embed, dropout)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x, angles):
+        x = x + self.sa_head(self.ln1(x), angles)
+        residual, raw_angles = self.ffn(self.ln2(x))
+        x = x + residual
+        return x, raw_angles
+
+
+class JoFormerProjectedMerged(nn.Module):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
+        super().__init__()
+        self.block_size = block_size
+        self.n_embed = n_embed
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.blocks = nn.ModuleList(
+            [JoFormerProjectedMergedBlock(n_embed, block_size, dropout, use_softmax)
+             for _ in range(n_layers)]
+        )
+        self.ln_f = nn.LayerNorm(n_embed)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
+        # Learnable initial angles for layer 0, initialized to RoPE-like frequencies
+        # After flip→cumsum→flip, constant c becomes (T-pos)*c, linear in position like RoPE
+        self.initial_angles = nn.Parameter(torch.arange(n_embed // 2).float().unsqueeze(0).unsqueeze(0))
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        x = self.token_embedding_table(idx)
+        raw_angles = self.initial_angles.expand(B, T, -1)
+        for block in self.blocks:
+            angles = torch.flip(raw_angles, dims=(1,))
+            angles = torch.cumsum(angles, dim=1)
+            angles = torch.flip(angles, dims=(1,))
+            x, raw_angles = block(x, angles)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        if targets is None:
+            return logits, None
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size:]
+            logits, _ = self(idx_cond)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+# ---------------------------------------------------------------------------
 # Model registry
 # ---------------------------------------------------------------------------
 
@@ -515,6 +596,7 @@ MODEL_CLASSES = {
     'joformer_fixed': JoFormerFixed,
     'joformer_learned': JoFormerLearned,
     'joformer_projected': JoFormerProjected,
+    'joformer_projected_merged': JoFormerProjectedMerged,
 }
 
 # ---------------------------------------------------------------------------
