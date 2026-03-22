@@ -325,8 +325,41 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
 
     eval_amp_dtype = amp_dtype if use_amp else None
 
+    # Parse K curriculum schedule
+    k_schedule = None
+    if getattr(args, 'k_schedule', None) and hasattr(model, 'n_iters'):
+        k_schedule = []
+        for segment in args.k_schedule.split(','):
+            iter_str, k_str = segment.strip().split(':')
+            start_iter = int(iter_str)
+            if '-' in k_str:
+                k_lo, k_hi = k_str.split('-')
+                k_schedule.append((start_iter, int(k_lo), int(k_hi)))
+            else:
+                k_val = int(k_str)
+                k_schedule.append((start_iter, k_val, k_val))
+        k_schedule.sort(key=lambda x: x[0])
+        print(f"  [{model_name}] K schedule: {args.k_schedule}")
+        for start, k_lo, k_hi in k_schedule:
+            if k_lo == k_hi:
+                print(f"    iter {start}: K={k_hi}")
+            else:
+                print(f"    iter {start}: K=random({k_lo},{k_hi})")
+
     pbar = tqdm(range(args.max_iters), desc=model_name)
     for it in pbar:
+        # Apply K schedule: set model.n_iters (= K) and model.k_min
+        if k_schedule and hasattr(model, 'n_iters'):
+            for start, k_lo, k_hi in reversed(k_schedule):
+                if it >= start:
+                    if it == start:
+                        model.n_iters = k_hi
+                        model.k_min = k_lo if k_lo != k_hi else 0
+                        if k_lo == k_hi:
+                            tqdm.write(f"  [{model_name}] iter {it}: K={k_hi}")
+                        else:
+                            tqdm.write(f"  [{model_name}] iter {it}: K=random({k_lo},{k_hi})")
+                    break
         # Eval
         if it % args.eval_interval == 0 or it == args.max_iters - 1:
             losses = estimate_loss(model, train_data, val_data,
@@ -565,6 +598,9 @@ def run_training(args):
         model = cls(actual_vocab_size, args.n_embed, args.n_layers,
                     args.block_size, args.dropout, use_softmax=args.softmax,
                     **extra_kwargs)
+        if args.compile:
+            print(f"  Compiling {model_name} with torch.compile...")
+            model = torch.compile(model)
         val_loss, val_ppl, ppl_log, extra = train_model(
             model_name, model, train_data, val_data, args, device, tokenizer
         )
@@ -675,6 +711,12 @@ def add_training_args(parser):
                              '0 = no windowing (use full causal mask).')
     parser.add_argument('--amp', action='store_true',
                         help='Use automatic mixed precision (bfloat16)')
+    parser.add_argument('--compile', action='store_true',
+                        help='Use torch.compile for faster training')
+    parser.add_argument('--k_schedule', type=str, default=None,
+                        help='K curriculum schedule: "iter1:K1,iter2:K2,..." e.g. '
+                             '"0:1,50000:2,90000:2-5". Each segment sets K (or K range '
+                             'for random sampling) starting at the given iteration.')
 
 
 def main():

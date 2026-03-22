@@ -2723,14 +2723,16 @@ Depth diagnostics: parallel K=1→51.60, K=2→40.12, K=3→39.22, K=5=K=10=39.1
 ### Roformer N=12 C=768 OWT (completed)
 
 Settings: n_embed=768, n_layers=12, block_size=256, batch_size=64, lr=2e-4, softmax, amp
-FLOPs: 144C². Absolute FLOPs: 144 × 768² = 84.9M (38% more inference FLOPs than D=8).
+FLOPs: 144C². Absolute FLOPs: 144 × 768² = 84.9M. D=8 uses 28% fewer inference FLOPs.
 
 Final: **37.83 PPL**.
 
-### Roformer N=11 C=768 OWT (in progress)
+### Roformer N=11 C=768 OWT (completed)
 
 Settings: n_embed=768, n_layers=11, block_size=256, batch_size=64, lr=2e-4, softmax, amp
-FLOPs: 132C². Absolute FLOPs: 132 × 768² = 77.9M (27% more inference FLOPs than D=8).
+FLOPs: 132C². Absolute FLOPs: 132 × 768² = 77.9M. D=8 uses 21% fewer inference FLOPs.
+
+Final: **38.74 PPL**.
 
 ### D=8 vs N=11 vs N=12 head-to-head (all C=768 OWT)
 
@@ -2744,26 +2746,188 @@ FLOPs: 132C². Absolute FLOPs: 132 × 768² = 77.9M (27% more inference FLOPs th
 | 30K  | 50.11      | 48.50       | 47.95       | +1.61       | +0.55       |
 | 35K  | 48.32      | 46.76       | 46.25       | +1.56       | +0.51       |
 | 40K  | 46.95      | 45.66       | 44.97       | +1.29       | +0.69       |
-| 45K  | 45.66      | —           | 43.94       |             |             |
-| 50K  | 44.72      | —           | 42.94       |             |             |
-| 55K  | 43.89      | —           | 42.15       |             |             |
-| 60K  | 43.14      | —           | 41.44       |             |             |
-| 65K  | 42.45      | —           | 40.96       |             |             |
-| 70K  | 41.72      | —           | 40.20       |             |             |
-| 75K  | 41.40      | —           | 39.74       |             |             |
-| 80K  | 40.77      | —           | 39.33       |             |             |
-| 85K  | 40.30      | —           | 39.02       |             |             |
-| 90K  | 39.86      | —           | 38.64       |             |             |
-| 95K  | 39.58      | —           | 38.23       |             |             |
-| 100K | **39.10**  | —           | **37.83**   |             |             |
+| 45K  | 45.66      | 44.49       | 43.94       | +1.17       | +0.55       |
+| 50K  | 44.72      | 43.41       | 42.94       | +1.31       | +0.47       |
+| 55K  | 43.89      | 42.75       | 42.15       | +1.14       | +0.60       |
+| 60K  | 43.14      | 42.17       | 41.44       | +0.97       | +0.73       |
+| 65K  | 42.45      | 41.52       | 40.96       | +0.93       | +0.56       |
+| 70K  | 41.72      | 40.94       | 40.20       | +0.78       | +0.74       |
+| 75K  | 41.40      | 40.51       | 39.74       | +0.89       | +0.77       |
+| 80K  | 40.77      | 39.97       | 39.33       | +0.80       | +0.64       |
+| 85K  | 40.30      | 39.70       | 39.02       | +0.60       | +0.68       |
+| 90K  | 39.86      | 39.34       | 38.64       | +0.52       | +0.70       |
+| 95K  | 39.58      | 38.93       | 38.23       | +0.65       | +0.70       |
+| 100K | **39.10**  | **38.74**   | **37.83**   | **+0.36**   | **+0.91**   |
 
-**N=11 vs N=12**: The 12th roformer layer (12C² extra, +9% FLOPs) adds only ~0.5 PPL — diminishing returns.
-**D=8 vs N=11**: Gap narrowing from 7.02 at 5K to 1.29 at 40K. D=8 uses 21% fewer inference FLOPs.
-**D=8 vs N=12**: Final gap 1.27 PPL. D=8 uses 38% fewer inference FLOPs.
+**D=8 vs N=11**: D=8 (104C²) only **0.36 PPL behind** N=11 (132C²) — 21% fewer inference FLOPs.
+**N=11 vs N=12**: The 12th roformer layer (+12C², +9%) adds 0.91 PPL.
+**D=8 vs N=12**: D=8 (104C²) 1.27 PPL behind N=12 (144C²) — 28% fewer inference FLOPs.
+
+### block_head_corr_ffn_concat D=8 C=768 OWT (completed)
+
+Settings: n_embed=768, n_layers=40, d_block=8, K=5, k_min=2, block_size=256, batch_size=64, lr=2e-4, softmax, convergence_weight=0.1, amp
+FLOPs: (12×8+16)C² = 112C². Absolute FLOPs: 112 × 768² = 66.1M.
+Compare: D=8 add = 104C² = 61.3M FLOPs. Concat adds 8C² (8% more FLOPs) for the 2C→C input projection in the correction FFN.
+
+Final: **39.22 PPL** (vs D=8 add's 39.10).
+
+#### D=8 add vs concat head-to-head (both C=768 OWT)
+
+| Iter | D=8 add (104C²) | D=8 concat (112C²) | Gap (add − concat) |
+|------|-----------------|--------------------|--------------------|
+| 5K   | 94.80           | 94.23              | +0.57              |
+| 10K  | 71.25           | 71.03              | +0.22              |
+| 15K  | 61.48           | 61.73              | -0.25              |
+| 20K  | 55.98           | 56.10              | -0.12              |
+| 25K  | 52.69           | 52.51              | +0.18              |
+| 30K  | 50.11           | 49.82              | +0.29              |
+| 35K  | 48.32           | 48.15              | +0.17              |
+| 40K  | 46.95           | 46.67              | +0.28              |
+| 45K  | 45.66           | 45.69              | -0.03              |
+| 50K  | 44.72           | 44.67              | +0.05              |
+| 55K  | 43.89           | 43.79              | +0.10              |
+| 60K  | 43.14           | 43.00              | +0.14              |
+| 65K  | 42.45           | 42.30              | +0.15              |
+| 70K  | 41.72           | 41.69              | +0.03              |
+| 75K  | 41.40           | 41.19              | +0.21              |
+| 80K  | 40.77           | 40.70              | +0.07              |
+| 85K  | 40.30           | 40.44              | -0.14              |
+| 90K  | 39.86           | 40.00              | -0.14              |
+| 95K  | 39.58           | 39.51              | +0.07              |
+| 100K | **39.10**       | **39.22**          | **-0.12**          |
+
+**At D=8, concat ≈ add.** The gap is noise-level (±0.3 PPL throughout, final difference 0.12). The extra 8C² from concat's 2C input to the correction FFN provides no benefit when D is already large. **Use add at high D** — fewer FLOPs, same or slightly better PPL.
+
+This confirms the pattern: at low D, concat helps because the correction FFN's 2C input (tok_emb + shifted correction) provides richer information. At high D, the D=8 block already has enough capacity to extract information from the shifted correction alone, making the tok_emb concatenation redundant.
+
+### D=8 C=768 K=2 compiled OWT (completed)
+
+Settings: n_embed=768, n_layers=16 (D=8 × K=2), d_block=8, K=2, k_min=0 (fixed K, no random sampling), block_size=256, batch_size=64, lr=2e-4, softmax, convergence_weight=0.1, amp, **torch.compile enabled**
+FLOPs: 104C² (same as K=5 — inference FLOPs don't depend on K).
+
+**Training speed**: 2.67 it/s (vs ~1.6 it/s for K=5 uncompiled) — **1.7× speedup**.
+- 60% fewer block applications per iteration (16 vs 40)
+- torch.compile optimizes the static computation graph
+- Wall clock: 10h 27min vs ~17.4h for K=5
+
+**Note on torch.compile**: Required `--k_min 0` to ensure fixed K (no `random.randint` call which breaks static graph). Also required `sudo apt-get install python3.12-dev` and `sudo ldconfig` to fix Triton compilation (missing `Python.h` and stale library cache).
+
+Final: **40.17 PPL** (K=5 baseline: 39.10). **Cost: 1.07 PPL for 1.7× faster training.**
+
+| Iter | D=8 K=2 (compiled) | D=8 K=5 (baseline) | Gap |
+|------|--------------------|--------------------|-----|
+| 5K   | 96.05              | 94.80              | +1.25 |
+| 10K  | 72.19              | 71.25              | +0.94 |
+| 15K  | 62.77              | 61.48              | +1.29 |
+| 20K  | 57.18              | 55.98              | +1.20 |
+| 25K  | 53.87              | 52.69              | +1.18 |
+| 30K  | 51.34              | 50.11              | +1.23 |
+| 35K  | 49.48              | 48.32              | +1.16 |
+| 40K  | 47.96              | 46.95              | +1.01 |
+| 45K  | 46.77              | 45.66              | +1.11 |
+| 50K  | 45.86              | 44.72              | +1.14 |
+| 55K  | 44.98              | 43.89              | +1.09 |
+| 60K  | 44.07              | 43.14              | +0.93 |
+| 65K  | 43.51              | 42.45              | +1.06 |
+| 70K  | 42.76              | 41.72              | +1.04 |
+| 75K  | 42.43              | 41.40              | +1.03 |
+| 80K  | 41.77              | 40.77              | +1.00 |
+| 85K  | 41.33              | 40.30              | +1.03 |
+| 90K  | 40.94              | 39.86              | +1.08 |
+| 95K  | 40.59              | 39.58              | +1.01 |
+| 100K | **40.17**          | **39.10**          | **+1.07** |
+
+The gap is remarkably stable at ~1.0-1.2 PPL throughout training. K=2 captures most of the model's capacity — the extra 3 iterations in K=5 contribute only 1 PPL.
+
+Diagnostics:
+- Parallel K=1: 62.58 (no iteration — bad)
+- Parallel K=2: 40.16 (optimal — matches training K)
+- Parallel K=3: 40.64, K=4: 40.53 (slightly worse — overtrained for K=2)
+- **Sequential K=1: 40.59** (0.43 PPL penalty vs parallel K=2)
+
+With K=5 training, sequential K=1 had zero penalty (39.10 = parallel K=5). With K=2 training, there's a 0.43 PPL gap — the model doesn't converge as deeply in 2 iterations, so sequential inference doesn't perfectly replicate the training regime.
+
+### D=8 C=768 K-schedule OWT (in progress)
+
+Settings: same as K=2 but with curriculum K schedule, **no torch.compile** (random K phase breaks static graph).
+Schedule: K=1 (iter 0–50K) → K=2 (50K–90K) → K=random(2,5) (90K–100K).
+
+CLI: `--k_schedule "0:1,50000:2,90000:2-5" --n_layers 40` (model created with full K=5 weights, schedule controls which K is used during training).
+
+Final: **41.63 PPL** (9h 50min, 2.83 it/s average).
+
+| Iter | K-schedule | K=2 (compiled) | K=5 (baseline) | Phase |
+|------|-----------|----------------|----------------|-------|
+| 5K   | 100.92    | 96.05          | 94.80          | K=1   |
+| 10K  | 76.39     | 72.19          | 71.25          | K=1   |
+| 15K  | 66.88     | 62.77          | 61.48          | K=1   |
+| 20K  | 61.14     | 57.18          | 55.98          | K=1   |
+| 25K  | 57.89     | 53.87          | 52.69          | K=1   |
+| 30K  | 55.28     | 51.34          | 50.11          | K=1   |
+| 35K  | 53.29     | 49.48          | 48.32          | K=1   |
+| 40K  | 51.70     | 47.96          | 46.95          | K=1   |
+| 45K  | 50.47     | 46.77          | 45.66          | K=1   |
+| 50K  | 49.44     | 45.86          | 44.72          | K=1→K=2 |
+| 55K  | 48.19     | 44.98          | 43.89          | K=2   |
+| 60K  | 46.91     | 44.07          | 43.14          | K=2   |
+| 65K  | 45.99     | 43.51          | 42.45          | K=2   |
+| 70K  | 45.06     | 42.76          | 41.72          | K=2   |
+| 75K  | 44.52     | 42.43          | 41.40          | K=2   |
+| 80K  | 43.81     | 41.77          | 40.77          | K=2   |
+| 85K  | 43.13     | 41.33          | 40.30          | K=2   |
+| 90K  | 42.87     | 40.94          | 39.86          | K=2→K=2-5 |
+| 95K  | 42.10     | 40.59          | 39.58          | K=2-5 |
+| 100K | **41.63** | **40.17**      | **39.10**      |       |
+
+Diagnostics:
+- Parallel K=2: 41.83, K=3: 41.62, K=5: 41.62, K=10: 41.62
+- **Sequential K=1: 41.62** (zero penalty — the K=2-5 random phase restored convergence)
+
+#### K training comparison summary
+
+| Run | Final PPL | Seq K=1 | Wall time | Speedup |
+|-----|-----------|---------|-----------|---------|
+| K=5 (baseline) | 39.10 | 39.10 (0.00) | ~17.4h | 1.0× |
+| K=2 (compiled) | 40.17 | 40.59 (+0.43) | 10.5h | 1.7× |
+| K-schedule (1→2→2-5) | 41.63 | 41.62 (0.00) | 9.8h | 1.8× |
+
+**Findings**: K-schedule is fastest (1.8×) and restores zero seq K=1 penalty, but 2.5 PPL behind K=5. The K=1 phase (50K iters) created too large a gap to recover from in only 40K of K=2 and 10K of K=2-5. A less aggressive schedule (e.g. shorter K=1 phase, or starting at K=2) might close the gap.
+
+---
+
+## Training Speedup Investigation
+
+### Bottleneck analysis
+
+The look-ahead architecture's training bottleneck is the K-iteration loop. For D=8 K=5, this means 40 sequential block applications per training step (vs 8 layers in a roformer). Each iteration is a Python for-loop body, limiting GPU utilization.
+
+### Approaches tested
+
+1. **torch.compile** (`--compile` flag): Compiles the model graph for Inductor/Triton optimization. Requires static graph — incompatible with `random.randint` for k_min, so use `--k_min 0`. Setup: `sudo apt-get install python3.12-dev && sudo ldconfig`.
+
+2. **Reduced K**: Training with K=2 instead of K=5 reduces block applications from 40 to 16 (60% reduction). Combined with torch.compile, achieves 1.7× speedup. Quality impact TBD.
+
+### Approaches considered but not yet tested
+
+- **Flash Attention**: Would speed up the attention computation in each block, but benefits both look-ahead and roformer equally. Not a differentiator. Current code uses manual attention (Q×K^T scaling, masking, softmax, ×V) in `joformer/train_wiki.py:185`.
+
+- **Fixed K with random loss iteration**: Instead of varying K during training, always run K=5 iterations but randomly sample which iteration's output to compute loss on. This gives the compiler a fixed graph while still training convergence across depths. Not yet implemented.
+
+### Key insight: training cost vs inference cost
+
+Look-ahead is more expensive to train than roformer (40 block apps vs 8-12 layers). **The value proposition is in inference FLOPs**, not training efficiency. Training speedups help iteration speed during research but don't change the deployment advantage.
 
 ---
 
 ## Future Work
+
+- **Mid-FFN insertion**: At D=8, roformer gains 1.5× more PPL per additional layer. Hypothesis: inserting an extra FFN between blocks 4 and 5 (mid-point of D=8) could boost quality for moderate FLOP cost. The FFN would break the monotony of the shared-weight iteration by adding a non-shared transformation mid-way. Not yet tested.
+
+- **K=2 training quality**: Currently running D=8 K=2 with torch.compile. If quality drop from K=5 is small (< 1-2 PPL), K=2 training enables 1.7× faster experimentation. This would dramatically speed up the research cycle.
+
+- **Thunder Compute parallel experiments**: tnr-cli installed, code and OWT data (34GB) synced to tnr machine. Ready for parallel runs. RTX A6000 on-demand at $0.27/hr or A100 at $0.78/hr available.
+
+- **GPT-2 scale comparison**: A100 (80GB) could train GPT-2 XL scale (1.5B params). At $0.78/hr this is feasible for short runs. Would provide a more meaningful comparison point.
 
 - **Multi-token prediction (MTP) via correction vectors**: The correction at position t already encodes contextual information from the sequence. This could be used to predict not just token t+1 but also t+2, t+3, etc., enabling speculative drafts from a single forward pass without a separate draft model. Requires retraining with multi-token prediction heads.
 
