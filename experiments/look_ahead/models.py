@@ -70,7 +70,7 @@ class SplitBlockLookAhead(nn.Module):
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
                  use_softmax=False, convergence_weight=0.0, k_min=0,
-                 head_sees_px=False, **kwargs):
+                 head_sees_px=False, n_head=1, **kwargs):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
@@ -79,6 +79,7 @@ class SplitBlockLookAhead(nn.Module):
         self.convergence_weight = convergence_weight
         self.k_min = k_min  # 0 = disabled (always use n_iters), >0 = sample K ~ Uniform(k_min, n_iters)
         self.head_sees_px = head_sees_px
+        self.n_head = n_head
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.drop = nn.Dropout(dropout)
@@ -301,7 +302,7 @@ class AttnCorrFFNModel(SplitBlockLookAhead):
                  use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          use_softmax=use_softmax, convergence_weight=convergence_weight, **kwargs)
-        self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+        self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.ln1 = nn.LayerNorm(n_embed)
         self.corr_ffn = FeedForward(n_embed, dropout)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -340,14 +341,14 @@ class AttnCorrFFNSyncModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.attns = nn.ModuleList([
-                RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+                RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
             self.ln1s = nn.ModuleList([nn.LayerNorm(n_embed) for _ in range(d_block)])
             self.corr_ffns = nn.ModuleList([FeedForward(n_embed, dropout) for _ in range(d_block)])
             self.ln2s = nn.ModuleList([nn.LayerNorm(n_embed) for _ in range(d_block)])
         else:
-            self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             self.ln1 = nn.LayerNorm(n_embed)
             self.corr_ffn = FeedForward(n_embed, dropout)
             self.ln2 = nn.LayerNorm(n_embed)
@@ -725,7 +726,7 @@ class BlockAlignedModel(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
-                 use_softmax=False, convergence_weight=0.0, d_block=1, k_min=0, **kwargs):
+                 use_softmax=False, convergence_weight=0.0, d_block=1, k_min=0, n_head=1, **kwargs):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
@@ -733,23 +734,24 @@ class BlockAlignedModel(nn.Module):
         self.convergence_weight = convergence_weight
         self.k_min = k_min
         self.d_block = d_block
+        self.n_head = n_head
 
         if d_block > 1:
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             # Blocks 1..D-1: full standard blocks
             self.inner_blocks = nn.ModuleList([
-                RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block - 1)
             ])
             # Block D: split into attn + ffn
-            self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             self.ln1 = nn.LayerNorm(n_embed)
             self.ffn = FeedForward(n_embed, dropout)
             self.ln2 = nn.LayerNorm(n_embed)
         else:
             self.n_iters = n_layers
-            self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             self.ln1 = nn.LayerNorm(n_embed)
             self.ffn = FeedForward(n_embed, dropout)
             self.ln2 = nn.LayerNorm(n_embed)
@@ -1114,7 +1116,7 @@ class AttnHeadFFNModel(SplitBlockLookAhead):
                  use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          use_softmax=use_softmax, convergence_weight=convergence_weight, **kwargs)
-        self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+        self.attn = RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.ln1 = nn.LayerNorm(n_embed)
         self.head_ffn = FeedForward(n_embed, dropout)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -1152,11 +1154,11 @@ class BlockHeadFFNModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.head_ffn = FeedForward(n_embed, dropout)
         self.ln3 = nn.LayerNorm(n_embed)
         self.ln_f = nn.LayerNorm(n_embed)
@@ -1200,11 +1202,11 @@ class BlockHeadModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.ln_f = nn.LayerNorm(n_embed)
         self.head = nn.Linear(n_embed, vocab_size)
 
@@ -1250,11 +1252,11 @@ class BlockHeadCorrFFNModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.corr_ffn = FeedForward(n_embed, dropout)
         self.ln_corr = nn.LayerNorm(n_embed)
         self.ln_f = nn.LayerNorm(n_embed)
@@ -1309,11 +1311,11 @@ class BlockHeadCorrFFNConcatModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         # corr_ffn takes 2C input (concat of shifted z and tok_emb)
         self.corr_ffn = nn.Sequential(
             nn.Linear(2 * n_embed, 4 * n_embed),
@@ -1530,11 +1532,11 @@ class BlockHeadCorrFFNAddModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.corr_ffn = FeedForward(n_embed, dropout)
         self.ln_corr = nn.LayerNorm(n_embed)
         self.ln_f = nn.LayerNorm(n_embed)
@@ -1970,11 +1972,11 @@ class BlockHeadRecomputeModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.ln_f = nn.LayerNorm(n_embed)
         self.head = nn.Linear(n_embed, vocab_size)
 
@@ -2155,11 +2157,11 @@ class BlockHeadRecomputeSepModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.corr_ffn = FeedForward(n_embed, dropout)
         self.ln_corr = nn.LayerNorm(n_embed)
         self.ln_f = nn.LayerNorm(n_embed)
@@ -2326,11 +2328,11 @@ class BlockHeadDeltaFFNModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.corr_ffn = FeedForward(n_embed, dropout)
         self.ln_corr = nn.LayerNorm(n_embed)
         self.ln_f = nn.LayerNorm(n_embed)
@@ -2385,11 +2387,11 @@ class BlockHeadDeltaFFNAddModel(SplitBlockLookAhead):
             assert n_layers % d_block == 0
             self.n_iters = n_layers // d_block
             self.blocks = nn.ModuleList([
-                block_class(n_embed, block_size, dropout, use_softmax)
+                block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(d_block)
             ])
         else:
-            self.block = block_class(n_embed, block_size, dropout, use_softmax)
+            self.block = block_class(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
         self.corr_ffn = FeedForward(n_embed, dropout)
         self.ln_corr = nn.LayerNorm(n_embed)
         self.ln_f = nn.LayerNorm(n_embed)
@@ -2578,13 +2580,14 @@ class StackedSplitBlock(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
-                 n_units, use_softmax=False, convergence_weight=0.0, d_block=1, k_min=0):
+                 n_units, use_softmax=False, convergence_weight=0.0, d_block=1, k_min=0, n_head=1):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_embed = n_embed
         self.n_units = n_units
         self.d_block = d_block
         self.k_min = k_min
+        self.n_head = n_head
         total_divisor = n_units * d_block
         if n_layers % total_divisor != 0:
             raise ValueError(
@@ -2775,9 +2778,9 @@ class StackedAttnCorrFFN(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.attns = nn.ModuleList([
-            RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             for _ in range(n_units)
         ])
         self.ln1s = nn.ModuleList([nn.LayerNorm(n_embed) for _ in range(n_units)])
@@ -2804,9 +2807,9 @@ class StackedAttnHeadFFN(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.attns = nn.ModuleList([
-            RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             for _ in range(n_units)
         ])
         self.ln1s = nn.ModuleList([nn.LayerNorm(n_embed) for _ in range(n_units)])
@@ -2831,9 +2834,9 @@ class StackedBlockHeadFFN(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.blocks = nn.ModuleList([
-            RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+            RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             for _ in range(n_units)
         ])
         self.head_ffn = FeedForward(n_embed, dropout)
@@ -2861,20 +2864,20 @@ class StackedBlockHead(StackedSplitBlock):
                  subtract_input=True, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         d_block=d_block, k_min=kwargs.get('k_min', 0))
+                         d_block=d_block, k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.subtract_input = subtract_input
         if d_block > 1:
             # Each unit gets D separate-weight blocks
             self.unit_blocks = nn.ModuleList([
                 nn.ModuleList([
-                    RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                    RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                     for _ in range(d_block)
                 ])
                 for _ in range(n_units)
             ])
         else:
             self.blocks = nn.ModuleList([
-                RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(n_units)
             ])
         self.ln_f = nn.LayerNorm(n_embed)
@@ -2905,18 +2908,18 @@ class StackedBlockHeadCorrFFN(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, d_block=1, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         d_block=d_block, k_min=kwargs.get('k_min', 0))
+                         d_block=d_block, k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         if d_block > 1:
             self.unit_blocks = nn.ModuleList([
                 nn.ModuleList([
-                    RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                    RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                     for _ in range(d_block)
                 ])
                 for _ in range(n_units)
             ])
         else:
             self.blocks = nn.ModuleList([
-                RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(n_units)
             ])
         self.corr_ffns = nn.ModuleList([
@@ -2956,9 +2959,9 @@ class StackedBlockHeadDeltaFFN(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.blocks = nn.ModuleList([
-            RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+            RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             for _ in range(n_units)
         ])
         self.corr_ffns = nn.ModuleList([
@@ -2996,18 +2999,18 @@ class StackedBlockHeadCorrFFNConcat(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, d_block=1, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         d_block=d_block, k_min=kwargs.get('k_min', 0))
+                         d_block=d_block, k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         if d_block > 1:
             self.unit_blocks = nn.ModuleList([
                 nn.ModuleList([
-                    RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                    RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                     for _ in range(d_block)
                 ])
                 for _ in range(n_units)
             ])
         else:
             self.blocks = nn.ModuleList([
-                RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(n_units)
             ])
         self.corr_ffns = nn.ModuleList([
@@ -3180,18 +3183,18 @@ class StackedBlockHeadCorrFFNAdd(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, d_block=1, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         d_block=d_block, k_min=kwargs.get('k_min', 0))
+                         d_block=d_block, k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         if d_block > 1:
             self.unit_blocks = nn.ModuleList([
                 nn.ModuleList([
-                    RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                    RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                     for _ in range(d_block)
                 ])
                 for _ in range(n_units)
             ])
         else:
             self.blocks = nn.ModuleList([
-                RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                 for _ in range(n_units)
             ])
         self.corr_ffns = nn.ModuleList([
@@ -3344,9 +3347,9 @@ class StackedAttnCorrFFNSync(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.attns = nn.ModuleList([
-            RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             for _ in range(n_units)
         ])
         self.ln1s = nn.ModuleList([nn.LayerNorm(n_embed) for _ in range(n_units)])
@@ -3374,7 +3377,7 @@ class StackedJoFormerFixedSync(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.attns = nn.ModuleList([
             JoFormerFixedAttention(n_embed, block_size, dropout, use_softmax)
             for _ in range(n_units)
@@ -3408,7 +3411,7 @@ class StackedJoFormerLearnedSync(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         # Override token embedding: half-size + expander
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
         self.angle_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
@@ -3593,7 +3596,7 @@ class StackedJoFormerProjectedSync(StackedSplitBlock):
                  n_units, use_softmax=False, convergence_weight=0.0, **kwargs):
         super().__init__(vocab_size, n_embed, n_layers, block_size, dropout,
                          n_units, use_softmax, convergence_weight,
-                         k_min=kwargs.get('k_min', 0))
+                         k_min=kwargs.get('k_min', 0), n_head=kwargs.get('n_head', 1))
         self.attns = nn.ModuleList([
             JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
             for _ in range(n_units)
@@ -3683,14 +3686,14 @@ class StackedBlockAligned(nn.Module):
             # Blocks 1..D-1 per unit: full standard blocks
             self.unit_inner_blocks = nn.ModuleList([
                 nn.ModuleList([
-                    RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+                    RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
                     for _ in range(d_block - 1)
                 ])
                 for _ in range(n_units)
             ])
         # Block D per unit: split attn + ffn
         self.attns = nn.ModuleList([
-            RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+            RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
             for _ in range(n_units)
         ])
         self.ln1s = nn.ModuleList([nn.LayerNorm(n_embed) for _ in range(n_units)])
@@ -3947,12 +3950,13 @@ class RoFormerHeadFFN(nn.Module):
     """Standard roformer with an extra FFN before the classification head."""
 
     def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout,
-                 use_softmax=False, **kwargs):
+                 use_softmax=False, n_head=1, **kwargs):
         super().__init__()
         self.block_size = block_size
+        self.n_head = n_head
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [RoFormerBlock(n_embed, block_size, dropout, use_softmax)
+            [RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=self.n_head)
              for _ in range(n_layers)]
         )
         self.head_ffn = FeedForward(n_embed, dropout)

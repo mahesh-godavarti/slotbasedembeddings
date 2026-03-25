@@ -306,9 +306,9 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters)
                  if args.cosine_decay else None)
-    use_amp = getattr(args, 'amp', False) and device == 'cuda'
+    use_amp = getattr(args, 'amp', False) and str(device).startswith('cuda')
     amp_dtype = torch.bfloat16
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
+    scaler = torch.amp.GradScaler(device, enabled=use_amp) if use_amp else None
     if use_amp:
         print(f"  [{model_name}] AMP enabled (bfloat16)")
     model.to(device)
@@ -322,8 +322,30 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
     best_val_loss = float('inf')
     ppl_log = {"iter": [], "train_ppl": [], "val_ppl": []}
     diagnostics_log = []
+    start_iter = 0
 
     eval_amp_dtype = amp_dtype if use_amp else None
+
+    # Auto-resume from checkpoint
+    if args.checkpoint_dir:
+        ckpt_path = os.path.join(args.checkpoint_dir, f"{model_name}_latest.pt")
+        if os.path.exists(ckpt_path):
+            print(f"  [{model_name}] Resuming from checkpoint: {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt['model_state_dict'])
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if scheduler and 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict'] is not None:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            if scaler and 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None:
+                scaler.load_state_dict(ckpt['scaler_state_dict'])
+            if 'ppl_log' in ckpt:
+                ppl_log = ckpt['ppl_log']
+            if 'diagnostics_log' in ckpt:
+                diagnostics_log = ckpt['diagnostics_log']
+            if 'best_val_loss' in ckpt:
+                best_val_loss = ckpt['best_val_loss']
+            start_iter = ckpt['iter'] + 1
+            print(f"  [{model_name}] Resumed at iter {start_iter} (val_ppl={ckpt.get('val_ppl', '?')})")
 
     # Parse K curriculum schedule
     k_schedule = None
@@ -331,13 +353,13 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
         k_schedule = []
         for segment in args.k_schedule.split(','):
             iter_str, k_str = segment.strip().split(':')
-            start_iter = int(iter_str)
+            start_iter_k = int(iter_str)
             if '-' in k_str:
                 k_lo, k_hi = k_str.split('-')
-                k_schedule.append((start_iter, int(k_lo), int(k_hi)))
+                k_schedule.append((start_iter_k, int(k_lo), int(k_hi)))
             else:
                 k_val = int(k_str)
-                k_schedule.append((start_iter, k_val, k_val))
+                k_schedule.append((start_iter_k, k_val, k_val))
         k_schedule.sort(key=lambda x: x[0])
         print(f"  [{model_name}] K schedule: {args.k_schedule}")
         for start, k_lo, k_hi in k_schedule:
@@ -345,8 +367,15 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
                 print(f"    iter {start}: K={k_hi}")
             else:
                 print(f"    iter {start}: K=random({k_lo},{k_hi})")
+        # On resume, apply the correct K schedule segment
+        if start_iter > 0:
+            for start, k_lo, k_hi in reversed(k_schedule):
+                if start_iter >= start:
+                    model.n_iters = k_hi
+                    model.k_min = k_lo if k_lo != k_hi else 0
+                    break
 
-    pbar = tqdm(range(args.max_iters), desc=model_name)
+    pbar = tqdm(range(start_iter, args.max_iters), desc=model_name, initial=start_iter, total=args.max_iters)
     for it in pbar:
         # Apply K schedule: set model.n_iters (= K) and model.k_min
         if k_schedule and hasattr(model, 'n_iters'):
@@ -361,7 +390,7 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
                             tqdm.write(f"  [{model_name}] iter {it}: K=random({k_lo},{k_hi})")
                     break
         # Eval
-        if it % args.eval_interval == 0 or it == args.max_iters - 1:
+        if it % args.eval_interval == 0 or it == args.max_iters - 1 or it == start_iter:
             losses = estimate_loss(model, train_data, val_data,
                                    args.block_size, args.batch_size, device,
                                    amp_dtype=eval_amp_dtype)
@@ -380,15 +409,21 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
             if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
 
-            # Checkpoint
+            # Checkpoint (rolling — keeps only latest)
             if args.checkpoint_dir:
                 os.makedirs(args.checkpoint_dir, exist_ok=True)
-                path = os.path.join(args.checkpoint_dir, f"{model_name}_iter{it}.pt")
+                path = os.path.join(args.checkpoint_dir, f"{model_name}_latest.pt")
                 torch.save({
                     'iter': it,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'scaler_state_dict': scaler.state_dict() if scaler else None,
                     'val_loss': losses['val'],
+                    'val_ppl': val_ppl,
+                    'best_val_loss': best_val_loss,
+                    'ppl_log': ppl_log,
+                    'diagnostics_log': diagnostics_log,
                 }, path)
 
             # Convergence diagnostics
@@ -526,9 +561,12 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
         os.makedirs(args.checkpoint_dir, exist_ok=True)
         path = os.path.join(args.checkpoint_dir, f"{model_name}_final.pt")
         torch.save({
-            'iter': args.max_iters,
+            'iter': args.max_iters - 1,
             'model_state_dict': model.state_dict(),
             'val_loss': losses['val'],
+            'val_ppl': val_ppl,
+            'ppl_log': ppl_log,
+            'diagnostics_log': diagnostics_log,
         }, path)
 
     return losses['val'], val_ppl, ppl_log, {
@@ -555,8 +593,10 @@ def run_training(args):
         args.n_embed += 1
         print(f"Adjusted n_embed to {args.n_embed} (must be even)")
 
+    import random
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     print(f"Config: n_embed={args.n_embed}, n_layers(iters)={args.n_layers}, "
           f"block_size={args.block_size}, batch_size={args.batch_size}, "
@@ -595,6 +635,8 @@ def run_training(args):
                 extra_kwargs['n_units'] = args.n_units
             if args.window_size > 0:
                 extra_kwargs['window_size'] = args.window_size
+        if args.n_head > 1:
+            extra_kwargs['n_head'] = args.n_head
         model = cls(actual_vocab_size, args.n_embed, args.n_layers,
                     args.block_size, args.dropout, use_softmax=args.softmax,
                     **extra_kwargs)
@@ -682,8 +724,8 @@ def add_training_args(parser):
                         help='Dropout rate')
     parser.add_argument('--eval_interval', type=int, default=500,
                         help='Eval frequency (iterations)')
-    parser.add_argument('--checkpoint_dir', type=str, default='',
-                        help='Checkpoint directory (empty to disable)')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Checkpoint directory for auto-resume (empty to disable)')
     parser.add_argument('--smoke', action='store_true',
                         help='Quick test: 50 iters, small model')
     parser.add_argument('--generate_len', type=int, default=200,
@@ -717,6 +759,10 @@ def add_training_args(parser):
                         help='K curriculum schedule: "iter1:K1,iter2:K2,..." e.g. '
                              '"0:1,50000:2,90000:2-5". Each segment sets K (or K range '
                              'for random sampling) starting at the given iteration.')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU index (0 or 1)')
+    parser.add_argument('--n_head', type=int, default=1,
+                        help='Number of attention heads (1 = single-head, default)')
 
 
 def main():

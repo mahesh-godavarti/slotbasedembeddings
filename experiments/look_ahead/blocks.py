@@ -77,27 +77,39 @@ def apply_inverse_rotation(x, matrix):
 # ---------------------------------------------------------------------------
 
 class RoFormerAttention(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
+        assert n_embed % n_head == 0, f"n_embed ({n_embed}) must be divisible by n_head ({n_head})"
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
         self.values = nn.Linear(n_embed, n_embed)
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
+        self.n_head = n_head
+        self.head_dim = n_embed // n_head
         self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
         B, T, C = x.shape
+        H = self.n_head
+        D = self.head_dim
+
         k = self.keys(x)
         q = self.queries(x)
         v = self.values(x)
 
+        if H > 1:
+            # Reshape to (B, T, H, D) -> (B*H, T, D) for per-head RoPE and attention
+            k = k.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            q = q.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            v = v.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+
         # Fixed RoPE angles: outer(pos, dim), flipped along T
         angle1 = torch.arange(T, device=x.device)
-        angle2 = torch.arange(C // 2, device=x.device)
-        angle = torch.outer(angle1, angle2).unsqueeze(0)  # (1, T, C//2)
+        angle2 = torch.arange(D // 2, device=x.device)
+        angle = torch.outer(angle1, angle2).unsqueeze(0)  # (1, T, D//2)
         angle = torch.flip(angle, dims=(1,))
         matrix = build_rotation_matrix(torch.cos(angle), torch.sin(angle))
 
@@ -105,7 +117,7 @@ class RoFormerAttention(nn.Module):
         q = apply_rotation(q, matrix)
         # V not rotated
 
-        wei = k @ q.transpose(-1, -2) * C ** (-0.5)
+        wei = k @ q.transpose(-1, -2) * D ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         if self.use_softmax:
             wei = F.softmax(wei, dim=-1)
@@ -115,15 +127,19 @@ class RoFormerAttention(nn.Module):
         wei = self.dropout(wei)
         out = wei @ v
 
+        if H > 1:
+            # Reshape back: (B*H, T, D) -> (B, H, T, D) -> (B, T, H, D) -> (B, T, C)
+            out = out.view(B, H, T, D).transpose(1, 2).reshape(B, T, C)
+
         out = self.proj(out)
         out = self.dropout(out)
         return out
 
 
 class RoFormerBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
-        self.sa_head = RoFormerAttention(n_embed, block_size, dropout, use_softmax)
+        self.sa_head = RoFormerAttention(n_embed, block_size, dropout, use_softmax, n_head=n_head)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -139,12 +155,12 @@ class RoFormerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RoFormer(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False, n_head=1, **kwargs):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [RoFormerBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
+            [RoFormerBlock(n_embed, block_size, dropout, use_softmax, n_head=n_head) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -177,25 +193,36 @@ class RoFormer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class JoFormerFixedAttention(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
+        assert n_embed % n_head == 0, f"n_embed ({n_embed}) must be divisible by n_head ({n_head})"
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
         self.values = nn.Linear(n_embed, n_embed)
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
+        self.n_head = n_head
+        self.head_dim = n_embed // n_head
         self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
         B, T, C = x.shape
+        H = self.n_head
+        D = self.head_dim
+
         k = self.keys(x)
         q = self.queries(x)
         v = self.values(x)
 
+        if H > 1:
+            k = k.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            q = q.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            v = v.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+
         angle1 = torch.arange(T, device=x.device)
-        angle2 = torch.arange(C // 2, device=x.device)
+        angle2 = torch.arange(D // 2, device=x.device)
         angle = torch.outer(angle1, angle2).unsqueeze(0)
         angle = torch.flip(angle, dims=(1,))
         matrix = build_rotation_matrix(torch.cos(angle), torch.sin(angle))
@@ -204,7 +231,7 @@ class JoFormerFixedAttention(nn.Module):
         q = apply_rotation(q, matrix)
         v = apply_rotation(v, matrix)
 
-        wei = k @ q.transpose(-1, -2) * C ** (-0.5)
+        wei = k @ q.transpose(-1, -2) * D ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         if self.use_softmax:
             wei = F.softmax(wei, dim=-1)
@@ -216,15 +243,18 @@ class JoFormerFixedAttention(nn.Module):
 
         out = apply_inverse_rotation(out, matrix)
 
+        if H > 1:
+            out = out.view(B, H, T, D).transpose(1, 2).reshape(B, T, C)
+
         out = self.proj(out)
         out = self.dropout(out)
         return out
 
 
 class JoFormerFixedBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
-        self.sa_head = JoFormerFixedAttention(n_embed, block_size, dropout, use_softmax)
+        self.sa_head = JoFormerFixedAttention(n_embed, block_size, dropout, use_softmax, n_head=n_head)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -236,12 +266,12 @@ class JoFormerFixedBlock(nn.Module):
 
 
 class JoFormerFixed(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False, n_head=1, **kwargs):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [JoFormerFixedBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
+            [JoFormerFixedBlock(n_embed, block_size, dropout, use_softmax, n_head=n_head) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -274,23 +304,36 @@ class JoFormerFixed(nn.Module):
 # ---------------------------------------------------------------------------
 
 class JoFormerLearnedAttention(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
+        assert n_embed % n_head == 0, f"n_embed ({n_embed}) must be divisible by n_head ({n_head})"
         self.keys = nn.Linear(n_embed, n_embed)
         self.queries = nn.Linear(n_embed, n_embed)
         self.values = nn.Linear(n_embed, n_embed)
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
         self.n_embed = n_embed
+        self.n_head = n_head
+        self.head_dim = n_embed // n_head
         self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x, angles):
         """x: (B,T,C), angles: (B,T,C//2) — already cumsum'd."""
         B, T, C = x.shape
+        H = self.n_head
+        D = self.head_dim
+
         k = self.keys(x)
         q = self.queries(x)
         v = self.values(x)
+
+        if H > 1:
+            k = k.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            q = q.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            v = v.view(B, T, H, D).transpose(1, 2).reshape(B * H, T, D)
+            # Expand angles for each head: (B, T, C//2) -> per-head (B*H, T, D//2)
+            angles = angles.view(B, T, H, D // 2).transpose(1, 2).reshape(B * H, T, D // 2)
 
         matrix = build_rotation_matrix(torch.cos(angles), torch.sin(angles))
 
@@ -298,7 +341,7 @@ class JoFormerLearnedAttention(nn.Module):
         q = apply_rotation(q, matrix)
         v = apply_rotation(v, matrix)
 
-        wei = k @ q.transpose(-1, -2) * C ** (-0.5)
+        wei = k @ q.transpose(-1, -2) * D ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         if self.use_softmax:
             wei = F.softmax(wei, dim=-1)
@@ -310,15 +353,18 @@ class JoFormerLearnedAttention(nn.Module):
 
         out = apply_inverse_rotation(out, matrix)
 
+        if H > 1:
+            out = out.view(B, H, T, D).transpose(1, 2).reshape(B, T, C)
+
         out = self.proj(out)
         out = self.dropout(out)
         return out
 
 
 class JoFormerLearnedBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
-        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax, n_head=n_head)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -330,14 +376,14 @@ class JoFormerLearnedBlock(nn.Module):
 
 
 class JoFormerLearned(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False, n_head=1, **kwargs):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
         self.angle_embedding_table = nn.Embedding(vocab_size, n_embed // 2)
         self.expander = nn.Linear(n_embed // 2, n_embed)
         self.blocks = nn.ModuleList(
-            [JoFormerLearnedBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
+            [JoFormerLearnedBlock(n_embed, block_size, dropout, use_softmax, n_head=n_head) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -375,9 +421,9 @@ class JoFormerLearned(nn.Module):
 # ---------------------------------------------------------------------------
 
 class JoFormerProjectedBlock(nn.Module):
-    def __init__(self, n_embed, block_size, dropout, use_softmax=False):
+    def __init__(self, n_embed, block_size, dropout, use_softmax=False, n_head=1):
         super().__init__()
-        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax)
+        self.sa_head = JoFormerLearnedAttention(n_embed, block_size, dropout, use_softmax, n_head=n_head)
         self.ffn = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -400,12 +446,12 @@ class JoFormerProjectedBlock(nn.Module):
 
 
 class JoFormerProjected(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, dropout, use_softmax=False, n_head=1, **kwargs):
         super().__init__()
         self.block_size = block_size
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.blocks = nn.ModuleList(
-            [JoFormerProjectedBlock(n_embed, block_size, dropout, use_softmax) for _ in range(n_layers)]
+            [JoFormerProjectedBlock(n_embed, block_size, dropout, use_softmax, n_head=n_head) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)

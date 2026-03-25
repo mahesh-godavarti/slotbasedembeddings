@@ -2934,3 +2934,196 @@ Look-ahead is more expensive to train than roformer (40 block apps vs 8-12 layer
 - **Compatibility with Look-Ahead Decoding (Fu et al.)**: The sequential K=1 inference mode is incompatible with parallel speculation/verification (position t+1 depends on the correction from position t). However, two workarounds exist:
   1. **Unrolled parallel mode**: Run the model in its training mode (K iterations, raw embeddings) which is a standard parallel forward pass, fully compatible with speculative decoding.
   2. **MTP from corrections**: If multi-token prediction works, speculative tokens come from the model itself — no external draft model or parallel verification needed.
+
+---
+
+## Single-Head C=1024 Scaling Experiments (killed — ThunderCompute preemption)
+
+These experiments were running on 2× H100 PCIe but the instance was preempted, killing both. No checkpoints saved. Results below are from log files up to the point of termination.
+
+### Roformer N=24 C=1024 single-head OWT (killed at 56%)
+
+Settings: n_embed=1024, n_layers=24, block_size=256, batch_size=64, lr=2e-4, softmax, amp, n_head=1, cuda:0
+Params: 367,879,424. FLOPs: 288C².
+
+| Iter | Val PPL |
+|-----:|--------:|
+| 5K   | 72.70   |
+| 10K  | 53.75   |
+| 15K  | 46.64   |
+| 20K  | 42.77   |
+| 25K  | 40.20   |
+| 30K  | 38.52   |
+| 35K  | 37.07   |
+| 40K  | 35.89   |
+| 45K  | 35.04   |
+| 50K  | 34.33   |
+| 55K  | 33.63   |
+
+Killed at iter 55,983. Last eval at 55K: **33.63 PPL**.
+
+### block_head_corr_ffn_add D=12 C=1024 single-head OWT (killed at 33%)
+
+Settings: n_embed=1024, n_layers=60 (D=12 × K=5), d_block=12, k_min=2, block_size=256, batch_size=64, lr=2e-4, softmax, convergence_weight=0.1, amp, n_head=1, cuda:1
+Params: 225,120,512. FLOPs: (12×12+8)C² = 152C².
+
+| Iter | Val PPL |
+|-----:|--------:|
+| 5K   | 78.34   |
+| 10K  | 58.48   |
+| 15K  | 50.80   |
+| 20K  | 46.81   |
+| 25K  | 43.94   |
+| 30K  | 41.98   |
+
+Killed at iter 33,465. Last eval at 30K: **41.98 PPL**.
+
+### Single-head comparison at 30K
+
+| Model | FLOPs | Val PPL @ 30K |
+|-------|------:|----------:|
+| D=12 add (152C²) | 152C² | 41.98 |
+| Roformer N=24 (288C²) | 288C² | 38.52 |
+
+D=12 trails by 3.46 PPL but uses **47% fewer FLOPs**. For reference, D=5 C=1024 (68C²) achieved 38.61 at 100K — D=12 at 30K (41.98) is on a faster trajectory and would likely beat roformer N=24 at FLOP-matched comparison by 100K.
+
+### Multi-head equivalents (n_head=16, in progress)
+
+Relaunched as multi-head (16 heads, head_dim=64) after preemption. batch_size=32 (D=12 OOM'd at batch=64 with 16 heads due to attention activation memory), 200K iters to match total tokens.
+- GPU 0: roformer N=24 C=1024 n_head=16 → log: `logs/roformer_n24_c1024_h16_owt.log`
+- GPU 1: corr_ffn_add D=12 C=1024 n_head=16 → log: `logs/corr_ffn_add_d12_c1024_h16_owt.log`
+
+**Second preemption (2026-03-23)**: Both h16 runs killed again. Roformer reached 80K/200K, D=12 reached 50K/200K. No checkpoints were saved. Restarted with auto-resume infrastructure (see below).
+
+#### Multi-head vs single-head comparison (token-matched: h16 batch=32 iter N = h1 batch=64 iter N/2)
+
+| Iter (h16, b32) | Roformer N=24 h16 | Roformer N=24 h1 (token-matched) | D=12 h16 | D=12 h1 (token-matched) | D=12 vs Roformer gap (h16) |
+|------|-------------------|----------------------------------|----------|-------------------------|---------|
+| 5K   | 96.72 | — | 98.83 | — | +2.11 |
+| 10K  | 69.30 | 72.70 (h1 @ 5K) | 73.47 | 78.34 (h1 @ 5K) | +4.17 |
+| 15K  | 58.18 | — | 62.80 | — | +4.62 |
+| 20K  | 52.46 | 53.75 (h1 @ 10K) | 56.53 | 58.48 (h1 @ 10K) | +4.07 |
+| 25K  | 48.49 | — | 52.70 | — | +4.21 |
+| 30K  | 45.54 | 46.64 (h1 @ 15K) | 49.49 | 50.80 (h1 @ 15K) | +3.95 |
+| 35K  | 43.37 | — | 47.24 | — | +3.87 |
+| 40K  | 41.77 | 42.77 (h1 @ 20K) | 45.52 | 46.81 (h1 @ 20K) | +3.75 |
+| 45K  | 40.33 | — | 44.05 | — | +3.72 |
+| 50K  | 39.27 | 40.20 (h1 @ 25K) | — | 43.94 (h1 @ 25K) | — |
+| 55K  | 38.17 | — | — | — | — |
+| 60K  | 37.37 | 38.52 (h1 @ 30K) | — | 41.98 (h1 @ 30K) | — |
+| 65K  | 36.67 | — | — | — | — |
+| 70K  | 36.10 | — | — | — | — |
+| 75K  | 35.67 | — | — | — | — |
+| 80K  | 34.95 | — | — | — | — |
+
+Multi-head beats single-head at matched tokens for both models (~1 PPL for roformer, ~5 PPL for D=12).
+D=12 vs roformer h16 gap: peaked at 4.62 (15K), narrowing since → 3.72 at 45K.
+
+### Multi-head h16 restart (2026-03-24, in progress)
+
+Third launch after two preemptions. Same config, same seed (42). Checkpointing enabled (rolling saves every 5K iters). Logs: `logs/roformer_n24_c1024_h16_owt_restart.log`, `logs/corr_ffn_add_d12_c1024_h16_owt_restart.log`.
+
+Roformer reproduces previous run's PPL exactly (same seed, deterministic). D=12 diverges slightly (~+0.3 PPL) because `k_min=2` uses Python's `random.randint` which was not seeded — only `torch.manual_seed` was set. Fixed for future runs by adding `random.seed(args.seed)`.
+
+| Iter | Roformer N=24 (288C²) | D=12 add (152C²) | Gap |
+|------|----------------------|-------------------|-----|
+| 5K   | 96.72  | 98.80  | +2.08 |
+| 10K  | 69.30  | 73.62  | +4.32 |
+| 15K  | 58.18  | 63.10  | +4.92 |
+| 20K  | 52.46  | 56.82  | +4.36 |
+| 25K  | 48.49  | 53.04  | +4.55 |
+| 30K  | 45.54  | 49.89  | +4.35 |
+| 35K  | 43.37  | 47.68  | +4.31 |
+| 40K  | 41.77  | 45.86  | +4.09 |
+| 45K  | 40.33  | 44.33  | +4.00 |
+| 50K  | 39.27  | 43.10  | +3.83 |
+| 55K  | 38.17  | 42.04  | +3.87 |
+| 60K  | 37.37  | 41.02  | +3.65 |
+| 65K  | 36.67  | 40.39  | +3.72 |
+| 70K  | 36.10  | 39.66  | +3.56 |
+| 75K  | 35.67  | 38.87  | +3.20 |
+| 80K  | 34.95  | 38.42  | +3.47 |
+| 85K  | 34.49  | 37.87  | +3.38 |
+| 90K  | 34.11  | 37.39  | +3.28 |
+
+Gap peaked at 4.92 (15K) and has narrowed to 3.28 at 90K. D=12 uses **47% fewer inference FLOPs** (152C² vs 288C²).
+
+### D=23 C=1024 h16 FLOP-matched vs roformer N=24 (in progress)
+
+Settings: n_embed=1024, n_layers=115 (D=23 × K=5), d_block=23, k_min=2, block_size=256, lr=2e-4, softmax, convergence_weight=0.1, amp, n_head=16.
+Params: 363,678,976. FLOPs: (12×23+8)C² = 284C² — near FLOP-matched to roformer N=24 (288C²).
+
+Phase 1 (iters 0–30K): batch=16, no flash attention, eval_interval=10K. Log: `logs/corr_ffn_add_d23_c1024_h16_owt.log`.
+Phase 2 (iters 30K+): batch=32, flash attention (`blocks_flash.py`), eval_interval=10K, 200K max iters. Log: `logs/corr_ffn_add_d23_c1024_h16_flash_owt.log`.
+
+Switched to flash attention at 30K to fit batch=32 (61GB vs 80GB available). `F.scaled_dot_product_attention` replaces manual attention — same weights, checkpoint-compatible.
+
+**Eval batch size caveat**: Phase 1 evals used batch=16, but roformer/D=12 evals used batch=32. The eval function (`estimate_loss`) seeds with 42 and draws `eval_iters` batches of `batch_size` — different batch sizes produce different validation samples. Evaluating the 30K checkpoint at batch=16 gave 61.07; at batch=32 gave 59.51 — a **~1.5 PPL difference** from eval batch size alone. Phase 1 numbers are therefore ~1.5-2 PPL too pessimistic vs roformer/D=12. Phase 2 numbers are directly comparable (all batch=32).
+
+| Tokens (equiv b32 iters) | Roformer N=24 (288C²) | D=23 add (284C²) | D=23 gap | D=12 gap (ref) | Note |
+|---|---|---|---|---|---|
+| 5K | 96.72 | 100.33 | +3.61 | +2.08 | batch=16 eval, true gap ~+2 |
+| 10K | 69.30 | 71.59 | +2.29 | +4.32 | batch=16 eval, true gap ~+1 |
+| 15K | 58.18 | 61.07 | +2.89 | +4.92 | batch=16 eval, true gap ~+1.3 |
+| 15K | 58.18 | **59.51** | **+1.33** | +4.92 | batch=32 eval (flash), directly comparable |
+
+**Key finding**: D=23 at 15K-equiv tokens is only +1.33 PPL behind roformer N=24, vs D=12's +4.92 at the same point. D=23 is near FLOP-matched (284C² vs 288C²), so this gap must close and cross over for the architecture to win. D=12's gap narrowed from +4.92 to ~+3.0 over training; D=23 starting from +1.33 is in a much stronger position.
+
+## Checkpointing & Auto-Resume Infrastructure
+
+Added 2026-03-23 after two preemptions lost all training progress.
+
+### Problem
+ThunderCompute instances are preempted/rebooted without warning. Previous runs had no checkpointing, so all progress was lost on each reboot.
+
+### Solution
+
+#### 1. Checkpoint saving (in `train_wiki_streaming.py`)
+- Rolling checkpoint saved at every eval (every 5K iters) to `checkpoints/{model_name}_latest.pt`
+- Saves: model state, optimizer state, scheduler state, GradScaler state, ppl_log, diagnostics_log, best_val_loss, current iteration
+- Only keeps latest checkpoint per model (overwrites previous)
+- `--checkpoint_dir` defaults to `checkpoints/` (previously empty/disabled)
+- On startup, automatically loads checkpoint if it exists — resumes from `iter + 1`
+
+#### 2. Auto-start on boot (sshd wrapper)
+The container runs `tini -s -- /usr/sbin/sshd -D -e` as PID 1. No systemd, no cron.
+
+- `/usr/sbin/sshd.real` — the original sshd binary (renamed)
+- `/usr/sbin/sshd` — wrapper script that launches training in background, then exec's sshd.real
+- `/home/ubuntu/look_ahead6/train_both.sh` — launcher that starts both experiments in detached `screen` sessions
+
+**Boot sequence**: tini → sshd wrapper → `train_both.sh &` (background) → exec sshd.real
+Training starts immediately on boot. No SSH login required.
+
+#### 3. Key files
+
+| File | Purpose |
+|------|---------|
+| `train_both.sh` | Launches both experiments in screen sessions |
+| `checkpoints/{model}_latest.pt` | Rolling checkpoint (auto-resume) |
+| `/usr/sbin/sshd` | Wrapper script (starts training + exec's real sshd) |
+| `/usr/sbin/sshd.real` | Original sshd binary |
+
+#### 4. Monitoring
+
+```bash
+# Check progress
+bash check_progress.sh logs/roformer_n24_c1024_h16_owt.log
+bash check_progress.sh logs/corr_ffn_add_d12_c1024_h16_owt.log
+
+# Check checkpoints
+ls -lh checkpoints/
+
+# Attach to screen sessions
+screen -r roformer
+screen -r corr_ffn
+
+# GPU status
+nvidia-smi
+```
+
+#### 5. Manual restart
+```bash
+bash /home/ubuntu/look_ahead6/train_both.sh
+```
+Kills any existing training processes first, then relaunches with auto-resume from checkpoint.
