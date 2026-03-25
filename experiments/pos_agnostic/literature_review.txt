@@ -1,0 +1,424 @@
+LITERATURE REVIEW: Position Encoding in Early Layers, Removal in Late Layers
+==============================================================================
+Date: 2026-03-21
+
+Core idea: Using positional encodings (like RoPE) in early transformer layers
+but removing them in late layers, to improve length generalization/extrapolation.
+
+==============================================================================
+MOST DIRECTLY RELEVANT PAPERS
+==============================================================================
+
+1. "Rope to Nope and Back Again: A New Hybrid Attention Strategy"
+   Authors: Bowen Yang, Bharat Venkitesh, Dwarak Talupuru, Hangyu Lin,
+            David Cairuz, Phil Blunsom, Acyr Locatelli (Cohere)
+   Date: January 2025 (arXiv: 2501.18795)
+   Venue: arXiv preprint
+   URL: https://arxiv.org/abs/2501.18795
+
+   THIS IS THE CLOSEST PAPER TO THE IDEA. It proposes interleaving RoPE and
+   NoPE (no positional encoding) layers in a transformer. Key findings:
+   - NoPE layers naturally specialize in information RETRIEVAL (content-based)
+   - RoPE layers naturally specialize in LOCAL CONTEXT modeling (positional)
+   - A "division of labor" emerges spontaneously during training
+   - NoPE layers use global attention; RoPE layers use sliding window attention
+   - Surpasses SOTA extrapolation-based RoPE models by a large margin
+   - Trained up to 5T tokens; tested from 8K to 256K context
+   - Retrieval score: 96.1 at 8K, 74.8 at 256K (vs sharper fall for pure RoPE)
+
+   ARCHITECTURE DETAILS (from full paper):
+   - Called "RNoPE-SWA"
+   - 1:3 ratio: 1 NoPE full-attention layer followed by 3 RoPE sliding-window layers
+   - RoPE layers use sliding window = 4096
+   - NoPE layers use full attention (global reach)
+   - 8B params, 32 layers, trained on 5T tokens
+   - The full-attention NoPE layer is placed at the END of each group of 4
+   - Pattern: [RoPE-SWA, RoPE-SWA, RoPE-SWA, NoPE-full] x 8
+
+   RESULTS:
+   - MMLU +2.0%, GSM8k +1.8% over full-RoPE baseline
+   - 256K context: Needles score 9.97 vs baseline 8.25
+   - Retrieval degradation (8K->256K): only 22% drop vs 41% drop for baseline
+
+   KEY DIFFERENCE FROM OUR PROPOSAL:
+   - They INTERLEAVE uniformly: [RoPE-SWA, RoPE-SWA, RoPE-SWA, NoPE-full] x 8
+   - We propose FRONT-LOADING RoPE, BACK-LOADING NoPE: [RoPE-SWA x K, NoPE-full x (L-K)]
+   - Their interleaved pattern gives every "neighborhood" of layers both local
+     and global access. Our proposal concentrates all global access in final layers.
+   - Possible framing: "asymmetric split works as well or better than interleaving,
+     and is simpler" — OR need a different angle entirely.
+
+2. "DroPE: Extending the Context of Pretrained LLMs by Dropping their
+    Positional Embeddings"
+   Authors: Yoav Gelberg, Koshi Eguchi, Takuya Akiba, Edoardo Cetin (Sakana AI)
+   Date: December 2025 (arXiv: 2512.12167)
+   URL: https://arxiv.org/abs/2512.12167
+
+   Drops ALL positional embeddings after pretraining + short recalibration.
+   Key insight: positional embeddings are "scaffolding" -- needed for training
+   but removable afterward. Far outperforms RoPE scaling methods for context
+   extension. Validated on models up to 7B parameters.
+
+3. "Why Are Positional Encodings Nonessential for Deep Autoregressive
+    Transformers? Revisiting a Petroglyph"
+   Authors: Kazuki Irie
+   Date: January 2025 (arXiv: 2501.00659)
+   Venue: ACL 2025 Findings
+   URL: https://arxiv.org/abs/2501.00659
+
+   Proves theoretically that deep autoregressive Transformers (>1 layer) can
+   distinguish sequences with permuted tokens WITHOUT positional encodings,
+   because causal attention creates different contexts at each position.
+   This directly supports the idea that late layers don't need PE.
+
+4. "Deconstructing Positional Information: From Attention Logits to Training
+    Biases" / "Unpacking Positional Encoding in Transformers: A Spectral
+    Analysis of Content-Position Coupling"
+   Authors: Multiple (arXiv: 2505.13027)
+   Date: May 2025
+   URL: https://arxiv.org/abs/2505.13027
+
+   Key findings via head-wise ablation:
+   - RoPE creates a "single-head deposit pattern" in EARLY layers
+   - Nearly ALL positional processing concentrates into ONE head in shallow layers
+   - Ablating that single shallow-layer head causes pronounced accuracy loss
+   - All remaining heads across deeper layers have negligible positional impact
+   - RoPE outperforms on position-sensitive tasks but UNDERPERFORMS on
+     position-agnostic tasks
+   - Tested "partial RoPE": applying RoPE to some heads, NoPE to others
+
+5. "Decoupling Positional and Symbolic Attention Behavior in Transformers"
+   Authors: (arXiv: 2511.11579)
+   Date: October 2025
+   URL: https://arxiv.org/abs/2511.11579
+
+   Proves that positional and symbolic attention behaviors are MUTUALLY EXCLUSIVE.
+   All heads show strong correspondence between behavior and RoPE frequency use.
+   Performance can be controlled by controlling which frequencies heads access.
+
+6. "Fractional Rotation, Full Potential? Investigating Performance and
+    Convergence of Partial RoPE"
+   Authors: M.A. Khan, K.P. Gummadi, M. Gupta, A. Ravichander (MPI, Microsoft)
+   Date: March 2026 (arXiv: 2603.11611)
+   URL: https://arxiv.org/abs/2603.11611
+
+   Systematic study: applying RoPE to only ~10% of dimensions achieves
+   convergence comparable to full RoPE, with up to 10x memory savings.
+   Consistent across model sizes, sequence lengths, and datasets.
+
+==============================================================================
+NoPE (NO POSITION ENCODING) PAPERS
+==============================================================================
+
+7. "Transformer Language Models without Positional Encodings Still Learn
+    Positional Information"
+   Authors: Adi Haviv, Ori Ram, Ofir Press, Peter Izsak, Omer Levy
+   Date: 2022 (arXiv: 2203.16634)
+   Venue: EMNLP 2022 Findings
+   URL: https://arxiv.org/abs/2203.16634
+
+   First major paper showing NoPE transformers are competitive. They learn
+   implicit absolute positions through causal attention (counting predecessors).
+
+8. "The Impact of Positional Encoding on Length Generalization in Transformers"
+   Authors: Amirhossein Kazemnejad et al. (McGill NLP)
+   Date: 2023 (arXiv: 2305.19466)
+   Venue: NeurIPS 2023
+   URL: https://arxiv.org/abs/2305.19466
+
+   NoPE outperforms all explicit PE methods (ALiBi, RoPE, APE) for length
+   generalization. NoPE can represent both absolute and relative PEs.
+   SGD-trained NoPE mostly resembles T5's Relative PE patterns.
+
+9. "Length Generalization of Causal Transformers without Position Encoding"
+   Authors: Wang et al.
+   Date: 2024 (arXiv: 2404.12224)
+   Venue: ACL 2024 Findings
+   URL: https://arxiv.org/abs/2404.12224
+
+   Temperature tuning of attention heads substantially expands NoPE's context.
+   Connects NoPE's generalization failure to attention distribution distraction.
+
+10. "Position Information Emerges in Causal Transformers Without Positional
+     Encodings via Similarity of Nearby Embeddings"
+    Authors: Chunsheng Zuo, Pavel Guerzhoy, Michael Guerzhoy
+    Date: December 2024 (arXiv: 2501.00073)
+    Venue: COLING 2025
+    URL: https://arxiv.org/abs/2501.00073
+
+    Shows position info emerges because nearby embeddings are more similar,
+    even in randomly initialized models with causal attention.
+
+==============================================================================
+LAYER-WISE ANALYSIS AND DEPTH STUDIES
+==============================================================================
+
+11. "Layer-wise Positional Bias in Short-Context Language Modeling"
+    Authors: Maryam Rahimi et al.
+    Date: January 2026 (arXiv: 2601.04098)
+    URL: https://arxiv.org/abs/2601.04098
+
+    Uses attribution-based framework to analyze positional effects per layer:
+    - Recency bias INCREASES with depth (later layers more position-focused)
+    - Primacy bias DIMINISHES with depth
+    - Early layers weight content words over function words
+    - Later layers LOSE word-type differentiation
+    - Profiles are architecture-specific and stable across inputs
+
+12. "Transformer Layers as Painters"
+    Authors: (arXiv: 2407.09298)
+    Date: July 2024
+    Venue: AAAI 2025
+    URL: https://arxiv.org/abs/2407.09298
+
+    Layer specialization study:
+    - Lower layers: establish local/semantic primitives (SPECIALIZED)
+    - Middle layers: iterate/refine global context (REDUNDANT, uniform)
+    - Final layers: targeted corrections, output assembly (SPECIALIZED)
+    - Lower and final layers are non-redundant; removal is catastrophic
+
+13. "Round and Round We Go! What makes Rotary Positional Encodings useful?"
+    Authors: (arXiv: 2410.06205)
+    Date: October 2024
+    Venue: ICLR 2025
+    URL: https://arxiv.org/abs/2410.06205
+
+    - First and last layers use HIGH frequencies of RoPE most
+    - Middle layers prefer LOW frequencies
+    - Low frequencies = semantic attention (distance-invariant)
+    - High frequencies = positional attention (position-selective)
+    - p-RoPE: removing lowest frequencies improves Gemma 2B performance
+    - Removing low-freq RoPE creates robust semantic channels
+
+14. "How Do LLMs Use Their Depth?"
+    Authors: (OpenReview)
+    URL: https://openreview.net/forum?id=Xpd6ZYm4js
+
+    - Early layers: high-frequency token predictions (statistical guesses)
+    - Middle layers: refine via contextual information
+    - Final layers: targeted corrections
+    - First wordpieces need more depth than suffixes
+
+==============================================================================
+HYBRID LOCAL/GLOBAL ATTENTION ARCHITECTURES
+==============================================================================
+
+15. Gemma 2 (Google, 2024)
+    URL: https://arxiv.org/abs/2408.00118
+
+    Alternates sliding window (local, 4096 tokens) and full (global, 8192
+    tokens) attention in every other layer. Pioneered the modern
+    local-global alternating pattern in production LLMs.
+
+16. Gemma 3 (Google, 2025)
+    URL: https://arxiv.org/abs/2503.19786
+
+    5:1 pattern: 5 local layers (sliding window 1024) + 1 global layer.
+    Different RoPE base frequencies: 10K for local, 1M for global.
+    Cuts attention compute by ~5x, KV cache from ~60% to ~15%.
+
+17. Longformer: The Long-Document Transformer
+    Authors: Beltagy, Peters, Cohan (Allen AI)
+    Date: 2020 (arXiv: 2004.05150)
+    URL: https://arxiv.org/abs/2004.05150
+
+    Local windowed attention + global attention to pre-selected tokens.
+    Smaller windows for lower layers, increasing windows for higher layers.
+    Dilated sliding windows in lower layers, increasing dilation in higher.
+
+18. Long-Short Transformer: Efficient Transformers for Language and Vision
+    Authors: Chen Zhu et al. (NVIDIA)
+    Date: 2021 (arXiv: 2107.02192)
+    URL: https://arxiv.org/abs/2107.02192
+
+    Each query attends to union of local window keys and global low-rank
+    projected keys. Introduces DualLN to align scales between sparse and
+    low-rank embeddings. 2x speed, 3x longer sequences.
+
+19. Big Bird: Transformers for Longer Sequences
+    Authors: Zaheer et al. (Google)
+    Date: 2020 (arXiv: 2007.14062)
+    URL: https://arxiv.org/abs/2007.14062
+
+    Combines sliding window + global tokens + random connections.
+    Reduces quadratic to linear complexity. 8x longer sequences.
+
+20. Mistral 7B
+    URL: https://mistral.ai/news/announcing-mistral-7b
+
+    All layers use sliding window attention (window=4096). Higher layers
+    access longer effective context due to stacking. Theoretical 128K span.
+
+==============================================================================
+HYBRID SSM-ATTENTION ARCHITECTURES (ANALOGOUS DESIGN PRINCIPLE)
+==============================================================================
+
+21. Jamba: A Hybrid Transformer-Mamba Language Model
+    Authors: AI21 Labs
+    Date: March 2024 (arXiv: 2403.19887)
+    Venue: ICLR 2025
+    URL: https://arxiv.org/abs/2403.19887
+
+    Interleaves Transformer and Mamba layers at 1:7 ratio.
+    Analogous to local-global: Mamba for efficient sequential processing,
+    attention for powerful global reasoning.
+
+22. Samba: Simple Hybrid State Space Models
+    Authors: Microsoft Research
+    Date: June 2024 (arXiv: 2406.07522)
+    Venue: ICLR 2025
+    URL: https://arxiv.org/abs/2406.07522
+
+    Layer-wise interleaving of Mamba + Sliding Window Attention + MLP.
+    Mamba = recurrent structure, SWA = precise memory retrieval.
+    Extrapolates from 4K to 256K with perfect recall.
+
+==============================================================================
+RoPE FREQUENCY AND CONTEXT EXTENSION
+==============================================================================
+
+23. YaRN: Efficient Context Window Extension
+    Authors: Peng et al.
+    Date: September 2023 (arXiv: 2309.00071)
+    Venue: ICLR 2024
+    URL: https://arxiv.org/abs/2309.00071
+
+    Frequency-aware scaling: interpolate high frequencies (local patterns),
+    extrapolate low frequencies (global patterns). Different treatment for
+    different RoPE dimensions, analogous to treating position info differently.
+
+24. "Decoupling the 'What' and 'Where' With Polar Coordinate Positional
+     Embeddings" (PoPE)
+    Authors: IDSIA, OpenAI, U. Colorado
+    Date: September 2025 (arXiv: 2509.10534)
+    URL: https://arxiv.org/abs/2509.10534
+
+    Shows RoPE entangles content ("what") and position ("where") information.
+    PoPE decouples them via polar coordinates. Outperforms RoPE on perplexity
+    and downstream tasks across 124M-774M scales.
+
+25. DAPE: Data-Adaptive Positional Encoding for Length Extrapolation
+    Date: 2024 (arXiv: 2405.14722)
+    Venue: NeurIPS 2024
+    URL: https://arxiv.org/abs/2405.14722
+
+    Dynamically adjusts PE based on semantic information and position.
+    Trained on length 128, performs well at length 8192.
+
+26. FIRE: Functional Interpolation for Relative Position Encoding
+    Authors: CMU, Google
+    Date: 2023 (arXiv: 2310.04418)
+    Venue: ICLR 2024
+    URL: https://arxiv.org/abs/2310.04418
+
+    Learnable relative PE with progressive interpolation for length
+    generalization. Can represent T5 RPE, ALiBi, and Kerple.
+
+==============================================================================
+SPARSE ATTENTION AND EFFICIENCY
+==============================================================================
+
+27. Native Sparse Attention (NSA)
+    Authors: DeepSeek-AI, Peking University
+    Date: February 2025 (arXiv: 2502.11089)
+    Venue: ACL 2025
+    URL: https://arxiv.org/abs/2502.11089
+
+    Three parallel branches: global compression, local sliding window,
+    fine-grained selective -- combined with learned gating.
+
+28. "Optimizing NSA with Latent Attention and Local-Global Alternating"
+    Date: November 2025 (arXiv: 2511.00819)
+    URL: https://arxiv.org/abs/2511.00819
+
+    Alternating local and global attention across layers improves
+    long-range dependency propagation. 50% KV-cache reduction.
+
+29. "The Sparse Frontier: Sparse Attention Trade-offs in Transformer LLMs"
+    Authors: Nawrot et al.
+    Date: 2025 (arXiv: 2504.17768)
+    URL: https://arxiv.org/abs/2504.17768
+
+    Comprehensive evaluation of sparse attention methods.
+    Larger sparse > smaller dense at equivalent cost.
+
+30. SWAA: Sliding Window Attention Adaptation
+    Date: December 2025 (arXiv: 2512.10411)
+    URL: https://arxiv.org/abs/2512.10411
+
+    Adapts full-attention models to SWA post-training.
+    Strategy 3: interleaving FA/SWA layers.
+    30-100% inference speedup with acceptable quality loss.
+
+31. DeepSeek-V3 Multi-Head Latent Attention (MLA)
+    Date: December 2024 (arXiv: 2412.19437)
+    URL: https://arxiv.org/abs/2412.19437
+
+    Decoupled RoPE: splits Q/K into content (NoPE) and positional (RoPE)
+    components. Content from compression-decompression, position from
+    separate projections. Explicit what/where separation within each layer.
+
+==============================================================================
+OTHER RELEVANT WORKS
+==============================================================================
+
+32. SeqPE: Transformer with Sequential Position Encoding
+    Date: June 2025 (arXiv: 2506.13277)
+    URL: https://arxiv.org/abs/2506.13277
+
+    Learnable PE framework using sequential encoder. Surpasses RoPE/ALiBi
+    baselines on length extrapolation.
+
+33. "Attention Sinks" Research
+    - StreamingLLM (ICLR 2024)
+    - "When Attention Sink Emerges" (ICLR 2025, arXiv: 2410.10781)
+
+    Attention sinks (disproportionate attention to first tokens) emerge from
+    softmax normalization, not positional encoding. Relevant because sinks
+    are position-dependent artifacts that interact with PE design.
+
+34. GPT-J / GPT-NeoX / Pythia (EleutherAI, 2021-2023)
+
+    Original partial RoPE: apply RoPE to only 25% of head dimensions,
+    leaving 75% as NoPE. Early practical hybrid within each layer.
+
+35. "Sliding Window Attention Training for Efficient Large Language Models"
+    (SWAT)
+    Date: February 2025 (arXiv: 2502.18845)
+    URL: https://arxiv.org/abs/2502.18845
+
+    Replaces softmax with sigmoid + balanced ALiBi/RoPE.
+    Short and long sequence attention as distinct learning paradigms.
+
+==============================================================================
+SUMMARY OF KEY TAKEAWAYS
+==============================================================================
+
+The idea of "RoPE in early layers, no PE in late layers" is WELL-SUPPORTED
+by the literature, and the most directly relevant prior work is:
+
+1. "Rope to Nope and Back Again" (2025) -- EXACTLY this idea, with
+   interleaved RoPE (local/sliding window) and NoPE (global) layers.
+   Shows spontaneous division of labor.
+
+2. The spectral analysis papers (2505.13027, 2410.06205) provide the
+   theoretical backing: positional computation concentrates in early-layer
+   heads, while late layers are more semantic/content-focused.
+
+3. DroPE (2025) shows PE can be entirely removed post-training, suggesting
+   late-layer PE is redundant even during inference.
+
+4. Gemma 2/3, Longformer, etc. demonstrate that mixed local/global attention
+   across layers is a production-validated design pattern.
+
+5. Partial RoPE (GPT-J, 2603.11611) shows only 10-25% of dimensions need
+   PE rotation, supporting the idea that most computation is position-free.
+
+6. "Why Are PE Nonessential" (2501.00659) provides the theoretical proof
+   that deep autoregressive transformers don't inherently need PE.
+
+The gap in the literature: most papers either (a) interleave RoPE/NoPE
+uniformly, or (b) study which layers use PE more. Few papers specifically
+propose "RoPE in ONLY early layers, NoPE in ONLY late layers" as a
+deliberate asymmetric design. The "Rope to Nope" paper comes closest but
+uses alternating (interleaved) patterns rather than a clean early/late split.
