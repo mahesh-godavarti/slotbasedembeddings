@@ -146,7 +146,22 @@ def eval_lengths(model, val_data, lengths, batch_size, device, eval_iters=10):
 
 def train_model(model_name, model, train_data, val_data, args, device):
     """Train one model, return results."""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
+    angle_lr = getattr(args, 'angle_lr', 0)
+    angle_lr_warmup = getattr(args, 'angle_lr_warmup', 0)
+    if angle_lr > 0 and hasattr(model, 'angle_params') and model.angle_params():
+        # Start with angle lr = 0 during warmup, switch to angle_lr after
+        initial_angle_lr = 0.0 if angle_lr_warmup > 0 else angle_lr
+        param_groups = [
+            {'params': model.non_angle_params(), 'lr': args.lr},
+            {'params': model.angle_params(), 'lr': initial_angle_lr},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.1)
+        print(f"Using separate angle lr: {angle_lr} (main lr: {args.lr})")
+        if angle_lr_warmup > 0:
+            print(f"Angle lr warmup: frozen for first {angle_lr_warmup} iters")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
+        angle_lr_warmup = 0
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters)
                  if args.cosine_decay else None)
 
@@ -217,6 +232,11 @@ def train_model(model_name, model, train_data, val_data, args, device):
             parts = [f"{l}:{r['ppl']}" for l, r in sorted(results.items())
                      if r.get('ppl') is not None]
             tqdm.write(f"  [{model_name}] extrap iter {it}: {', '.join(parts)}")
+
+        # --- Angle lr warmup: switch on angle lr after warmup iters ---
+        if angle_lr_warmup > 0 and it == angle_lr_warmup:
+            optimizer.param_groups[1]['lr'] = angle_lr
+            tqdm.write(f"  [{model_name}] iter {it}: angle lr switched on to {angle_lr}")
 
         # --- Train step ---
         x, y = get_batch(train_data, args.block_size, args.batch_size, device)
@@ -312,6 +332,12 @@ def main():
                         help='At eval, use top-k attention over full history (0=disabled, use window)')
     parser.add_argument('--bf16', action='store_true',
                         help='Use BF16 mixed precision training')
+    parser.add_argument('--angle_lr', type=float, default=0,
+                        help='Separate learning rate for angle parameters (0=use main lr)')
+    parser.add_argument('--angle_lr_warmup', type=int, default=0,
+                        help='Keep angle lr at 0 for this many iters before switching on')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU device index (default: 0)')
     parser.add_argument('--smoke', action='store_true',
                         help='Quick test: small model, few iters')
 
@@ -331,7 +357,19 @@ def main():
         args.window_size = 32
 
     torch.manual_seed(args.seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = f'cuda:{args.gpu}'
+        torch.cuda.set_device(args.gpu)
+    else:
+        device = 'cpu'
+
+    # A100 / Ampere+ speedups
+    if device == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
+        print("Enabled TF32 matmul, cudnn TF32, cudnn benchmark")
 
     # Load data
     print(f"Loading data from {args.data_dir}...")
@@ -353,9 +391,11 @@ def main():
     all_results = {}
     for model_name in args.models:
         torch.manual_seed(args.seed)
+        split_angles = getattr(args, 'angle_lr', 0) > 0
         model = GPTModel(vocab_size, args.n_embed, args.n_layers, args.n_heads,
                          args.block_size, args.dropout, attn_config=model_name,
-                         window_size=args.window_size, use_softplus=args.softplus)
+                         window_size=args.window_size, use_softplus=args.softplus,
+                         split_angles=split_angles)
         result = train_model(model_name, model, train_data, val_data, args, device)
         all_results[model_name] = result
 

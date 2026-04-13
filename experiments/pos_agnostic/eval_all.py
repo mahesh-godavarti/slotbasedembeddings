@@ -104,14 +104,20 @@ def detect_attn_config(cfg):
     return attn_config
 
 
-def detect_n_embed(cfg):
+def detect_n_embed(cfg, state_dict=None):
     """Detect the correct n_embed for model construction.
 
-    For datadep2/joformer2 models, the checkpoint saves n_embed as the
-    embedding dimension (C + C//2), but we need the content dimension C.
+    For split_angles v2 models, n_embed is already the content dim.
+    For legacy (non-split) v2 models, n_embed is C + C//2 and we recover C.
     """
     attn_config = cfg['attn_config']
     n_embed = cfg['n_embed']
+
+    # split_angles: tok_emb and angle_emb are separate, n_embed is content dim
+    # NOTE: this trusts cfg['n_embed']. A more robust alternative:
+    #   n_embed = state_dict['tok_emb.weight'].shape[1]
+    if state_dict is not None and 'angle_emb.weight' in state_dict:
+        return n_embed
 
     # Check if this is a v2 model (has larger embedding)
     is_v2 = False
@@ -143,13 +149,15 @@ def eval_checkpoint(checkpoint_path, val_data, eval_lengths, batch_size=4,
     cfg = ckpt['config']
 
     attn_config = detect_attn_config(cfg)
-    n_embed = detect_n_embed(cfg)
+    sd = ckpt['model_state_dict']
+    n_embed = detect_n_embed(cfg, sd)
     window_size = cfg.get('window_size', 32)
+    split_angles = 'angle_emb.weight' in sd
 
     model = GPTModel(
         cfg['vocab_size'], n_embed, cfg['n_layers'], cfg['n_heads'],
         cfg['block_size'], dropout=0.0, attn_config=attn_config,
-        window_size=window_size,
+        window_size=window_size, split_angles=split_angles,
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)
@@ -211,9 +219,15 @@ def main():
                         help='Comma-separated eval lengths')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Eval batch size')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU device index (default: 0)')
     args = parser.parse_args()
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = f'cuda:{args.gpu}'
+        torch.cuda.set_device(args.gpu)
+    else:
+        device = 'cpu'
     eval_lengths = [int(x) for x in args.eval_lengths.split(',')]
 
     # Load data

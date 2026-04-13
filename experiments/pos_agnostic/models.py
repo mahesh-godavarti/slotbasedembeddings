@@ -414,19 +414,33 @@ class DataDep2Attention(nn.Module):
 
 
 class FeedForwardWithAngles(nn.Module):
-    """FFN that outputs C content dims + C//2 angle dims."""
+    """FFN that outputs C content dims + C//2 angle dims.
 
-    def __init__(self, n_embed, dropout):
+    split_angles=True uses separate projections for content and angles
+    (allows separate lr). split_angles=False uses a single fc2 (legacy).
+    """
+
+    def __init__(self, n_embed, dropout, split_angles=False):
         super().__init__()
         self.n_embed = n_embed
+        self.split_angles = split_angles
         self.fc1 = nn.Linear(n_embed, 4 * n_embed)
-        self.fc2 = nn.Linear(4 * n_embed, n_embed + n_embed // 2)
+        if split_angles:
+            self.fc2_content = nn.Linear(4 * n_embed, n_embed)
+            self.fc2_angles = nn.Linear(4 * n_embed, n_embed // 2)
+        else:
+            self.fc2 = nn.Linear(4 * n_embed, n_embed + n_embed // 2)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = self.dropout(self.fc2(F.gelu(self.fc1(x))))
-        content = out[..., :self.n_embed]
-        angles = out[..., self.n_embed:]
+        h = F.gelu(self.fc1(x))
+        if self.split_angles:
+            content = self.dropout(self.fc2_content(h))
+            angles = torch.tanh(self.fc2_angles(h)) * math.pi
+        else:
+            out = self.dropout(self.fc2(h))
+            content = out[..., :self.n_embed]
+            angles = torch.tanh(out[..., self.n_embed:]) * math.pi
         return content, angles
 
 
@@ -434,17 +448,20 @@ class DataDep2Block(nn.Module):
     """Transformer block for datadep2: receives angles, produces new angles."""
 
     def __init__(self, n_embed, n_heads, dropout, window_size=256,
-                 use_softplus=False, use_cumsum=False, rotate_v=False):
+                 use_softplus=False, use_cumsum=False, rotate_v=False,
+                 split_angles=False):
         super().__init__()
         self.attn = DataDep2Attention(n_embed, n_heads, dropout, window_size,
                                       use_softplus, use_cumsum, rotate_v)
-        self.ffn = FeedForwardWithAngles(n_embed, dropout)
+        self.ffn = FeedForwardWithAngles(n_embed, dropout, split_angles=split_angles)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
 
-    def forward(self, x, angles):
+    def forward(self, x, angles, rope_base=None):
         x = x + self.attn(self.ln1(x), angles)
         content, new_angles = self.ffn(self.ln2(x))
+        if rope_base is not None:
+            new_angles = new_angles + rope_base
         x = x + content
         return x, new_angles
 
@@ -530,18 +547,35 @@ class GPTModel(nn.Module):
     """
 
     def __init__(self, vocab_size, n_embed, n_layers, n_heads, block_size,
-                 dropout, attn_config='rope', window_size=256, use_softplus=False):
+                 dropout, attn_config='rope', window_size=256, use_softplus=False,
+                 split_angles=False):
         super().__init__()
         self.block_size = block_size
         self.window_size = window_size
         self.use_softplus = use_softplus
+        self.split_angles = split_angles
         self.is_datadep2 = isinstance(attn_config, str) and (
             attn_config.startswith('datadep2') or attn_config.startswith('monoidal2')
             or attn_config.startswith('joformer2'))
 
         if self.is_datadep2:
-            # v2 angle flow: embedding outputs C + C//2, angles flow through network
-            self.tok_emb = nn.Embedding(vocab_size, n_embed + n_embed // 2)
+            if split_angles:
+                # Separate content and angle embeddings (allows separate lr)
+                self.tok_emb = nn.Embedding(vocab_size, n_embed)
+                self.angle_emb = nn.Embedding(vocab_size, n_embed // 2)
+                # RoPE-equivalent base angles: constant vector added at every position
+                # Cumsum is flip-cumsum-flip (suffix sum), giving (T-t)*δ at position t.
+                # Negate δ so we get (t-T)*δ, which has the same relative differences
+                # as RoPE's t*δ (just shifted by a global constant T*δ, which cancels
+                # in Q·K because both Q and K get the same shift).
+                head_dim = n_embed // n_heads
+                freqs = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+                # Negate so suffix-sum matches RoPE direction
+                rope_base = -freqs.repeat(n_heads)
+                self.register_buffer('rope_base_angles', rope_base)
+            else:
+                # Legacy: single combined embedding
+                self.tok_emb = nn.Embedding(vocab_size, n_embed + n_embed // 2)
             self.n_embed = n_embed
 
             # Determine cumsum and rotate_v from config name
@@ -551,7 +585,8 @@ class GPTModel(nn.Module):
 
             def _make_v2_block(ws):
                 return DataDep2Block(n_embed, n_heads, dropout, ws,
-                                     use_softplus, use_cumsum, rotate_v)
+                                     use_softplus, use_cumsum, rotate_v,
+                                     split_angles=split_angles)
 
             if '_hybrid_' in attn_config:
                 # v2 windowed early + NoPE full late
@@ -663,6 +698,27 @@ class GPTModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
+        # Zero-init angle parameters so model starts with identity rotations
+        if self.is_datadep2 and split_angles:
+            with torch.no_grad():
+                for p in self.angle_params():
+                    p.zero_()
+
+    def angle_params(self):
+        """Return parameters that produce rotation angles (for separate lr)."""
+        if not self.is_datadep2 or not self.split_angles:
+            return []
+        params = list(self.angle_emb.parameters())
+        for block in self.blocks:
+            if isinstance(block, DataDep2Block) and block.ffn.split_angles:
+                params.extend(block.ffn.fc2_angles.parameters())
+        return params
+
+    def non_angle_params(self):
+        """Return all parameters except angle-producing ones."""
+        angle_param_ids = {id(p) for p in self.angle_params()}
+        return [p for p in self.parameters() if id(p) not in angle_param_ids]
+
     def set_eval_topk(self, topk):
         """Set top-k attention for eval mode on all layers."""
         for block in self.blocks:
@@ -672,13 +728,19 @@ class GPTModel(nn.Module):
 
     def forward(self, idx, targets=None):
         if self.is_datadep2:
-            emb = self.tok_emb(idx)  # (B, T, C + C//2)
-            C = self.n_embed
-            x = emb[..., :C]          # content
-            angles = emb[..., C:]      # initial angles (C//2)
+            if self.split_angles:
+                x = self.tok_emb(idx)          # (B, T, C)
+                # Learned deviation (zero-init) + constant RoPE base
+                angles = torch.tanh(self.angle_emb(idx)) * math.pi + self.rope_base_angles
+            else:
+                emb = self.tok_emb(idx)  # (B, T, C + C//2)
+                C = self.n_embed
+                x = emb[..., :C]
+                angles = torch.tanh(emb[..., C:]) * math.pi
+            rope_base = self.rope_base_angles if self.split_angles else None
             for block in self.blocks:
                 if isinstance(block, DataDep2Block):
-                    x, angles = block(x, angles)
+                    x, angles = block(x, angles, rope_base=rope_base)
                 else:
                     x = block(x)
         else:

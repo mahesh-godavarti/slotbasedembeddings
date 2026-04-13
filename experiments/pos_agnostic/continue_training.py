@@ -32,9 +32,25 @@ def main():
     parser.add_argument('--cosine_decay', action='store_true')
     parser.add_argument('--bf16', action='store_true',
                         help='Use BF16 mixed precision training')
+    parser.add_argument('--angle_lr', type=float, default=0,
+                        help='Separate learning rate for angle parameters (0=use main lr)')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU device index (default: 0)')
     args = parser.parse_args()
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = f'cuda:{args.gpu}'
+        torch.cuda.set_device(args.gpu)
+    else:
+        device = 'cpu'
+
+    # A100 / Ampere+ speedups
+    if device == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
+        print("Enabled TF32 matmul, cudnn TF32, cudnn benchmark")
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -46,14 +62,20 @@ def main():
     # Reconstruct correct string config and n_embed from checkpoint
     from eval_all import detect_attn_config, detect_n_embed
     attn_config = detect_attn_config(cfg)
-    n_embed = detect_n_embed(cfg)
-    print(f"Detected attn_config: {attn_config}, n_embed: {n_embed}")
+
+    # Detect split_angles from checkpoint state dict
+    split_angles = 'angle_emb.weight' in ckpt['model_state_dict']
+
+    # split_angles models store n_embed as content dim already; only non-split v2 needs 2/3 correction
+    n_embed = cfg['n_embed'] if split_angles else detect_n_embed(cfg)
+    print(f"Detected attn_config: {attn_config}, n_embed: {n_embed}, split_angles: {split_angles}")
 
     # Build model
     model = GPTModel(
         cfg['vocab_size'], n_embed, cfg['n_layers'], cfg['n_heads'],
         cfg['block_size'], dropout=0.1, attn_config=attn_config,
         window_size=cfg.get('window_size', 32),
+        split_angles=split_angles,
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)
@@ -68,7 +90,16 @@ def main():
     print(f"Data: {meta['total_tokens']:,} tokens")
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
+    angle_lr = args.angle_lr
+    if angle_lr > 0 and hasattr(model, 'angle_params') and model.angle_params():
+        param_groups = [
+            {'params': model.non_angle_params(), 'lr': args.lr},
+            {'params': model.angle_params(), 'lr': angle_lr},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=0.1)
+        print(f"Using separate angle lr: {angle_lr} (main lr: {args.lr})")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_iters)
                  if args.cosine_decay else None)
     use_bf16 = args.bf16 and torch.cuda.is_bf16_supported()
