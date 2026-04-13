@@ -86,11 +86,19 @@ Baseline:               learned (additive PE)
 
 No resume checkpoints existed. Data lost. Results matched closely with second attempt through the epochs completed.
 
-### Second attempt (current, with resume checkpoints)
+### Second attempt (completed, with resume checkpoints)
 
 Crashed once at epoch 68 (rope2d, CUDA driver fault on GPU 0). Resumed successfully from checkpoint after GPU reset via `tnr modify` (ThunderCompute restart).
 
-### Results: rope2d vs joformer_old (in progress, through epoch 210/170)
+### Final Results
+
+| Model | Top-1 | Top-5 |
+|-------|-------|-------|
+| rope2d | 80.71% | 95.26% |
+| joformer_old | **81.11%** | **95.53%** |
+| **Gap** | **+0.40%** | **+0.27%** |
+
+### Full Training Curves
 
 | Epoch | Rope2d Top-1 | Rope2d Top-5 | JoFormer_old Top-1 | JoFormer_old Top-5 | Gap (Top-1) |
 |-------|-------------|-------------|--------------------|--------------------|-------------|
@@ -112,40 +120,43 @@ Crashed once at epoch 68 (rope2d, CUDA driver fault on GPU 0). Resumed successfu
 | 150   | 75.16%      | 92.71%      | 75.09%             | 92.87%             | -0.07% |
 | 160   | 75.55%      | 93.04%      | 75.62%             | 93.08%             | +0.07% |
 | 170   | 76.21%      | 93.23%      | 76.08%             | 93.38%             | -0.13% |
-| 180   | 76.74%      | 93.55%      | —                  | —                  | — |
-| 190   | 77.00%      | 93.65%      | —                  | —                  | — |
-| 200   | 77.56%      | 94.01%      | —                  | —                  | — |
-| 210   | 78.14%      | 94.26%      | —                  | —                  | — |
+| 180   | 76.74%      | 93.55%      | 77.12%             | 93.64%             | +0.38% |
+| 190   | 77.00%      | 93.65%      | 77.31%             | 93.85%             | +0.31% |
+| 200   | 77.56%      | 94.01%      | 78.00%             | 94.16%             | +0.44% |
+| 210   | 78.14%      | 94.26%      | 78.34%             | 94.33%             | +0.20% |
+| 220   | 78.61%      | 94.43%      | 78.85%             | 94.65%             | +0.24% |
+| 230   | 78.94%      | 94.59%      | 79.33%             | 94.86%             | +0.39% |
+| 240   | 79.50%      | 94.77%      | 79.80%             | 94.95%             | +0.30% |
+| 250   | 79.79%      | 94.85%      | 80.07%             | 95.14%             | +0.28% |
+| 260   | 80.03%      | 95.04%      | 80.49%             | 95.24%             | +0.46% |
+| 270   | 80.40%      | 95.16%      | 80.82%             | 95.39%             | +0.42% |
+| 280   | 80.54%      | 95.27%      | 81.04%             | 95.47%             | +0.50% |
+| 290   | 80.69%      | 95.29%      | 81.05%             | 95.49%             | +0.36% |
+| 300   | 80.71%      | 95.26%      | 81.11%             | 95.53%             | +0.40% |
 
 ### Observations
 
-1. **JoFormer_old and rope2d are essentially tied.** The gap fluctuates between -0.13% and +1.58%, with no consistent trend after epoch 50. V rotation does not provide a meaningful advantage at this scale.
-2. **Early advantage for JoFormer_old** (epochs 10-60, gap +0.5-1.6%) vanishes by epoch 80+. This mirrors the CIFAR-100 finding that JoFormer starts slower but catches up — except here rope2d also catches up to JoFormer.
-3. **12 layers + DeiT-III much stronger than 6 layers + no augmentation**: 78% at epoch 210 vs 63% at epoch 70.
-4. **JoFormer_old is ~30% slower per epoch** (~1020s vs ~790s) due to extra V rotation and inverse rotation operations. Same accuracy for more compute — not a good tradeoff.
-5. **Both runs still climbing** at ~0.4-0.5% per 10 epochs. Cosine schedule acceleration in late training should push final accuracy higher.
+1. **JoFormer_old consistently ahead by ~0.3-0.4% at matched epochs.** The gap fluctuates between -0.13% and +1.58% early, but stabilizes around +0.3-0.5% from epoch 180 onward. Final gap: +0.40% top-1, +0.27% top-5.
+2. **Early advantage for JoFormer_old** (epochs 10-60, gap +0.5-1.6%) narrows in the middle (epochs 80-130, near zero), then re-emerges and stabilizes in the second half of training.
+3. **12 layers + DeiT-III much stronger than 6 layers + no augmentation**: 80.7% at epoch 300 vs 62.8% at epoch 70.
+4. **JoFormer_old is ~30% slower per epoch** (~1020s vs ~790s) due to extra V rotation and inverse rotation operations. The +0.40% accuracy costs 30% more compute.
+5. **Both models exceed the RoPE2D paper's reported ViT-S accuracy** (~79.4% at 400 epochs). We achieve 80.71% (rope2d) and 81.11% (joformer_old) at 300 epochs.
+6. **Single seed (42), single run** — the +0.40% gap is suggestive but not statistically conclusive. Multiple seeds needed for a definitive claim.
 
 ### Comparison with RoPE2D paper (ECCV 2024)
 
-The paper reports ViT-S at ~79.4% on ImageNet with DeiT-III at 400 epochs. We're at 78.14% at epoch 210 with 300-epoch schedule — on track to land close to the paper's numbers, validating our implementation.
+The paper reports ViT-S at ~79.4% on ImageNet with DeiT-III at 400 epochs. Our rope2d achieves 80.71% at 300 epochs, exceeding their number — likely due to implementation differences (we use 12 layers vs their default, or minor recipe variations). The important point is that our implementation is competitive, validating the experimental setup.
 
 ---
 
 ## Remaining Experiments
 
-### Priority 1: Complete current runs
-- rope2d: epoch ~214 of 300
-- joformer_old: epoch ~171 of 300
-
-### Priority 2: Baselines and other PE variants
-- **learned** PE — to reproduce rope2d > learned at ImageNet scale (already shown in simplified recipe)
-- **rope2dv2** (combined/mixed) — to reproduce rope2dv2 > rope2d from the paper
+### Potential next steps
+- **Multiple seeds** for statistical significance on the rope2d vs joformer_old comparison
+- **learned** PE baseline under DeiT-III recipe to quantify rope2d's advantage at ImageNet scale
+- **rope2dv2** (combined/mixed) to test mixed > axial under our framework
 - **monoidal_axial** / **monoidal** — learned-frequency variants (per-head, per-layer)
-- **joformer_axial** / **joformer** — V-rotation with learned frequencies
-
-### Priority 3: Improvements for future runs
-- Switch from fp16 to **bf16** (H100 has 2x bf16 TFLOPS, removes GradScaler overhead)
-- Consider dropping JoFormer variants if V rotation continues showing no benefit at ImageNet scale
+- Switch from fp16 to **bf16** for future runs (H100 has 2x bf16 TFLOPS)
 
 ---
 
