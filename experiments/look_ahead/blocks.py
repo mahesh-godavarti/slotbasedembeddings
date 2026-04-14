@@ -46,6 +46,9 @@ def build_rotation_matrix(cos_a, sin_a):
 
     cos_a, sin_a: (..., C//2) shaped tensors
     Returns: (..., C//2, 2, 2) rotation matrices
+
+    NOTE: Only used by RoFormerAttention. JoFormer uses the fast
+    element-wise apply_rotation_fast / apply_inverse_rotation_fast instead.
     """
     cos_a = cos_a.unsqueeze(-1)  # (..., C//2, 1)
     sin_a = sin_a.unsqueeze(-1)
@@ -70,6 +73,31 @@ def apply_inverse_rotation(x, matrix):
     x = x.reshape(B, T, C // 2, 2, 1)
     x = torch.matmul(matrix.transpose(-1, -2), x)
     return x.reshape(B, T, C)
+
+
+def apply_rotation_fast(x, cos_a, sin_a):
+    """Apply rotation using element-wise ops (fast). Same math as apply_rotation.
+
+    x: (..., C), cos_a/sin_a: (..., C//2)
+    """
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    out_even = x_even * cos_a - x_odd * sin_a
+    out_odd = x_even * sin_a + x_odd * cos_a
+    return torch.stack([out_even, out_odd], dim=-1).reshape(x.shape)
+
+
+def apply_inverse_rotation_fast(x, cos_a, sin_a):
+    """Apply inverse rotation using element-wise ops (fast). Same math as apply_inverse_rotation.
+
+    x: (..., C), cos_a/sin_a: (..., C//2)
+    Inverse rotation: transpose of rotation matrix = use -sin.
+    """
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    out_even = x_even * cos_a + x_odd * sin_a
+    out_odd = -x_even * sin_a + x_odd * cos_a
+    return torch.stack([out_even, out_odd], dim=-1).reshape(x.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -344,11 +372,12 @@ class JoFormerLearnedAttention(nn.Module):
             # Expand angles for each head: (B, T, C//2) -> per-head (B*H, T, D//2)
             angles = angles.view(B, T, H, D // 2).transpose(1, 2).reshape(B * H, T, D // 2)
 
-        matrix = build_rotation_matrix(torch.cos(angles), torch.sin(angles))
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
 
-        k = apply_rotation(k, matrix)
-        q = apply_rotation(q, matrix)
-        v = apply_rotation(v, matrix)
+        k = apply_rotation_fast(k, cos_a, sin_a)
+        q = apply_rotation_fast(q, cos_a, sin_a)
+        v = apply_rotation_fast(v, cos_a, sin_a)
 
         wei = k @ q.transpose(-1, -2) * D ** (-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
@@ -360,7 +389,7 @@ class JoFormerLearnedAttention(nn.Module):
         wei = self.dropout(wei)
         out = wei @ v
 
-        out = apply_inverse_rotation(out, matrix)
+        out = apply_inverse_rotation_fast(out, cos_a, sin_a)
 
         if H > 1:
             out = out.view(B, H, T, D).transpose(1, 2).reshape(B, T, C)
