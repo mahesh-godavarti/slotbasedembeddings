@@ -117,19 +117,28 @@ class RoFormerAttention(nn.Module):
         q = apply_rotation(q, matrix)
         # V not rotated
 
-        wei = k @ q.transpose(-1, -2) * D ** (-0.5)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        if self.use_softmax:
-            wei = F.softmax(wei, dim=-1)
+        if False and self.use_softmax and H > 1 and T > 64:
+            # Flash attention: memory-efficient, avoids materializing T×T matrix
+            k = k.view(B, H, T, D)
+            q = q.view(B, H, T, D)
+            v = v.view(B, H, T, D).contiguous()
+            drop_p = self.dropout.p if self.training else 0.0
+            # Original code does k @ q^T, so pass k as query and q as key
+            out = F.scaled_dot_product_attention(k, q, v, is_causal=True, dropout_p=drop_p)
+            out = out.transpose(1, 2).reshape(B, T, C)
         else:
-            wei = torch.log(torch.exp(wei) + 1)
-            wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
-        wei = self.dropout(wei)
-        out = wei @ v
+            wei = k @ q.transpose(-1, -2) * D ** (-0.5)
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+            if self.use_softmax:
+                wei = F.softmax(wei, dim=-1)
+            else:
+                wei = torch.log(torch.exp(wei) + 1)
+                wei = wei / (wei.sum(dim=-1, keepdim=True) + 1e-6)
+            wei = self.dropout(wei)
+            out = wei @ v
 
-        if H > 1:
-            # Reshape back: (B*H, T, D) -> (B, H, T, D) -> (B, T, H, D) -> (B, T, C)
-            out = out.view(B, H, T, D).transpose(1, 2).reshape(B, T, C)
+            if H > 1:
+                out = out.view(B, H, T, D).transpose(1, 2).reshape(B, T, C)
 
         out = self.proj(out)
         out = self.dropout(out)

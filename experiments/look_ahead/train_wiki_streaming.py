@@ -333,7 +333,8 @@ def train_model(model_name, model, train_data, val_data, args, device, tokenizer
             print(f"  [{model_name}] Resuming from checkpoint: {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt['model_state_dict'])
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if ckpt['optimizer_state_dict'] is not None:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             if scheduler and 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict'] is not None:
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             if scaler and 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None:
