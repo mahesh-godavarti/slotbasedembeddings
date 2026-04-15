@@ -40,6 +40,7 @@ class PointerChasingDataset:
         self.multi_q = multi_q    # multiple Q sections per level (helper signals)
         self.shuffle = shuffle    # shuffle table/Q section entry order
         self._n_keys_active = None  # for key curriculum: block permutations
+        self.level_gap = 0         # separator tokens between levels
         self.vocab_hops = vocab_hops if vocab_hops is not None else n_hops
 
         # Vocabulary:
@@ -75,14 +76,26 @@ class PointerChasingDataset:
         return base_table[current]
 
     def _chain_all_active(self, key, from_level, levels, n_keys_active):
-        """Check if the entire resolution chain from key at from_level stays within active keys."""
-        if key >= n_keys_active:
-            return False
-        current = key
-        for lev in range(from_level, 0, -1):
-            current = levels[lev][current]
-            if current >= n_keys_active:
+        """Check if the entire resolution chain from key at from_level stays within active keys.
+        n_keys_active: int or list of ints (per-level). If int, same for all levels.
+        """
+        if isinstance(n_keys_active, (list, tuple)):
+            if key >= n_keys_active[from_level]:
                 return False
+            current = key
+            for lev in range(from_level, 0, -1):
+                current = levels[lev][current]
+                limit = n_keys_active[lev - 1] if lev - 1 < len(n_keys_active) else self.n_keys
+                if current >= limit:
+                    return False
+        else:
+            if key >= n_keys_active:
+                return False
+            current = key
+            for lev in range(from_level, 0, -1):
+                current = levels[lev][current]
+                if current >= n_keys_active:
+                    return False
         return True
 
     def _resolve_hops(self, key, from_level, n_hops, levels, base_table):
@@ -172,16 +185,31 @@ class PointerChasingDataset:
 
         # Query section for base level: Q key -> target = base value (0 hops)
         n_active = self._n_keys_active
+
+        def level_active(lev):
+            """Get n_keys_active for a specific level."""
+            if n_active is None:
+                return None
+            if isinstance(n_active, (list, tuple)):
+                return n_active[lev] if lev < len(n_active) else self.n_keys
+            return n_active
+
         for k in pick_shown_keys(base_required):
             tokens.append(self.QUERY)
             targets.append(IGNORE)
             tokens.append(self.key_token(k, level=0))
-            if n_active is not None and k >= n_active:
+            l0_active = level_active(0)
+            if l0_active is not None and k >= l0_active:
                 targets.append(IGNORE)
             else:
                 targets.append(self.value_token(base_table[k]))
         tokens.append(self.LEVEL_SEP)
         targets.append(IGNORE)
+
+        # Level gap: separator tokens to push previous level out of window
+        for _ in range(self.level_gap):
+            tokens.append(self.LEVEL_SEP)
+            targets.append(IGNORE)
 
         # Index levels: no targets in table, multiple Q sections per level
         for level in range(1, self.n_hops):
@@ -221,6 +249,11 @@ class PointerChasingDataset:
                     else:
                         resolved = self._resolve(k, level, levels, base_table)
                         targets.append(self.value_token(resolved))
+                tokens.append(self.LEVEL_SEP)
+                targets.append(IGNORE)
+
+            # Level gap: push previous level out of attention window
+            for _ in range(self.level_gap):
                 tokens.append(self.LEVEL_SEP)
                 targets.append(IGNORE)
 
@@ -396,13 +429,18 @@ class LookAheadD1Sequential(nn.Module):
 class TransformerBaseline(nn.Module):
     """Standard N-layer transformer (parallel, no look-ahead)."""
 
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_head=4, dropout=0.0, no_rope=False, window=None):
+    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_head=4, dropout=0.0, no_rope=False, window=None, hybrid_k=0, hybrid_window=None):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
-        self.blocks = nn.ModuleList([
-            RoFormerBlock(n_embed, block_size, dropout, use_softmax=True, n_head=n_head, no_rope=no_rope, window=window)
-            for _ in range(n_layers)
-        ])
+        # hybrid_k: last K layers use no-RoPE with hybrid_window
+        # first (n_layers-K) layers use RoPE with window
+        blocks = []
+        for i in range(n_layers):
+            if hybrid_k > 0 and i >= n_layers - hybrid_k:
+                blocks.append(RoFormerBlock(n_embed, block_size, dropout, use_softmax=True, n_head=n_head, no_rope=True, window=hybrid_window))
+            else:
+                blocks.append(RoFormerBlock(n_embed, block_size, dropout, use_softmax=True, n_head=n_head, no_rope=no_rope, window=window))
+        self.blocks = nn.ModuleList(blocks)
         self.ln_f = nn.LayerNorm(n_embed)
         self.head = nn.Linear(n_embed, vocab_size)
 
@@ -510,11 +548,14 @@ def _mask_targets_by_key(targets, inputs, n_keys_active, n_keys_total, key_offse
 def train_and_eval(model, dataset, n_iters=5000, batch_size=64, lr=1e-3, device='cuda',
                    eval_every=500, eval_batches=20, checkpoint_dir=None, checkpoint_every=1000,
                    curriculum=None, curriculum_datasets=None,
-                   hop_curriculum=None, key_curriculum=None):
+                   hop_curriculum=None, key_curriculum=None, level_key_curriculum=None,
+                   adaptive_curriculum=False, adaptive_threshold=0.9, adaptive_consecutive=3):
     """Train model with dense targets and evaluate per-level accuracy.
 
     hop_curriculum: list of (iter, max_hop) — mask targets for levels >= max_hop
     key_curriculum: list of (iter, n_keys_active) — mask targets for keys >= n_keys_active
+    level_key_curriculum: list of (iter, [k0,k1,...]) — per-level key limits
+    adaptive_curriculum: auto-advance per-level k when accuracy > threshold
     """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -537,6 +578,15 @@ def train_and_eval(model, dataset, n_iters=5000, batch_size=64, lr=1e-3, device=
 
     prev_max_hop = None
     prev_n_keys_active = None
+
+    # Adaptive curriculum state
+    if adaptive_curriculum:
+        n_hops = dataset.n_hops
+        n_keys = dataset.n_keys
+        adaptive_k = [n_keys] + [1] * (n_hops - 1)  # L0 starts at max, rest at 1
+        adaptive_streak = [0] * n_hops  # consecutive evals above threshold per level
+        adaptive_advancing_level = 1  # which level is currently advancing (0 is always done)
+        print(f"  [Adaptive] Starting with k={adaptive_k}, threshold={adaptive_threshold}, consecutive={adaptive_consecutive}")
 
     for it in range(start_iter, n_iters + 1):
         # Curriculum: switch dataset based on iteration
@@ -570,10 +620,37 @@ def train_and_eval(model, dataset, n_iters=5000, batch_size=64, lr=1e-3, device=
                 print(f"  [Key curriculum] n_keys_active={n_keys_active} at iter {it}")
                 prev_n_keys_active = n_keys_active
 
+        # Per-level key curriculum overrides global key_curriculum
+        if level_key_curriculum:
+            for c_iter, c_keys in reversed(level_key_curriculum):
+                if it >= c_iter:
+                    n_keys_active = c_keys  # list of per-level limits
+                    break
+            if n_keys_active != prev_n_keys_active:
+                print(f"  [Level key curriculum] n_keys_active={n_keys_active} at iter {it}")
+                prev_n_keys_active = n_keys_active
+
+        # Adaptive curriculum: set n_keys_active from adaptive state
+        # Levels beyond adaptive_advancing_level get k=0 (no targets)
+        if adaptive_curriculum:
+            n_keys_active = adaptive_k[:]
+            for lev in range(adaptive_advancing_level + 1, len(n_keys_active)):
+                n_keys_active[lev] = 0  # suppress targets for future levels
+            if all(k >= current_dataset.n_keys for k in n_keys_active):
+                current_dataset._n_keys_active = None
+            else:
+                current_dataset._n_keys_active = n_keys_active
+        elif key_curriculum or level_key_curriculum:
+            # Set n_keys_active for chain-based masking
+            if isinstance(n_keys_active, list):
+                if all(k >= current_dataset.n_keys for k in n_keys_active):
+                    current_dataset._n_keys_active = None
+                else:
+                    current_dataset._n_keys_active = n_keys_active
+            else:
+                current_dataset._n_keys_active = n_keys_active if n_keys_active < current_dataset.n_keys else None
+
         model.train()
-        # Set n_keys_active for block permutations
-        if key_curriculum:
-            current_dataset._n_keys_active = n_keys_active if n_keys_active < current_dataset.n_keys else None
         inputs, targets, _ = current_dataset.generate_batch(batch_size)
         inputs, targets = inputs.to(device), targets.to(device)
 
@@ -641,7 +718,28 @@ def train_and_eval(model, dataset, n_iters=5000, batch_size=64, lr=1e-3, device=
 
                 labels = [f'L{i}' for i in range(len(level_accs) - 1)] + ['LF']
                 level_str = ' '.join(f'{labels[i]}:{a:.3f}' for i, a in enumerate(level_accs))
+                if adaptive_curriculum:
+                    level_str += f' | k={adaptive_k}'
                 print(f"  iter {it:5d}: loss={loss.item():.4f}, acc={overall_acc:.4f} | {level_str}")
+
+                # Adaptive curriculum: check if current level should advance
+                if adaptive_curriculum and adaptive_advancing_level < dataset.n_hops:
+                    lev = adaptive_advancing_level
+                    acc_lev = level_accs[lev] if lev < len(level_accs) - 1 else level_accs[-1]
+                    if acc_lev >= adaptive_threshold:
+                        adaptive_streak[lev] += 1
+                    else:
+                        adaptive_streak[lev] = 0
+                    if adaptive_streak[lev] >= adaptive_consecutive:
+                        if adaptive_k[lev] < dataset.n_keys:
+                            adaptive_k[lev] += 1
+                            adaptive_streak[lev] = 0
+                            print(f"  [Adaptive] L{lev} advanced to k={adaptive_k[lev]} at iter {it}")
+                        if adaptive_k[lev] >= dataset.n_keys:
+                            # This level done, move to next
+                            adaptive_advancing_level += 1
+                            if adaptive_advancing_level < dataset.n_hops:
+                                print(f"  [Adaptive] Now advancing L{adaptive_advancing_level}, k={adaptive_k}")
 
         if checkpoint_dir and it % checkpoint_every == 0:
             os.makedirs(checkpoint_dir, exist_ok=True)
@@ -688,6 +786,17 @@ def main():
     parser.add_argument('--window', type=int, default=None, help='Sliding window size for attention')
     parser.add_argument('--multi_q', action='store_true', help='Multiple Q sections per level with helper targets')
     parser.add_argument('--no_shuffle', action='store_true', help='Disable shuffling of table/Q section entries')
+    parser.add_argument('--level_gap', type=int, default=0, help='Number of separator tokens between levels')
+    parser.add_argument('--hybrid_k', type=int, default=0, help='Last K layers use no-RoPE (hybrid: RoPE early, NoPE late)')
+    parser.add_argument('--hybrid_window', type=int, default=None, help='Window size for no-RoPE layers in hybrid mode')
+    parser.add_argument('--level_key_curriculum', type=str, default=None,
+                        help='Per-level key curriculum: "iter:L0_k,L1_k,L2_k,..." e.g. "0:5,5,5,2|50000:5,5,5,5"')
+    parser.add_argument('--adaptive_curriculum', action='store_true',
+                        help='Adaptive per-level key curriculum: advance k when accuracy threshold met')
+    parser.add_argument('--adaptive_threshold', type=float, default=0.9,
+                        help='Accuracy threshold to advance key curriculum (default: 0.9)')
+    parser.add_argument('--adaptive_consecutive', type=int, default=3,
+                        help='Consecutive evals above threshold before advancing (default: 3)')
     parser.add_argument('--hop_curriculum', type=str, default=None, help='Hop curriculum: "iter:max_hop,..." e.g. "0:2,50000:5,80000:10"')
     parser.add_argument('--key_curriculum', type=str, default=None, help='Key curriculum: "iter:n_keys_active,..." e.g. "0:2,50000:5,80000:10"')
     args = parser.parse_args()
@@ -720,12 +829,22 @@ def main():
             key_curriculum.append((int(it), int(val)))
         key_curriculum.sort()
 
+    level_key_curriculum = None
+    if args.level_key_curriculum:
+        level_key_curriculum = []
+        for entry in args.level_key_curriculum.split('|'):
+            it_part, keys_part = entry.strip().split(':')
+            keys_list = [int(k) for k in keys_part.split(',')]
+            level_key_curriculum.append((int(it_part), keys_list))
+        level_key_curriculum.sort()
+
     dataset = PointerChasingDataset(
         n_keys=args.n_keys, n_values=args.n_values, n_hops=args.n_hops,
         n_show=args.n_show, permutation=args.permutation, seed=args.seed,
         vocab_hops=args.vocab_hops, multi_q=args.multi_q,
         shuffle=not args.no_shuffle
     )
+    dataset.level_gap = args.level_gap
 
     # Sequence length for block_size
     sample_tokens, _, seq_len = dataset.generate_example()
@@ -750,7 +869,8 @@ def main():
             print(f"=== Transformer N={n_layers} ===")
             model = TransformerBaseline(
                 dataset.vocab_size, args.n_embed, n_layers, block_size,
-                n_head=args.n_head, no_rope=args.no_rope, window=args.window
+                n_head=args.n_head, no_rope=args.no_rope, window=args.window,
+                hybrid_k=args.hybrid_k, hybrid_window=args.hybrid_window
             )
         elif model_name == 'bptt':
             print(f"=== D=1 Look-Ahead (BPTT, sequential training) ===")
@@ -795,12 +915,17 @@ def main():
                         vocab_hops=args.vocab_hops, multi_q=args.multi_q,
                         shuffle=not args.no_shuffle
                     )
+                    c_datasets[c_hops].level_gap = args.level_gap
 
         acc = train_and_eval(
             model, dataset, n_iters=args.n_iters, batch_size=args.batch_size,
             lr=args.lr, device=device, checkpoint_dir=ckpt_dir,
             curriculum=curriculum, curriculum_datasets=c_datasets,
-            hop_curriculum=hop_curriculum, key_curriculum=key_curriculum
+            hop_curriculum=hop_curriculum, key_curriculum=key_curriculum,
+            level_key_curriculum=level_key_curriculum,
+            adaptive_curriculum=args.adaptive_curriculum,
+            adaptive_threshold=args.adaptive_threshold,
+            adaptive_consecutive=args.adaptive_consecutive
         )
         print(f"  Final accuracy: {acc:.4f}")
         print()
