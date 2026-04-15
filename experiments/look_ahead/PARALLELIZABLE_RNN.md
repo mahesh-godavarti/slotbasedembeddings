@@ -157,6 +157,14 @@ This is analogous to how LSTMs use gates to control information flow, but simple
 
 The correction resets to $x_t$ at each step: $\tilde{x}_t = x_t + c_t$, not $\tilde{x}_t = h_{t-1} + c_t$. This prevents error accumulation across the sequence. The model always starts from a clean signal (the token embedding) and adds a single correction. This is critical for long-sequence stability and is what enables the parallel training trick — the correction only needs to converge, not the entire accumulated state.
 
+### When look-ahead works (and when it doesn't)
+
+The correction mechanism assumes the next token is predictable from context. The correction at position $t$ is derived from $h_{t-1}$ — if token $t$ has no relationship to the preceding tokens, this correction is noise and the model wastes capacity trying to use it.
+
+The architecture's advantage over standard transformers comes specifically from exploiting sequential predictability. Any sequential task where what comes next relates to what came before will benefit. A sequence of truly random, independent tokens will not — a standard transformer would be equally good.
+
+This is a fundamental property, not a limitation. Natural language is highly predictable from context, which is why the correction mechanism works well for language modeling. The same applies to code, music, protein sequences, or any structured sequential data.
+
 ### Why attention is essential for parallel training
 
 The attention mechanism provides O(T) context in O(1) depth. Without it, information must propagate one position per iteration, requiring K = T iterations (no speedup). With attention, every position sees the full context in a single iteration. The K iterations only refine the corrections, not propagate information. This is why K = 5 works for T = 256 — a 50x speedup over sequential training.

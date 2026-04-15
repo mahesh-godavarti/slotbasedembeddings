@@ -40,10 +40,10 @@ Note: K=5 uses batch=32, K=10 uses batch=16 (memory constraint). The gap columns
 | 70K  | +1.82        | **-0.57**            | +1.58                |
 | 75K  | +1.48        | **-0.55**            | +1.39                |
 | 80K  | +1.36        | **-0.61**            | +1.32                |
-| 85K  | +1.33        | —                    | +1.09                |
-| 90K  | +1.43        | —                    | +0.77                |
-| 95K  | +1.08        | —                    | +0.90                |
-| 100K | +0.99        | —                    | +0.91                |
+| 85K  | +1.33        | **-0.92**            | +1.09                |
+| 90K  | +1.43        | **-0.81**            | +0.77                |
+| 95K  | +1.08        | **-0.97**            | +0.90                |
+| 100K | +0.99        | **-0.97**            | +0.91                |
 
 ## Raw PPL Values
 
@@ -67,6 +67,12 @@ Note: K=5 uses batch=32, K=10 uses batch=16 (memory constraint). The gap columns
 | 70K  | 37.97   | 37.40           |
 | 75K  | 37.42   | 36.87           |
 | 80K  | 36.99   | 36.38           |
+| 85K  | 36.50   | 35.58           |
+| 90K  | 36.09   | 35.28           |
+| 95K  | 35.74   | 34.77           |
+| 100K | 35.37   | 34.40           |
+| 105K | —       | 33.95           |
+| 110K | —       | 33.63           |
 
 ### K=5 (batch=32) vs N=6 (batch=32)
 
@@ -121,6 +127,9 @@ Note: K=5 uses batch=32, K=10 uses batch=16 (memory constraint). The gap columns
 | 110K | —       | 35.25           |
 | 115K | —       | 34.97           |
 | 120K | —       | 34.54           |
+| 125K | —       | 34.15           |
+| 130K | —       | 33.89           |
+| 135K | —       | 33.63           |
 
 *N=6 b16 ran to 100K. k_min=2 gaps beyond 100K cannot be computed.
 
@@ -129,7 +138,7 @@ Note: K=5 uses batch=32, K=10 uses batch=16 (memory constraint). The gap columns
 ### K=10 k_min=0 is the winner
 
 - **Crosses zero at 65K** — D=1 beats N=6 at FLOP parity
-- Gap grows to **-0.61** by 80K
+- Gap grows to **-0.97** by 100K and still widening
 - K=5 never crosses zero — stabilizes around +1.0
 - K=10 k_min=2 tracks close to K=5 — random lower K values are the bottleneck
 
@@ -172,12 +181,17 @@ Also running: D=1 K=10 fine-tuned from N=1 C=2048 pretrained for 85K iters.
 | 90K     | 175K      | 33.71          |
 | 95K     | 180K      | 33.44          |
 | 100K    | 185K      | 33.05          |
+| 105K    | 190K      | 32.86          |
+| 110K    | 195K      | 32.39          |
+| 115K    | 200K      | 32.14          |
+| 120K    | 205K      | 32.15          |
+| 125K    | 210K      | 31.71          |
+| 130K    | 215K      | 31.35          |
 
-At 185K total iters, fine-tune is at 33.05 — well below N=6 b16's 100K result (35.37). But at matched total iters (e.g. 100K), fine-tune (46.66) is far behind N=6 (35.37). The correction mechanism needs many iters to adapt the pretrained representations.
+At 215K total iters, fine-tune is at 31.35. At matched total iters (e.g. 100K), fine-tune (46.66) is far behind N=6 (35.37). The correction mechanism needs many iters to adapt the pretrained representations. But the fine-tune is now well below N=6 b16's 100K (35.37) and still dropping.
 
 ## Active Experiments
 
-- D=1 K=10 k_min=0 scratch (GPU 0, this machine) — at 80K, running to 400K
-- D=1 K=10 fine-tune from N=1 (GPU 1, this machine) — at 100K ft, running to 400K
-- D=1 K=10 k_min=2 scratch (GPU 0, qmt machine) — at 120K
-- N=6 b32 bs1024 (GPU 0, this machine) — still running at 287K, was supposed to be stopped
+- D=1 K=10 k_min=0 scratch (GPU 0, this machine) — at 110K, running to 400K
+- D=1 K=10 fine-tune from N=1 (GPU 1, this machine) — at 130K ft / 215K total, running to 400K
+- D=1 K=10 k_min=2 scratch (GPU 0, qmt machine) — at 135K

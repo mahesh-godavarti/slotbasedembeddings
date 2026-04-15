@@ -201,6 +201,14 @@ The recurrent state capacity is bounded by C (the hidden dimension). At FLOP par
 
 Fixed K is critical — random K (k_min=2) negates the benefit of higher K, as the model optimizes for the average K rather than the maximum.
 
+### When look-ahead works (and when it doesn't)
+
+The correction mechanism assumes the next token is predictable from context. The correction at position t is derived from h[t-1] — if token t has no relationship to the preceding tokens, this correction is noise. The architecture's advantage over standard transformers comes specifically from exploiting sequential predictability.
+
+This is not limited to next-token prediction in the language modeling sense — any sequential task where what comes next relates to what came before will benefit. But a sequence of truly random, independent tokens will not benefit from the correction chain, and a standard transformer would be equally good.
+
+Natural language is highly predictable from context, which is why the correction mechanism works well for language modeling.
+
 ## Experiments
 
 ### Completed
