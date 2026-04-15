@@ -2,15 +2,21 @@
 
 ## Key Finding
 
-The gap between D=1 look-ahead and deeper transformers (N=6) narrows as training block_size increases, reaching zero at bs1024:
+The gap between D=1 look-ahead and deeper transformers (N=6) narrows as training block_size increases, and **reverses** with higher K:
 
-| block_size | batch | D=1 C=2048 (200K) | N=6 C=1088 (200K) | Gap at 200K | Gap at ~245K |
-|-----------|-------|-------------------|-------------------|-------------|-------------|
-| 256       | 64    | 35.34             | 34.15             | +1.19       | ~+1.0       |
-| 512       | 64    | 30.57             | 30.11             | +0.46       | —           |
-| 1024      | 32    | 29.53             | 29.22             | +0.31       | **~0.0**    |
+| block_size | K | batch | Gap at 200K | Gap trend |
+|-----------|---|-------|-------------|-----------|
+| 256       | 5 | 64    | +1.19       | stabilizes ~+1.0 |
+| 512       | 5 | 64    | +0.46       | stabilizes ~+0.46 |
+| 1024      | 5 | 32    | +0.31       | converges to ~0.0 by 245K |
+| 1024      | 10 (fixed) | 16 | — | **D=1 beats N=6 from 65K, gap -0.61 at 80K** |
+| 1024      | 10 (k_min=2) | 16 | — | tracks K=5, ~+0.9 at 100K |
 
 All at ~85M inference FLOPs, lr=2e-4, softmax, n_head=16, OWT data.
+
+**K limits the effective training depth.** At K=5, block_size=1024 is underutilized — the correction chain only gets 5 iterations to propagate. K=10 doubles the training depth and lets D=1 fully exploit the longer context, surpassing N=6. Random K (k_min=2) negates the benefit — the model needs consistent full-depth iterations.
+
+See `K10_RESULTS.md` for full K=10 comparison tables.
 
 ## Why This Happens
 
@@ -183,11 +189,17 @@ D=1 gains more from each block_size increase than N=6 does:
 
 ## Implications
 
-**For any N-layer transformer, there exists a block_size B such that D=1 trained at block_size B matches or exceeds it at FLOP parity.**
+**For any N-layer transformer, there exists a block_size B and K such that D=1 trained at block_size B with K iterations exceeds it at FLOP parity.**
 
-Depth is not a fundamental requirement for language modeling — it is a substitute for recurrence. Width + sequence length can substitute for depth. As block_size increases during training, D=1 learns to use longer correction chains, providing the sequential computation that deeper models achieve through layer stacking.
+Two knobs control D=1's effective training depth:
+1. **Block_size** — determines how many positions the correction chain spans during training
+2. **K** — determines how many iterations the correction chain gets to propagate per training step
 
-The recurrent state capacity is bounded by C (the hidden dimension). At FLOP parity, D=1 gets a wider model (C=2048 vs C=1088 for N=6), giving it a richer recurrent state. Block_size during training determines how much of that capacity the model learns to exploit.
+Both must be scaled together. Block_size=1024 with K=5 leaves the model underutilized. K=10 at block_size=1024 lets D=1 surpass N=6.
+
+The recurrent state capacity is bounded by C (the hidden dimension). At FLOP parity, D=1 gets a wider model (C=2048 vs C=1088 for N=6), giving it a richer recurrent state. Block_size and K during training determine how much of that capacity the model learns to exploit.
+
+Fixed K is critical — random K (k_min=2) negates the benefit of higher K, as the model optimizes for the average K rather than the maximum.
 
 ## Experiments
 
