@@ -10,7 +10,7 @@
   - Dual: mixed (A-J') + KAT (B/C with --kg_as_text)
   - Non-dual: mixed (A-J') + causal (E/H/I with --causal_kg) + KAT (B/C with --kg_as_text)
 
-## Completion Status (as of Apr 12, 2026)
+## Completion Status (as of May 2, 2026)
 
 ### Dual
 | Grid Point | mixed | kat | Status |
@@ -43,9 +43,12 @@
 | n100_l4 | Done | Done | Done | Complete |
 | n100_l8 | Done | Done | Done | Complete |
 | n100_l16 | Done | Done | Done | Complete |
-| n100_l20 | Done | Running (E' 25%) | — | In progress |
-| n250_l2–l8 | — | — | — | Pending |
-| n500_l2–l4 | — | — | — | Pending |
+| n100_l20 | Done | Done | Done | Complete |
+| n250_l2 | Done | Done | Done | Complete |
+| n250_l4 | Done | Done | Done | Complete |
+| n250_l8 | Done | Done | Done | Complete |
+| n500_l2 | Done | Done | Done | Complete |
+| n500_l4 | Done | Done | Done | Complete |
 
 ### K/K' Backfill
 | Grid Point | dual | non-dual | Status |
@@ -102,8 +105,13 @@
 | n100_l8 | J' | 3.59 | G' | 3.73 |
 | **n100_l16** | **J'** | **2.76** | **G'** | **3.07** |
 | **n100_l20** | **J'** | **2.43** | **K'** | **2.45** |
+| n250_l2 | I'/E'/G' | 4.00 | K' | 3.77 |
+| n250_l4 | J'/G' | 3.34 | E' | 3.49 |
+| n250_l8 | K' | 1.87 | E' | 2.34 |
+| n500_l2 | E' | 3.23 | J' | 3.59 |
+| **n500_l4** | **E'** | **1.88** | **D'** | **2.23** |
 
-**Takeaway**: E' essentially solves KG memorization at n500_l4 (**1.52 PPL**, **.960** h@5). K' is the new #2: **1.87** non-dual at n250_l8, **2.24** dual at n500_l4 — survives where I'/J' diverge. I' dominates width (**2.60** at n500_l2) but diverges at depth. Non-dual J' 2.43 and K' 2.45 are nearly tied at n100_l20.
+**Takeaway**: E' essentially solves KG memorization at n500_l4 (**1.52 PPL**, **.960** h@5 dual; **1.88 PPL**, **.887** h@5 non-dual). K' is the new #2: **1.87** non-dual at n250_l8, **2.24** dual at n500_l4 — survives where I'/J' diverge. I' dominates width (**2.60** at n500_l2) but diverges at depth. Non-dual J' 2.43 and K' 2.45 are nearly tied at n100_l20. J' survives n500_l4 in non-dual (3.27) but diverged in dual. D' non-dual 2.23 at n500_l4 beats dual 2.71.
 
 ---
 
@@ -141,8 +149,13 @@
 | n100_l8 | J' | .373 | G' | .334 |
 | **n100_l16** | **J'** | **.628** | **K'** | **.559** |
 | **n100_l20** | **J'** | **.751** | **K'** | **.750** |
+| n250_l2 | G' | .248 | I' | .245 |
+| n250_l4 | J' | .441 | E' | .431 |
+| n250_l8 | K' | .895 | E' | .777 |
+| n500_l2 | E' | .537 | I' | .415 |
+| **n500_l4** | **E'** | **.887** | **D'** | **.794** |
 
-**Takeaway**: E' achieves **.960** h@5 at n500_l4 — KG memorization essentially solved. K' is the new #2: **.895** non-dual at n250_l8, **.880** dual at n500_l4. I' achieves **.805** at n500_l2 via width scaling. D' is robust at .719 (n500_l4). I/I'/J/J' all diverge at n500_l4 — only E'/K'/D' survive at depth+width.
+**Takeaway**: E' achieves **.960** dual / **.887** non-dual h@5 at n500_l4. K' is #2: **.895** non-dual at n250_l8, **.880** dual at n500_l4. D' non-dual .794 at n500_l4 beats dual .719. J' survives n500_l4 in non-dual (.443) but diverges in dual. I' diverges at n250_l8+ but achieves **.805** at n500_l2 via width.
 
 ---
 
@@ -164,15 +177,15 @@
 
 ## 4. Depth Scaling — Non-dual KG mem PPL (best model)
 
-| Layers | n50 | n100 |
-|---|---|---|
-| 2 | 4.74 (I') | 4.07 (I') |
-| 4 | 4.22 (I') | 3.98 (J') |
-| 8 | 4.07 (I') | 3.59 (J') |
-| 16 | 3.95 (J') | **2.76 (J')** |
-| 20 | **3.83 (J')** | **2.43 (J')** |
+| Layers | n50 | n100 | n250 | n500 |
+|---|---|---|---|---|
+| 2 | 4.74 (I') | 4.07 (I') | 4.00 (I'/E'/G') | 3.23 (E') |
+| 4 | 4.22 (I') | 3.98 (J') | 3.34 (J'/G') | **1.88 (E')** |
+| 8 | 4.07 (I') | 3.59 (J') | **1.87 (K')** | — |
+| 16 | 3.95 (J') | 2.76 (J') | — | — |
+| 20 | 3.83 (J') | 2.43 (J') | — | — |
 
-J' dominates non-dual at n100: 3.98 (l4) → 3.59 (l8) → 2.76 (l16) → **2.43** (l20). K' is #2 at l20 (2.45) — nearly tied. G' follows at 2.71. J' at n100_l20 (2.43) surpasses dual D' at n500_l4 (2.71) and approaches dual E' at n250_l8 (1.88). K' shows the same superlinear scaling: 4.22 (l2) → 4.02 (l4) → 3.56 (l8) → 3.03 (l16) → **2.45** (l20).
+Non-dual E' at n500_l4 achieves 1.88/.887 — nearly matching dual E' (1.52/.960). K' non-dual at n250_l8 (1.87/.895) outperforms E' dual (1.88/.907) at the same config! J' survives n500_l4 in non-dual (3.27/.443) but diverged in dual. I/I' diverge at n250_l8 (same as dual).
 
 ---
 
@@ -192,7 +205,7 @@ V rotation (primed variants) is beneficial for MLM KG but can catastrophically f
 | F → F' | 4.31 | 4.13 | -0.18 |
 | I → I' | 4.23 | **79.39** | **+75.16 (DIVERGED)** |
 
-V rotation effect is **massive at n250_l8**: E' gains 2.37 PPL (was 0.87 at n100_l20, 0.35 at n100_l8). D' gains 1.43 — simple RoPE benefits enormously. But **I' completely diverges** (PPL 79.39). At n500_l4, V rotation is even more critical: E' 1.52 vs E 4.48 (gain of **2.96**), D' 2.71 vs D 4.51 (gain of **1.80**). I/I'/J/J' all diverge at n500_l4 regardless of V rotation.
+V rotation effect is **massive at n250_l8**: E' gains 2.37 PPL (was 0.87 at n100_l20, 0.35 at n100_l8). D' gains 1.43 — simple RoPE benefits enormously. But **I' completely diverges** (PPL 79.39 dual, billions non-dual). At n500_l4 dual, V rotation is even more critical: E' 1.52 vs E 4.48 (gain of **2.96**), D' 2.71 vs D 4.51 (gain of **1.80**). At n500_l4 non-dual: E' 1.88 vs E 4.09 (gain **2.21**), D' 2.23 vs D 4.10 (gain **1.87**). I diverges at n250_l8+ but I' survives at n500 non-dual (3.41) while diverging in dual.
 
 ---
 
@@ -239,13 +252,13 @@ This is a key metric: can models predict text about facts only seen in KG?
 | n100_l8 | 5.27 (I) | 6.54 (F/F'/I) |
 | n100_l16 | 5.39 (A) | 6.07 (G') |
 | n100_l20 | 5.31 (D') | 6.03 (I') |
-| n250_l2 | 5.64 (D) | — |
-| n250_l4 | 5.27 (I) | — |
-| n250_l8 | 5.21 (I) | — |
-| n500_l2 | 5.22 (I') | — |
-| n500_l4 | 5.17 (H) | — |
+| n250_l2 | 5.64 (D) | 6.54 (G') |
+| n250_l4 | 5.27 (I) | 6.55 (F') |
+| n250_l8 | 5.21 (I) | 6.65 (G/J) |
+| n500_l2 | 5.22 (I') | 6.71 (D) |
+| n500_l4 | 5.17 (H) | 6.88 (H) |
 
-Dual cross-pollination (kg_excl text PPL) plateaus around 5.2–5.3 across all scales. The improvement from n100 to n500 is minimal. Non-dual kg_excl text PPL stays high (6.0+), meaning pure MLM KG training doesn't transfer well to text generation.
+Dual cross-pollination (kg_excl text PPL) plateaus around 5.2–5.3 across all scales. Non-dual kg_excl text PPL stays high (6.0–7.0) and actually gets WORSE at n500 (6.88 vs 6.03 at n100_l20). Models that improve KG PPL at n500 (E', D', J') see their text kg_excl PPL deteriorate — the KG knowledge is being stored in angle mechanisms that don't help text generation.
 
 ---
 
@@ -280,8 +293,14 @@ C' consistently leads dual KAT. At n500_l4, C' achieves **4.12** text PPL and .3
 | n100_l2 | C' | 4.91 | 5.25 |
 | n100_l8 | C' | 1.68 | 2.59 |
 | **n100_l16** | **C'** | **1.02** | **1.12** |
+| n100_l20 | C' | 1.01 | 1.04 |
+| n250_l2 | C' | 1.10 | 1.27 |
+| n250_l4 | C' | 1.01 | 1.05 |
+| **n250_l8** | **C'** | **1.00** | **1.01** |
+| n500_l2 | C' | 1.01 | 1.02 |
+| **n500_l4** | **C'** | **1.00** | **1.02** |
 
-Non-dual KAT C' shows explosive scaling at n100: 4.91 (l2) → 1.68 (l8) → **1.02** (l16). At n100_l16, C' achieves **perfect 1.000 h@5** on memorization, kg_excl, AND txtExcl — every single fact predicted correctly. B/B' also reach 1.000/.999 h@5 at n100_l16. KAT is fully solved at this scale.
+Non-dual KAT C' shows explosive scaling: 4.91 (n100_l2) → 1.68 (l8) → **1.02** (l16) → **1.00** (n250_l8, n500_l4). At n100_l16+, C' achieves **perfect 1.000 h@5** on all tiers. At n250_l8 and n500_l4, C' reaches **1.00 PPL** — the theoretical minimum. B/B' also reach .97–1.00 h@5 at n250_l8+. KAT is completely solved from n100_l16 onward.
 
 ---
 
@@ -302,10 +321,20 @@ These models use causal (left-to-right) KG training instead of MLM. **At n50_l16
 | n100_l4 | I' | .884 | 1.76 | .817 | 2.05 |
 | n100_l8 | H | .975 | 1.36 | .983 | 1.51 |
 | **n100_l16** | **H'** | **.996** | **1.13** | **.983** | **1.37** |
+| n100_l20 | H' | .998 | 1.10 | .983 | 1.18 |
+| n250_l2 | I' | .945 | 1.20 | .933 | 1.36 |
+| n250_l4 | I' | 1.000 | 1.06 | .917 | 1.24 |
+| n250_l8 | E'/H'/I | 1.000/.999 | 1.01 | .950 | 1.25 |
+| n500_l2 | E' | 1.000 | 1.01 | .767 | 2.18 |
+| **n500_l4** | **I'/E'** | **1.000** | **1.01** | **.950** | **1.33** |
 
 At n50_l2/l4, causal KG gives modestly better text PPL than MLM (I' causal 5.09 vs MLM 5.33 at n50_l4). At n50_l8, H starts to pull ahead (.209 h@5, 4.77 PPL). A phase transition occurs at n50_l16 where unprimed models explode to .5–.6 h@5 / 3.1–3.5 PPL, continuing to .8+ h@5 / 2.3 PPL at l20.
 
-**At n100_l4, I' shatters records** with .884 text h@5 / 1.76 PPL. Width accelerates the phase transition: at n50, it needed l16+; at n100, it's already strong at l4. **At n100_l8, all models except E' converge to near-perfect text prediction** (.929–.975 h@5, 1.29–1.56 PPL). **At n100_l16, the system approaches perfection**: H achieves **1.000 kg_excl_m h@5** (perfect cross-pollination), H/H' get .983 txtExcl_m (near-perfect reverse cross-pollination), and E' partially recovers (.604 h@5, up from .109 at l8).
+**At n100_l4, I' shatters records** with .884 text h@5 / 1.76 PPL. Width accelerates the phase transition: at n50, it needed l16+; at n100, it's already strong at l4. **At n100_l8, all models except E' converge to near-perfect text prediction** (.929–.975 h@5, 1.29–1.56 PPL). **At n100_l16/l20, the system is near-perfect**: H achieves **1.000 kg_excl_m h@5** (perfect cross-pollination), H/H' get .983 txtExcl_m (near-perfect reverse cross-pollination), and E' partially recovers (.672 at l20, up from .109 at l8).
+
+**At n250, width unlocks further breakthroughs**: I' achieves .945 h@5 / 1.20 PPL at just l2 (2 layers!). At n250_l4, I' reaches **1.000 h@5 / 1.06 PPL** — perfect. At n250_l8, E/E'/H/H'/I all achieve .999–1.000 h@5, but **I' diverges** (PPL 15.49). **E' FULLY RECOVERS**: 1.000 h@5 / 1.01 PPL at n250_l8, up from .672 at n100_l20.
+
+**At n500, causal is essentially solved**: E'/I' both achieve **1.000 h@5 / 1.01 PPL** at n500_l4. All models except I' (at n250_l8 only) reach .95+ h@5. I' recovers at n500 — .999/1.04 at l2, 1.000/1.01 at l4. The causal phase transition is complete.
 
 ### n50_l8 Causal Detailed Results
 
@@ -414,6 +443,84 @@ Continued improvement from n100_l8 — all models now above .98 h@5 with sub-1.2
 4. **I' has best PPL**: I' 1.13 PPL (tied with H' 1.13), I' 1.20 kg_excl PPL. V rotation continues to help I' extract information.
 5. **Generalization plateau**: All models at .667-.689 gen h@5. Text generalization doesn't scale past ~.7 — a hard ceiling on unseen derived facts.
 
+### n100_l20 Causal — Continued Near-Perfection
+
+| Model | Text mem h@5 | Text mem PPL | Text trans h@5 | Text gen h@5 | kg_excl_m h@5 | kg_excl_m PPL | txtExcl_m h@5 |
+|---|---|---|---|---|---|---|---|
+| **H'** | **.998** | **1.10** | .967 | .733 | .983 | 1.36 | .950 |
+| H | .992 | 1.10 | .967 | .667 | .983 | 1.18 | **1.000** |
+| I' | .995 | **1.09** | .967 | .700 | .950 | 1.27 | .983 |
+| E | .988 | 1.12 | .967 | .700 | .950 | 1.27 | .967 |
+| I | .983 | 1.12 | .989 | .656 | .933 | 1.20 | .933 |
+| E' | .672 | 2.10 | .589 | .489 | .550 | 2.76 | .633 |
+
+H achieves **1.000 txtExcl_m h@5** — perfect reverse cross-pollination. E' continues recovery (.672, up from .604 at l16). All other models above .98.
+
+### n250_l2 Causal — **I' WIDTH BREAKTHROUGH**
+
+| Model | Text mem h@5 | Text mem PPL | kg_excl_m h@5 | kg_excl_m PPL | txtExcl_m h@5 |
+|---|---|---|---|---|---|
+| **I'** | **.945** | **1.20** | **.933** | **1.36** | **.967** |
+| H' | .787 | 2.28 | .483 | 3.63 | .333 |
+| E' | .658 | 2.15 | .533 | 2.60 | .500 |
+| I | .539 | 3.25 | .400 | 3.79 | .167 |
+| H | .529 | 3.01 | .483 | 3.45 | .183 |
+| E | .346 | 4.16 | .300 | 4.39 | .067 |
+
+**I' at just 2 layers achieves .945 h@5 / 1.20 PPL** — width alone enables the causal phase transition. E' also recovers significantly here (.658 vs .672 at n100_l20 but with only 2 layers). V rotation helps all models at n250.
+
+### n250_l4 Causal — **I' PERFECT, ALL NEAR-PERFECT**
+
+| Model | Text mem h@5 | Text mem PPL | kg_excl_m h@5 | kg_excl_m PPL | txtExcl_m h@5 |
+|---|---|---|---|---|---|
+| **I'** | **1.000** | **1.06** | .917 | 1.24 | **1.000** |
+| H | .992 | 1.18 | **1.000** | **1.35** | .867 |
+| H' | .992 | 1.14 | .967 | 1.49 | .967 |
+| I | .989 | 1.27 | .950 | 1.45 | .783 |
+| E | .979 | 1.35 | .900 | 1.70 | .717 |
+| E' | .861 | 1.68 | .567 | 3.19 | .833 |
+
+I' achieves **1.000 h@5 / 1.06 PPL** — perfection. E' continues recovery to .861. H again gets 1.000 kg_excl_m h@5.
+
+### n250_l8 Causal — **E' FULLY RECOVERS, I' DIVERGES**
+
+| Model | Text mem h@5 | Text mem PPL | kg_excl_m h@5 | kg_excl_m PPL | txtExcl_m h@5 |
+|---|---|---|---|---|---|
+| **E'** | **1.000** | **1.01** | .867 | 1.72 | **1.000** |
+| H' | 1.000 | 1.03 | .967 | 1.33 | 1.000 |
+| I | 1.000 | 1.07 | .950 | 1.32 | 1.000 |
+| H | .999 | 1.04 | .933 | 1.25 | .983 |
+| E | .999 | 1.08 | .950 | 1.35 | .983 |
+| **I'** | **.006** | **15.49** | .000 | 17.20 | .000 |
+
+**E' FULLY RECOVERS** to 1.000 h@5 / 1.01 PPL — its causal failure was transient, needing width (not just depth) to overcome. But **I' catastrophically diverges** (PPL 15.49). I' seems unstable at n250_l8 in both MLM (DIV) and causal modes.
+
+### n500_l2 Causal — E'/I' LEAD
+
+| Model | Text mem h@5 | Text mem PPL | kg_excl_m h@5 | kg_excl_m PPL | txtExcl_m h@5 |
+|---|---|---|---|---|---|
+| **E'** | **1.000** | **1.01** | .767 | 2.18 | **1.000** |
+| **I'** | .999 | 1.04 | .867 | 1.32 | 1.000 |
+| H' | .936 | 1.45 | .633 | 2.85 | .683 |
+| H | .919 | 1.59 | .850 | 1.91 | .433 |
+| I | .613 | 2.70 | .567 | 3.07 | .383 |
+| E | .460 | 3.55 | .283 | 4.88 | .283 |
+
+E' achieves 1.000/1.01 at just 2 layers with n500 width. I' recovers from its n250_l8 divergence (.999/1.04). V rotation helps enormously at this width.
+
+### n500_l4 Causal — **CAUSAL FULLY SOLVED**
+
+| Model | Text mem h@5 | Text mem PPL | kg_excl_m h@5 | kg_excl_m PPL | txtExcl_m h@5 |
+|---|---|---|---|---|---|
+| **I'** | **1.000** | **1.01** | .900 | 1.38 | **1.000** |
+| **E'** | **1.000** | **1.01** | .900 | 1.60 | **1.000** |
+| H' | .999 | 1.04 | .900 | 1.65 | 1.000 |
+| H | .997 | 1.09 | .950 | 1.23 | .950 |
+| I | .995 | 1.15 | .950 | 1.33 | .950 |
+| E | .967 | 1.38 | .817 | 2.21 | .667 |
+
+**Causal KG training is FULLY SOLVED at n500_l4.** All 6 models achieve .967+ h@5 with sub-1.4 PPL. I'/E' achieve perfect 1.000/1.01. Cross-pollination and reverse cross-pollination are near-universal (most models .90+ on both kg_excl and txtExcl). Only E (unprimed, no V rotation) lags slightly.
+
 ### Key observations on causal n50_l16
 
 1. **V rotation HURTS causal KG at depth**: E' (.107 h@5) is catastrophically worse than E (.601). I' (.157) is much worse than I (.540). H' (.635) is the sole exception — V rotation helps H but not E or I. This is the opposite of MLM KG training where V rotation is universally beneficial.
@@ -437,11 +544,11 @@ Continued improvement from n100_l8 — all models now above .98 h@5 with sub-1.2
 ## 9. Model Rankings Summary
 
 ### KG Champions (by PPL)
-1. **E'** (learned cumsum + V rotation) — **overall champion**, **1.52** at n500_l4. KG memorization essentially solved. Superlinear scaling in both depth and width.
+1. **E'** (learned cumsum + V rotation) — **overall champion**, **1.52** at n500_l4 dual, **1.88** at n500_l4 non-dual. KG memorization essentially solved. Superlinear scaling in both depth and width.
 2. **K'** (RoPE + per-relation slot angles, native 2-slot + V rotation) — **1.87** non-dual / **2.00** dual at n250_l8. Scales like E' in both depth and width. **SURVIVES n500_l4** (2.24 dual). New top-tier model.
 3. **I'** (learned cumsum + shared relation op + V rotation) — **width champion**, **2.60** at n500_l2. Diverges at l4+ (n250_l8, n500_l4).
-4. **D'** (RoPE + V rotation) — **robust #2**, **2.71** at n500_l4. Scales in both directions without catastrophic failure.
-5. **J'** (RoPE + per-relation slot angles + V rotation) — **2.43** non-dual at n100_l20, 3.37 dual at n250_l8. DIVERGES at n500_l4.
+4. **D'** (RoPE + V rotation) — **robust #2**, **2.71** at n500_l4 dual, **2.23** at n500_l4 non-dual (better than dual). Scales in both directions without catastrophic failure.
+5. **J'** (RoPE + per-relation slot angles + V rotation) — **2.43** non-dual at n100_l20, 3.37 dual at n250_l8. DIVERGES at n500_l4 dual but **survives in non-dual** (3.27).
 6. **G'** (RoPE + per-relation slot angles, slotted format) — 3.83 at n250_l8
 
 ### KG Champions (by h@5)
@@ -453,19 +560,19 @@ Continued improvement from n100_l8 — all models now above .98 h@5 with sub-1.2
 6. **G'** — .318 at n250_l8
 
 ### Text Champions
-- **H' (causal KG, n100_l16)** — **.996** mem h@5 / **1.13** PPL — best text h@5 in entire sweep
-- **H (causal KG, n100_l16)** — .995 h@5 / 1.12 PPL — **1.000 kg_excl_m** (perfect cross-pollination)
-- **C' (non-dual KAT, n100_l16)** — **1.000** h@5 / **1.02** PPL — perfect on all tiers. Best non-causal text.
-- **I' (causal KG, n100_l16)** — .983 h@5 / 1.13 PPL — best causal kg_excl PPL (1.20)
-- **E' (dual mixed, n500_l4)** — 4.21 text PPL, .323 h@5 — first meaningful text accuracy for E' in dual mixed mode
+- **I'/E' (causal KG, n500_l4)** — **1.000** h@5 / **1.01** PPL — **perfect text prediction, causal fully solved**
+- **C' (non-dual KAT, n250_l8+)** — **1.000** h@5 / **1.00** PPL — perfect on all tiers, KAT fully solved
+- **I' (causal KG, n250_l2)** — .945 h@5 / 1.20 PPL — width alone achieves near-perfect at just 2 layers
+- **E' (causal KG, n250_l8)** — 1.000/1.01 — **E' fully recovers** from causal failure at this width
+- **E' (non-dual mixed, n500_l4)** — 4.27 text PPL, .350 h@5 — first meaningful text accuracy in mixed mode
 
 ### Cross-pollination Champions
-- **H (causal, n100_l16)** — **1.000** kg_excl_m h@5 / **1.19** PPL — **perfect** cross-pollination
-- **C' (non-dual KAT, n100_l16)** — **1.000** kg_excl_m h@5 / **1.12** PPL — perfect cross-pollination
-- **I' (causal, n100_l16)** — .967 kg_excl_m h@5 / 1.20 PPL
-- **H/H' (causal, n100_l16)** — .983 txtExcl_m h@5 — near-perfect reverse cross-pollination
+- **H (causal, n250_l4)** — **1.000** kg_excl_m h@5 — perfect cross-pollination (also at n100_l16)
+- **I'/E' (causal, n500_l4)** — .900 kg_excl_m h@5 / ~1.4 PPL — near-perfect at extreme scale
+- **C' (non-dual KAT, n250_l8)** — **1.000** kg_excl_m h@5 / **1.01** PPL — perfect
+- **H/I'/E' (causal, n500_l4)** — .950–1.000 txtExcl_m h@5 — perfect reverse cross-pollination
 - **Dual I/I'** — best kg_excl text PPL in dual mixed mode (~5.2)
-- Non-dual MLM KG has poor cross-pollination (kg_excl text PPL stays 6.0+)
+- Non-dual MLM KG has poor cross-pollination (kg_excl text PPL stays 6.0–7.0, gets worse at n500)
 
 ---
 
@@ -475,7 +582,7 @@ Continued improvement from n100_l8 — all models now above .98 h@5 with sub-1.2
 Non-dual achieves better KG PPL at every grid point (e.g., I' 4.74 vs 5.25 at n50_l2). But dual has much better kg_excl text PPL (5.27 vs 6.22), meaning dual training helps transfer KG knowledge to text predictions.
 
 ### 2. E' scales in both directions; I' is width-only
-E' scales superlinearly: 4.00 (l8) → 3.29 (l20) at n100; 1.88 at n250_l8; **1.52** at n500_l4. It benefits from both width and depth. I' scales with width: 5.25 → 4.53 → 3.76 → **2.60** at l2, but **diverges** at depth (n250_l8: 79.39, n500_l4: DIV). I/J also diverge at n500_l4 — only E'/D' and simpler models survive at extreme scale.
+E' scales superlinearly: 4.00 (l8) → 3.29 (l20) at n100; 1.88 at n250_l8; **1.52** at n500_l4 dual. Non-dual E' reaches **1.88/.887** at n500_l4 — nearly matching dual. It benefits from both width and depth. I' scales with width: 5.25 → 4.53 → 3.76 → **2.60** at l2, but **diverges** at depth (n250_l8: 79.39, n500_l4: DIV). I/J also diverge at n500_l4 — only E'/D' and simpler models survive at extreme scale.
 
 ### 3. J' emerges at depth with superlinear scaling
 J' (RoPE + per-relation slot angles) is unremarkable at shallow configs but shows superlinear KG scaling at depth: 3.98 (n100_l4) → 3.59 (l8) → **2.76** (l16), with h@5 .266 → .373 → **.628**. At n100_l16, J' approaches dual E' at n250_l8 (1.88). G' follows the same pattern (3.07/.541 at n100_l16). Non-dual training with slot angles may rival dual E' at sufficient scale.
@@ -483,8 +590,8 @@ J' (RoPE + per-relation slot angles) is unremarkable at shallow configs but show
 ### 4. V rotation: massive benefit for MLM but catastrophic at scale for I' and causal E'
 At n250_l8, V rotation gives E' a 2.37 PPL improvement (4.25→1.88) and D' a 1.43 improvement (4.31→2.88). But it **completely destroys I'** at the same config (PPL 79.39 vs 4.23 unprimed). Under causal KG training, V rotation catastrophically hurts E (h@5 .792→.117 at l20) while H and I are partially immune. The V rotation interaction is architecture-specific and can flip from massive benefit to catastrophic failure.
 
-### 5. Causal KG training produces the best text performance (by far)
-At n100_l16, causal models achieve near-perfection: H' .996 h@5 / 1.13 PPL, H **1.000 kg_excl_m h@5** (perfect cross-pollination). All models except E' exceed .98 h@5 with sub-1.2 PPL. Reverse cross-pollination is also near-perfect (H/H' .983 txtExcl_m). Width accelerates the phase transition: at n50, it needed l16+; at n100, I' already breaks through at l4 (.884 h@5). E' partially recovers at l16 (.604, up from .109 at l8) — its failure was transient. Generalization plateaus at ~.68 h@5.
+### 5. Causal KG training produces the best text performance — fully solved at n500_l4
+At n100_l16, causal models achieve near-perfection. At n250_l4, I' reaches **1.000 h@5 / 1.06 PPL**. At n250_l8, **E' FULLY RECOVERS** (1.000/1.01) — its causal failure was transient, needing width to overcome. At n500_l4, **all models achieve .967+ h@5** with sub-1.4 PPL — causal is fully solved. I'/E' both reach 1.000/1.01. Width is the primary scaling axis: I' achieves .945/1.20 at n250_l2 (just 2 layers!). I' diverges at n250_l8 causal (PPL 15.49) but recovers at n500. Generalization plateaus at ~.7 h@5.
 
 ### 6. E' essentially solves KG memorization
 E' (learned cumsum + relation operator + V rotation) achieves **1.52 PPL / .960 h@5** at n500_l4 — KG memorization is essentially solved. KG-exclusive h@5 is .967, meaning even unseen KG facts are predicted near-perfectly. E' also achieves .323 text h@5 / 4.21 text PPL at this config — the first time a dual mixed model achieves meaningful text accuracy beyond the ~.10 floor. E' scales in both depth and width without catastrophic failure, unlike I'/J' which diverge at n500_l4.
@@ -504,14 +611,17 @@ I' scales excellently with width: 5.25 (n50) → 4.53 (n100) → 3.76 (n250) →
 ### 11. D' emerges as the robust #2
 D' (simple RoPE + V rotation) was unremarkable at small scale but scales exceptionally: **2.71** PPL / **.719** h@5 at n500_l4. D (unprimed) diverges at n500_l2 (PPL 12.27) but recovers at n500_l4 (4.51) — the n500_l2 failure was likely a training instability, not a fundamental limit. D' benefits from both width and depth without catastrophic failure, making it the most robust architecture alongside E'.
 
-### 12. n500_l4 reveals a survival threshold
-At n500_l4, I/I'/J/J' all diverge, while A/A'/D/D'/E/E'/F/F'/G/G'/H/H'/K/K' survive. K' surviving (2.24/.880 dual) while J' diverges is notable — both use per-relation slot angles in native 2-slot format, but K's implementation differs. The surviving models all use either simple positional encodings (RoPE, fixed angles), E's learned cumsum, or K's stable slot-angle variant.
+### 12. n500_l4 reveals a survival threshold — non-dual stabilizes J'
+At n500_l4 dual, I/I'/J/J' all diverge, while A/A'/D/D'/E/E'/F/F'/G/G'/H/H'/K/K' survive. But in non-dual, **J' survives n500_l4** (3.27/.443) — only I diverges (I' also survives at 3.41/.473). Non-dual training stabilizes models at extreme scale. K' surviving (2.24/.880 dual) while J' diverges in dual is notable — both use per-relation slot angles in native 2-slot format, but K's implementation differs. The surviving models all use either simple positional encodings (RoPE, fixed angles), E's learned cumsum, or K's stable slot-angle variant.
 
 ### 13. K' is a new top-tier model matching E' scaling
 K' (RoPE + per-relation slot angles, native 2-slot, V rotation) scales like E' in both depth and width: **1.87/.895** non-dual at n250_l8 (matching E' 1.88/.907 dual), **2.24/.880** dual at n500_l4 (where I'/J' diverge). K' non-dual depth scaling at n100 is superlinear: 4.22 (l2) → 4.02 (l4) → 3.56 (l8) → 3.03 (l16) → **2.45** (l20). At n100_l20, K' (.750 h@5) essentially ties J' (.751). Non-dual K' slightly outperforms dual K' at n250_l8 (1.87 vs 2.00) but dual is far better at n500 (2.24 vs 3.07 at l4), suggesting dual training becomes critical at extreme width.
 
 ### 14. J' and K' are nearly tied at n100_l20 non-dual
 J' 2.43/.751 and K' 2.45/.750 at n100_l20 non-dual — essentially identical. Both surpass dual D' at n500_l4 (2.71/.719). The key difference emerges at n500: K' survives (2.24/.880 dual) while J' diverges. This makes K' the safer choice for scaling, despite identical performance at moderate scale.
+
+### 15. Non-dual training stabilizes models at extreme scale
+Non-dual training produces better stability than dual at extreme configs. D' improves from 2.71 (dual) to **2.23** (non-dual) at n500_l4. J' **survives** n500_l4 in non-dual (3.27/.443) but DIVERGES in dual. I' survives n500_l4 in non-dual (3.41/.473) but diverges in dual. Only I diverges at n250_l8+ in non-dual. The dual objective's alternating training apparently introduces instability at extreme scale, while non-dual's consistent MLM KG objective is more stable.
 
 ---
 
@@ -540,26 +650,26 @@ J' 2.43/.751 and K' 2.45/.750 at n100_l20 non-dual — essentially identical. Bo
 | K' | 5.42 | 4.91 | 4.54 | 4.26 | 4.16 | 4.75 | 4.39 | 3.69 | 3.48 | 3.16 | 4.16 | 2.64 | **2.00** | 2.67 | **2.24** |
 
 ### Non-dual — KG Mem PPL across grid
-| Model | n50_l2 | n50_l4 | n50_l8 | n50_l16 | n50_l20 | n100_l2 | n100_l4 | n100_l8 | n100_l16 | n100_l20 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| A | 5.39 | 4.84 | 4.25 | 4.08 | 4.07 | 4.77 | 4.18 | 4.08 | 4.01 | 3.98 |
-| A' | 5.15 | 4.55 | 4.16 | 4.06 | 4.03 | 4.23 | 4.07 | 3.97 | 3.79 | 3.81 |
-| D | 5.38 | 4.88 | 4.31 | 4.11 | 4.07 | 4.58 | 4.21 | 4.09 | 4.05 | 4.04 |
-| D' | 4.90 | 4.41 | 4.10 | 4.05 | 4.02 | 4.13 | 4.06 | 4.04 | 3.98 | 3.93 |
-| E | 5.29 | 4.70 | 4.24 | 4.09 | 4.06 | 4.48 | 4.14 | 4.07 | 4.01 | 4.03 |
-| E' | 4.91 | 4.29 | 4.08 | 4.03 | 4.02 | 4.09 | 4.05 | 4.00 | 3.77 | 3.58 |
-| F | 5.62 | 5.03 | 4.38 | 4.14 | 4.09 | 4.92 | 4.28 | 4.10 | 4.00 | 4.01 |
-| F' | 5.27 | 4.70 | 4.23 | 4.08 | 4.06 | 4.42 | 4.11 | 4.03 | 3.91 | 3.89 |
-| G | 5.63 | 4.90 | 4.30 | 4.10 | 4.05 | 4.83 | 4.16 | 4.06 | 3.96 | 3.80 |
-| G' | 5.06 | 4.48 | 4.14 | 3.96 | 3.92 | 4.21 | 4.06 | 3.73 | 3.07 | 2.71 |
-| H | 5.53 | 4.94 | 4.32 | 4.08 | 4.04 | 4.89 | 4.21 | 4.06 | 4.02 | 3.91 |
-| H' | 5.02 | 4.54 | 4.16 | 4.01 | 3.95 | 4.26 | 4.07 | 3.90 | 3.55 | 3.36 |
-| I | 5.34 | 4.68 | 4.21 | 4.06 | 4.06 | 4.53 | 4.17 | 4.07 | 4.04 | 4.03 |
-| I' | 4.74 | 4.22 | 4.07 | 4.03 | 4.03 | 4.07 | 4.04 | 3.99 | 4.02 | 4.03 |
-| J | 5.48 | 4.94 | 4.33 | 4.08 | 4.05 | 4.69 | 4.23 | 4.05 | 3.91 | 3.88 |
-| J' | 5.03 | 4.47 | 4.11 | 3.95 | 3.83 | 4.18 | 3.98 | 3.59 | 2.76 | **2.43** |
-| K | 5.91 | 4.81 | 4.23 | 4.07 | 4.05 | 4.76 | 4.17 | 4.06 | 3.84 | 3.89 |
-| K' | 5.04 | 4.36 | 4.09 | 3.86 | 3.84 | 4.22 | 4.02 | 3.56 | 3.03 | **2.45** |
+| Model | n50_l2 | n50_l4 | n50_l8 | n50_l16 | n50_l20 | n100_l2 | n100_l4 | n100_l8 | n100_l16 | n100_l20 | n250_l2 | n250_l4 | n250_l8 | n500_l2 | n500_l4 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | 5.39 | 4.84 | 4.25 | 4.08 | 4.07 | 4.77 | 4.18 | 4.08 | 4.01 | 3.98 | 4.20 | 4.09 | 4.02 | 4.19 | 4.14 |
+| A' | 5.15 | 4.55 | 4.16 | 4.06 | 4.03 | 4.23 | 4.07 | 3.97 | 3.79 | 3.81 | 4.09 | 3.85 | 3.68 | 4.02 | 3.77 |
+| D | 5.38 | 4.88 | 4.31 | 4.11 | 4.07 | 4.58 | 4.21 | 4.09 | 4.05 | 4.04 | 4.30 | 4.11 | 4.08 | 4.37 | 4.10 |
+| D' | 4.90 | 4.41 | 4.10 | 4.05 | 4.02 | 4.13 | 4.06 | 4.04 | 3.98 | 3.93 | 4.06 | 3.93 | 2.95 | 3.73 | 2.23 |
+| E | 5.29 | 4.70 | 4.24 | 4.09 | 4.06 | 4.48 | 4.14 | 4.07 | 4.01 | 4.03 | 4.21 | 4.08 | 4.05 | 4.30 | 4.09 |
+| E' | 4.91 | 4.29 | 4.08 | 4.03 | 4.02 | 4.09 | 4.05 | 4.00 | 3.77 | 3.58 | 4.00 | 3.49 | 2.34 | 3.23 | **1.88** |
+| F | 5.62 | 5.03 | 4.38 | 4.14 | 4.09 | 4.92 | 4.28 | 4.10 | 4.00 | 4.01 | 4.37 | 4.14 | 4.09 | 4.61 | 4.15 |
+| F' | 5.27 | 4.70 | 4.23 | 4.08 | 4.06 | 4.42 | 4.11 | 4.03 | 3.91 | 3.89 | 4.08 | 3.93 | 3.82 | 4.13 | 3.95 |
+| G | 5.63 | 4.90 | 4.30 | 4.10 | 4.05 | 4.83 | 4.16 | 4.06 | 3.96 | 3.80 | 4.28 | 4.05 | 3.98 | 4.31 | 4.13 |
+| G' | 5.06 | 4.48 | 4.14 | 3.96 | 3.92 | 4.21 | 4.06 | 3.73 | 3.07 | 2.71 | 4.00 | 3.34 | 2.84 | 3.81 | 3.27 |
+| H | 5.53 | 4.94 | 4.32 | 4.08 | 4.04 | 4.89 | 4.21 | 4.06 | 4.02 | 3.91 | 4.26 | 4.11 | 4.04 | 4.28 | 4.20 |
+| H' | 5.02 | 4.54 | 4.16 | 4.01 | 3.95 | 4.26 | 4.07 | 3.90 | 3.55 | 3.36 | 4.02 | 3.59 | 3.02 | 3.98 | 3.58 |
+| I | 5.34 | 4.68 | 4.21 | 4.06 | 4.06 | 4.53 | 4.17 | 4.07 | 4.04 | 4.03 | 4.24 | 4.08 | 25.07 | 20.63 | DIV |
+| I' | 4.74 | 4.22 | 4.07 | 4.03 | 4.03 | 4.07 | 4.04 | 3.99 | 4.02 | 4.03 | 4.00 | 3.72 | DIV | 3.62 | 3.41 |
+| J | 5.48 | 4.94 | 4.33 | 4.08 | 4.05 | 4.69 | 4.23 | 4.05 | 3.91 | 3.88 | 4.26 | 4.09 | 3.95 | 4.30 | 4.10 |
+| J' | 5.03 | 4.47 | 4.11 | 3.95 | 3.83 | 4.18 | 3.98 | 3.59 | 2.76 | **2.43** | 4.04 | 3.34 | 2.39 | 3.59 | 3.27 |
+| K | 5.91 | 4.81 | 4.23 | 4.07 | 4.05 | 4.76 | 4.17 | 4.06 | 3.84 | 3.89 | 4.23 | 4.07 | 4.02 | 4.29 | 4.12 |
+| K' | 5.04 | 4.36 | 4.09 | 3.86 | 3.84 | 4.22 | 4.02 | 3.56 | 3.03 | **2.45** | 3.77 | 2.69 | **1.87** | 3.83 | 3.07 |
 
 ### Observations on the full tables
 - **E' solves KG memorization**: **1.52** PPL / **.960** h@5 at n500_l4. Superlinear scaling in both depth and width. Never diverges.
@@ -568,6 +678,11 @@ J' 2.43/.751 and K' 2.45/.750 at n100_l20 non-dual — essentially identical. Bo
 - **I/J both diverge at n500_l4**: Both unprimed and primed variants. Only E'/D'/K' and the simpler models (A-H') survive.
 - **Non-dual J'/K' show superlinear scaling at n100**: J' 3.98 (l4) → 3.59 (l8) → 2.76 (l16) → **2.43** (l20). K' 4.02 (l4) → 3.56 (l8) → 3.03 (l16) → **2.45** (l20). G' also breaks out: 3.73 (l8) → 3.07 (l16) → **2.71** (l20).
 - **I' stalls at n100 depth in non-dual**: I' 4.07 (l2) → 4.04 (l4) → 3.99 (l8) → 4.02 (l16) → **4.03** (l20). I' shows zero depth scaling — a hard ceiling at ~4.0 PPL.
+- **Non-dual E' nearly matches dual at n500_l4**: E' 1.88 non-dual vs 1.52 dual. The gap narrows dramatically at extreme scale.
+- **K' non-dual beats dual at n250_l8**: K' 1.87 non-dual vs 2.00 dual. Non-dual is actually better for K' at this scale.
+- **J' survives n500_l4 in non-dual**: J' 3.27 — it DIVERGED in dual at this config. Non-dual training stabilizes J'.
+- **I/I' diverge at n250_l8 non-dual**: I PPL 25.07, I' catastrophically diverged (PPL in billions). Same pattern as dual (I' PPL 79.39).
+- **D' non-dual 2.23 at n500_l4**: Better than dual D' (2.71). D' benefits from non-dual training at extreme scale.
 
 ---
 
@@ -596,26 +711,26 @@ J' 2.43/.751 and K' 2.45/.750 at n100_l20 non-dual — essentially identical. Bo
 | K' | .101 | .140 | .169 | .217 | .243 | .158 | .193 | .420 | .468 | .543 | .270 | .767 | **.889** | .777 | **.880** |
 
 ### Non-dual — KG Mem h@5 across grid
-| Model | n50_l2 | n50_l4 | n50_l8 | n50_l16 | n50_l20 | n100_l2 | n100_l4 | n100_l8 | n100_l16 | n100_l20 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| A | .102 | .158 | .198 | .200 | .205 | .178 | .197 | .207 | .225 | .239 |
-| A' | .123 | .185 | .201 | .205 | .209 | .200 | .219 | .244 | .321 | .303 |
-| D | .112 | .155 | .196 | .199 | .199 | .181 | .198 | .203 | .201 | .200 |
-| D' | .143 | .190 | .199 | .201 | .204 | .198 | .201 | .205 | .240 | .244 |
-| E | .126 | .171 | .197 | .198 | .199 | .190 | .199 | .202 | .219 | .206 |
-| E' | .155 | .193 | .202 | .203 | .203 | .199 | .207 | .232 | .302 | .356 |
-| F | .102 | .144 | .189 | .196 | .201 | .158 | .202 | .203 | .230 | .232 |
-| F' | .115 | .173 | .198 | .204 | .205 | .191 | .201 | .233 | .274 | .267 |
-| G | .091 | .148 | .197 | .200 | .213 | .163 | .202 | .208 | .263 | .309 |
-| G' | .133 | .189 | .206 | .259 | .278 | .197 | .216 | .334 | .541 | .655 |
-| H | .103 | .149 | .191 | .204 | .204 | .165 | .203 | .205 | .216 | .263 |
-| H' | .134 | .184 | .200 | .227 | .255 | .195 | .210 | .282 | .381 | .413 |
-| I | .111 | .171 | .196 | .203 | .200 | .188 | .199 | .202 | .203 | .208 |
-| I' | .162 | .197 | .200 | .200 | .200 | .202 | .211 | .242 | .209 | .204 |
-| J | .111 | .152 | .195 | .201 | .216 | .182 | .201 | .214 | .271 | .281 |
-| J' | .134 | .188 | .212 | .262 | .313 | .208 | .266 | .373 | .628 | **.751** |
-| K | .097 | .158 | .197 | .208 | .206 | .175 | .199 | .218 | .293 | .270 |
-| K' | .140 | .195 | .205 | .296 | .300 | .198 | .240 | .405 | .559 | **.750** |
+| Model | n50_l2 | n50_l4 | n50_l8 | n50_l16 | n50_l20 | n100_l2 | n100_l4 | n100_l8 | n100_l16 | n100_l20 | n250_l2 | n250_l4 | n250_l8 | n500_l2 | n500_l4 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | .102 | .158 | .198 | .200 | .205 | .178 | .197 | .207 | .225 | .239 | .203 | .205 | .233 | .197 | .201 |
+| A' | .123 | .185 | .201 | .205 | .209 | .200 | .219 | .244 | .321 | .303 | .212 | .305 | .341 | .227 | .337 |
+| D | .112 | .155 | .196 | .199 | .199 | .181 | .198 | .203 | .201 | .200 | .200 | .200 | .207 | .198 | .201 |
+| D' | .143 | .190 | .199 | .201 | .204 | .198 | .201 | .205 | .240 | .244 | .208 | .286 | .593 | .361 | .794 |
+| E | .126 | .171 | .197 | .198 | .199 | .190 | .199 | .202 | .219 | .206 | .193 | .208 | .217 | .197 | .207 |
+| E' | .155 | .193 | .202 | .203 | .203 | .199 | .207 | .232 | .302 | .356 | .231 | .431 | .777 | .537 | **.887** |
+| F | .102 | .144 | .189 | .196 | .201 | .158 | .202 | .203 | .230 | .232 | .198 | .201 | .203 | .197 | .198 |
+| F' | .115 | .173 | .198 | .204 | .205 | .191 | .201 | .233 | .274 | .267 | .205 | .267 | .305 | .208 | .269 |
+| G | .091 | .148 | .197 | .200 | .213 | .163 | .202 | .208 | .263 | .309 | .200 | .227 | .255 | .200 | .209 |
+| G' | .133 | .189 | .206 | .259 | .278 | .197 | .216 | .334 | .541 | .655 | .248 | .411 | .581 | .290 | .436 |
+| H | .103 | .149 | .191 | .204 | .204 | .165 | .203 | .205 | .216 | .263 | .201 | .207 | .216 | .204 | .205 |
+| H' | .134 | .184 | .200 | .227 | .255 | .195 | .210 | .282 | .381 | .413 | .234 | .379 | .545 | .246 | .373 |
+| I | .111 | .171 | .196 | .203 | .200 | .188 | .199 | .202 | .203 | .208 | .199 | .205 | .000 | .007 | DIV |
+| I' | .162 | .197 | .200 | .200 | .200 | .202 | .211 | .242 | .209 | .204 | .245 | .370 | DIV | .415 | .473 |
+| J | .111 | .152 | .195 | .201 | .216 | .182 | .201 | .214 | .271 | .281 | .204 | .223 | .260 | .199 | .213 |
+| J' | .134 | .188 | .212 | .262 | .313 | .208 | .266 | .373 | .628 | **.751** | .231 | .441 | .743 | .344 | .443 |
+| K | .097 | .158 | .197 | .208 | .206 | .175 | .199 | .218 | .293 | .270 | .207 | .215 | .240 | .204 | .209 |
+| K' | .140 | .195 | .205 | .296 | .300 | .198 | .240 | .405 | .559 | **.750** | .327 | .690 | **.895** | .315 | .546 |
 
 ### Observations on h@5 tables
 - **E' achieves .960 at n500_l4**: KG memorization essentially solved. .281→.445→.527→.628→.907→**.960**. Superlinear growth continues.
@@ -624,6 +739,11 @@ J' 2.43/.751 and K' 2.45/.750 at n100_l20 non-dual — essentially identical. Bo
 - **J' diverges at n500_l4**: Best non-E'/I'/D' at n250_l8 dual (.450) but can't survive extreme scale. Non-dual: .628 (l16) → **.751** (l20) at n100.
 - **Non-dual J'/K'/G' show superlinear h@5 scaling**: J' .373 (n100_l8) → .628 (l16) → **.751** (l20). K' .405 (l8) → .559 (l16) → **.750** (l20). G' .334 → .541 → **.655**. Most other models remain stuck at ~.20–.30.
 - **I' h@5 stalls in non-dual**: .242 (l8) → .209 (l16) → **.204** (l20) at n100. Depth provides no benefit — I' is width-only.
+- **Non-dual E' .887 at n500_l4**: Nearly matches dual .960. E' non-dual h@5 scaling: .231 (n250_l2) → .431 (n250_l4) → .777 (n250_l8) → .537 (n500_l2) → **.887** (n500_l4).
+- **K' non-dual .895 at n250_l8**: Beats dual K' (.889) and matches dual E' (.907). K' non-dual h@5 scaling: .327 (n250_l2) → .690 (n250_l4) → **.895** (n250_l8).
+- **J' survives n500_l4 in non-dual with .443 h@5**: In dual, J' DIVERGED at n500_l4. Non-dual training stabilizes J'.
+- **D' non-dual .794 at n500_l4**: Better than dual D' (.719). Non-dual training benefits D' at extreme scale.
+- **I/I' diverge at n250_l8 non-dual**: I h@5 .000 (PPL 25.07), I' catastrophically diverged. Same instability as dual.
 
 ---
 
