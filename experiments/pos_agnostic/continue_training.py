@@ -70,14 +70,48 @@ def main():
     n_embed = cfg['n_embed'] if split_angles else detect_n_embed(cfg)
     print(f"Detected attn_config: {attn_config}, n_embed: {n_embed}, split_angles: {split_angles}")
 
+    # Detect angle_hidden_mult from checkpoint weights
+    sd = ckpt['model_state_dict']
+    angle_hidden_mult = 4  # default
+    # For cbd/cb models, K is the codebook size (second dim of angle_codebook)
+    if 'angle_codebook' in sd:
+        angle_hidden_mult = sd['angle_codebook'].shape[1]
+        print(f"Detected K={angle_hidden_mult} from angle_codebook shape {sd['angle_codebook'].shape}")
+    else:
+        for key in sd:
+            if 'angle_mlp.fc1.weight' in key or 'shared_angle_mlp.fc1.weight' in key:
+                hidden_dim = sd[key].shape[0]
+                angle_hidden_mult = hidden_dim // n_embed
+                print(f"Detected angle_hidden_mult={angle_hidden_mult} from {key}")
+                break
+            # datadep2 architecture: FFN fc1 is shared for content + angles
+            if 'blocks.0.ffn.fc1.weight' in key and 'angle_mlp' not in key:
+                hidden_dim = sd[key].shape[0]
+                angle_hidden_mult = hidden_dim // n_embed
+                print(f"Detected angle_hidden_mult={angle_hidden_mult} from {key} (datadep2)")
+                break
+
+    # Detect angle_activation from checkpoint (has angle_ln = 'ln', has freq_scales = 'fs', has angle_freq_scales = 'tanh_freq')
+    angle_activation = 'tanh'  # default
+    if any('angle_ln' in k or 'shared_angle_mlp.ln' in k for k in sd):
+        angle_activation = 'ln'
+    elif any('angle_freq_scales' in k for k in sd):
+        # Has both angle_ln and angle_freq_scales → ln_tanh_freq
+        if any('angle_ln' in k for k in sd):
+            angle_activation = 'ln_tanh_freq'
+        else:
+            angle_activation = 'tanh_freq'
+
     # Build model
     model = GPTModel(
         cfg['vocab_size'], n_embed, cfg['n_layers'], cfg['n_heads'],
         cfg['block_size'], dropout=0.1, attn_config=attn_config,
         window_size=cfg.get('window_size', 32),
         split_angles=split_angles,
+        angle_hidden_mult=angle_hidden_mult,
+        angle_activation=angle_activation,
     )
-    model.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model.to(device)
     model.train()
 
@@ -147,7 +181,7 @@ def main():
             extrap_log.append({'iter': it, 'results': {str(k): v for k, v in results.items()}})
             parts = [f"{l}:{r['ppl']}" for l, r in sorted(results.items())
                      if r.get('ppl') is not None]
-            tqdm.write(f"  [{model_name}] extrap iter {it}: {', '.join(parts)}")
+            pbar.set_postfix_str(f"[{model_name}] extrap iter {it}: {' '.join(parts)}")
 
         # Train step
         x, y = get_batch(train_data, block_size, args.batch_size, device)

@@ -244,6 +244,91 @@ No long-context data needed. No inference-time scaling hacks (PI, YaRN, NTK). No
 6. **V rotation helps at extreme lengths**: Acts as a second selection mechanism via rotational coherence, cleaning up noise when softmax attention becomes too diluted (8K-16K tokens).
 7. **Practical context extension**: Any RoPE model can be converted and fine-tuned to gain length generalization — no long-context data or inference hacks required.
 
+## Related Work: Soft Windowing and Length Generalization
+
+### The landscape of attention decay functions
+
+The problem of length generalization has led to a progression of approaches, all of which can be understood as different forms of **soft windowing** — controlling how attention weight decays with distance.
+
+**1. Hard windowing (Sliding Window Attention).** Attention is zero beyond a fixed window. Perfect length generalization but no long-range information flow. Used in Mistral, Longformer.
+
+**2. ALiBi (Press et al., 2022).** Adds a fixed linear bias to attention logits: `bias = -m_h · |i-j|`, where `m_h` is a fixed per-head slope. After softmax, this creates exponential decay with distance. Simple and effective for length generalization, but the rigid linear bias constrains expressiveness. Used in BLOOM.
+
+**3. KERPLE (Chi et al., NeurIPS 2022).** Generalizes ALiBi using kernel functions — polynomial and Gaussian-like decay. The Gaussian kernel creates a flat-then-exponential-falloff profile: tokens within an effective window contribute equally, then contributions decay smoothly. Better extrapolation than ALiBi.
+
+**4. Sandwich / T5 RPE.** Logarithmic decaying bias — slower decay than ALiBi's linear. Allows more long-range attention.
+
+**5. MEP (2024).** Multiple kernel learning — combines exponential and Gaussian kernels per head, letting the model learn which decay shape is best. Addresses ALiBi's problem of killing long-range attention too aggressively.
+
+**6. CABLE (Veisi et al., EMNLP 2025).** Makes ALiBi's slopes data-dependent: `bias = -m(x_i) · |i-j|`, where the slope is a learned function of the token content. Each token dynamically controls its own attention window width. This is the closest prior work to our data-dependent cumsum approach.
+
+### Where cumsum rotation fits
+
+Our cumsum approach creates soft windowing through a fundamentally different mechanism — multiplicative modulation via rotation rather than additive bias:
+
+| Method | Mechanism | Decay shape | Data-dependent? | Position info? |
+|--------|-----------|-------------|-----------------|---------------|
+| Hard window | Mask | Step function | No | No |
+| ALiBi | Additive bias | Exponential | No | Yes (distance) |
+| KERPLE | Additive bias | Gaussian/polynomial | No | Yes (distance) |
+| CABLE | Additive bias | Exponential, learned slope | **Yes** | Yes (distance) |
+| Random cumsum | Rotary modulation | Gaussian envelope | No | **No** |
+| Learned cumsum (JoFormer) | Rotary modulation | Data-dependent | **Yes** | Implicit |
+
+Key differences from additive bias approaches:
+- **Rotary modulation** multiplies attention scores by `cos(phase_difference)`, while additive bias shifts logits before softmax. Rotation can create constructive AND destructive interference, not just attenuation.
+- **Random cumsum** provides NO positional information — it's purely a stochastic soft window. ALiBi and KERPLE provide deterministic distance information.
+- **Data-dependent cumsum** (JoFormer v2) makes the window width content-dependent, similar to CABLE, but through rotation rather than bias. The cumsum of data-dependent angles creates a content-aware random walk where the effective window depends on the intervening tokens.
+
+### Key experimental finding: zero-mean is the critical ingredient
+
+Our experiments (Part 21 in RESULTS.md) show that the critical factor for length generalization with cumsum is **zero-mean angles**, not data-dependence:
+
+- Random zero-mean angles (Uniform(-freq, freq)): **flat extrapolation** through 8192 tokens
+- Random positive angles (Uniform(0, 2·freq)): degrades like RoPE
+- Learned angles with LayerNorm: degrade as training progresses (the MLP overfits to training length)
+
+Zero-mean angles create a random walk that stays bounded (variance grows, but the distribution doesn't drift). Positive angles create a monotonically growing phase — out-of-distribution at test time, just like RoPE.
+
+This is analogous to the difference between ALiBi (fixed decay, generalizes) and RoPE (deterministic phase, doesn't generalize). The random walk of zero-mean cumsum is equivalent to a stochastic Gaussian-envelope soft window, similar to KERPLE's Gaussian kernel but achieved through rotation rather than additive bias.
+
+### Random cumsum is just stochastic ALiBi
+
+The cumsum of random zero-mean angles creates a random walk. The expected attention modulation between positions i and j is:
+
+```
+E[cos(random_walk(|i-j|))] = exp(-|i-j| · σ²/2)
+```
+
+Compare to ALiBi, where the effective attention weight after softmax includes:
+
+```
+exp(-m · |i-j|)
+```
+
+Both produce exponential decay with distance. The only difference is that ALiBi's decay is deterministic (providing the model with exact distance information), while random cumsum's is stochastic (providing no distance information — just the average decay envelope).
+
+This means **random zero-mean cumsum is an expensive way to approximate ALiBi without the position signal.** The cumsum machinery — sampling random angles, computing cumulative sums, applying rotary embeddings — achieves the same soft windowing that ALiBi gets with a single additive bias term. You could equivalently add Gaussian noise with std ∝ √d directly to attention logits.
+
+Random cumsum is useful as a proof of concept: it demonstrates that the soft windowing effect alone is sufficient for length generalization, independent of data-dependent angles or rotation mechanics. But as a practical method, ALiBi is simpler, cheaper, and provides position information on top.
+
+### When cumsum becomes meaningful
+
+The cumsum framework becomes genuinely different from ALiBi only when angles are **data-dependent** (learned from content). In that case:
+- The effective window width varies per token and per layer, adapting to content
+- The position signal is implicit in the content-dependent relative phases
+- The rotary modulation creates richer interactions than additive bias (constructive and destructive interference, not just attenuation)
+
+This is what JoFormer v2 achieves with tanh·π angles and warm-start training: both flat extrapolation AND superior training-length PPL (25.55 vs RoPE's 31.51). The challenge is training these data-dependent angles from scratch without them overfitting to training length.
+
+### Open question: can learned angles match random for extrapolation?
+
+Our learned angle models (shared MLP, per-layer MLP with LayerNorm) improve training-length PPL but lose extrapolation as they train — the angles drift away from zero-mean toward configurations that exploit training-length patterns. Every learned model eventually degrades, while random stays flat.
+
+Current best approach: slow angle learning rate (1e-4 vs 5e-4 main lr) delays this overfitting and maintains near-flat extrapolation longer (8192/512 ratio of 1.03x at 50K iters). Whether it can maintain it indefinitely while achieving competitive training-length PPL is an open question.
+
+The fundamental tension: learned angles need to deviate from random to provide useful position/content information (improving training PPL), but deviating from zero-mean random sacrifices the length generalization property. Finding the right balance — or the right regularization to prevent drift — is the key unsolved problem.
+
 ## References
 
 - Cho et al. (2024). "Length Generalization of Causal Transformers without Position Encoding." Findings of ACL 2024. https://arxiv.org/abs/2404.12224
@@ -251,3 +336,145 @@ No long-context data needed. No inference-time scaling hacks (PI, YaRN, NTK). No
 
 - Kazemnejad et al. (2023). "The Impact of Positional Encoding on Length Generalization in Transformers." NeurIPS 2023. https://arxiv.org/abs/2305.19466
   - Showed NoPE outperforms RoPE, ALiBi, and APE on length generalization tasks. Demonstrated NoPE can represent both absolute and relative PEs but learns patterns resembling T5's relative PE.
+
+- Press et al. (2022). "Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation." ICLR 2022.
+  - ALiBi: fixed linear attention bias per head for length generalization. Used in BLOOM.
+
+- Chi et al. (2022). "KERPLE: Kernelized Relative Positional Embedding for Length Extrapolation." NeurIPS 2022. https://arxiv.org/abs/2205.09921
+  - Generalized ALiBi with polynomial and Gaussian kernel decay functions.
+
+- Veisi et al. (2025). "Context-aware Biases for Length Extrapolation (CABLE)." EMNLP 2025. https://arxiv.org/abs/2503.08067
+  - Data-dependent ALiBi slopes: per-token learned decay rate for content-aware soft windowing.
+
+- Wang & Shen (2025). "Positional Encoding via Token-Aware Phase Attention (TAPA)." https://arxiv.org/abs/2509.12635
+  - Learnable token-pair-dependent phase function replacing RoPE. Proves RoPE has intrinsic distance-dependent bias. Extrapolates to 64K (PPL 11.75) while RoPE collapses. Deterministic learned phases.
+
+- CARoPE (2025). "Context-aware Rotary Position Embedding." https://arxiv.org/abs/2507.23083
+  - Dynamic head-specific frequency values from token embeddings. 60%+ perplexity reduction vs RoPE at extrapolation lengths. Deterministic, minimal overhead.
+
+- Awadhiya (2026). "Bifocal Attention: Harmonizing Geometric and Spectral Positional Embeddings." https://arxiv.org/abs/2601.22402
+  - Decouples position encoding into fixed geometric (RoPE) and learnable spectral frequencies. "Spectral Evolution" initializes from fixed then evolves via gradient. Similar to our warm-start approach.
+
+### Comparison with our approach
+
+| Method | Angles | Frequencies | Deterministic? | Extrapolation |
+|--------|--------|-------------|---------------|---------------|
+| RoPE | Fixed (position-indexed) | Fixed (log-spaced) | Yes | Degrades |
+| ALiBi | N/A (additive bias) | Fixed (per-head slopes) | Yes | Flat |
+| TAPA | Learned (token-pair) | Learned | Yes | Good (to 64K) |
+| CARoPE | Learned (token-dependent) | Learned (per-head) | Yes | Good |
+| Bifocal | Fixed + learned | Fixed + learned | Yes | Good (algorithmic) |
+| CABLE | N/A (additive bias) | Learned (per-token) | Yes | Good |
+| Random cumsum (ours) | Random | Fixed (log-spaced) | No | Flat |
+| **Learned freq (ours, shared_lf)** | **Random** | **Learned (per-dim, per-token)** | **No** | **Flat (early)** |
+
+### TAPA: A fundamentally better approach
+
+TAPA (Wang & Shen, 2025) deserves special attention. Its mechanism:
+
+```
+Attn(q, k) = (q_A · k_A / √(θD)) · cos(2π |m-n|^α · q_P · k_P / √((1-θ)D))
+```
+
+- Splits each head's q/k into Amplitude (A) and Phase (P) halves (θ=0.5)
+- Amplitude: standard content similarity `q_A · k_A`
+- Phase: token-pair-dependent oscillation frequency `q_P · k_P`
+- Uses explicit position distance `|m-n|^α` with α=0.1 (sublinear)
+- Proven: intrinsic distance bias decays as |m-n|^(-α(1-θ)D) — exponentially in D
+
+**Why TAPA succeeds where our approach has fundamental limitations:**
+
+1. **Selective long-range attention.** TAPA's phase depends on the q·k interaction of BOTH tokens. Two semantically related tokens with aligned q_P·k_P maintain coherent attention at any distance. Unrelated tokens' phases cancel out via oscillatory integral. This is a scalpel — it suppresses noise while preserving signal.
+
+2. **Our cumsum is a blunt instrument.** In our approach, the phase difference between distant tokens i and j depends on ALL intervening tokens' cumulative angles. Even if tokens i and j are semantically related, the intervening tokens randomize their phase. Our soft windowing attenuates ALL distant attention — both noise and legitimate long-range dependencies.
+
+3. **Evidence of this limitation.** Our random model's PPL improves from 512→2048 but then flattens. There is useful information beyond the soft window that the model cannot access. TAPA's PPL keeps improving with context (11.97 at 8K → 11.67 at 49K) because it can reach arbitrarily far for relevant tokens.
+
+4. **ALiBi has the same limitation as our approach.** ALiBi also blindly penalizes distance — a fixed slope per head, independent of content. It forces a tradeoff between local precision (steep slope) and long-range reach (gentle slope). TAPA eliminates this tradeoff.
+
+**The hierarchy of approaches:**
+
+| Approach | Soft window | Content-dependent? | Selective long-range? | Position info |
+|----------|------------|--------------------|-----------------------|---------------|
+| Hard window | Step function | No | No | No |
+| ALiBi | Exponential | No | No | Yes (distance) |
+| Random cumsum (ours) | Gaussian envelope | No | No | No |
+| Learned freq (ours) | Learned envelope | Magnitude only | No | No |
+| CABLE | Exponential | Slope only | No | Yes (distance) |
+| **TAPA** | **Oscillatory cancellation** | **Full (token-pair)** | **Yes** | **Yes (distance)** |
+
+TAPA solves the fundamental tradeoff that we've been struggling with: it provides both training-length performance AND long-range generalization by making the attention decay content-dependent at the token-pair level. Our approaches (random cumsum, learned freq, dropout, etc.) are all attempts to balance uniform soft windowing against training-length PPL — a tradeoff that TAPA transcends.
+
+### The cumsum advantage: intervening content as position
+
+Cumsum has a fundamental property that TAPA lacks: **the phase between tokens i and j encodes the content of everything between them.** TAPA sees only `|m-n|` (how far apart) and `q_P · k_P` (how related the endpoints are). Cumsum sees the actual path.
+
+This is a limitation for retrieval (needle in haystack — the irrelevant intervening content destroys the phase signal between query and needle). But it's an advantage for tasks where the path matters:
+
+- **Code**: The phase between a variable declaration and its use encodes the intervening code — assignments, branches, function calls. The model knows not just HOW FAR the use is from the declaration, but WHAT HAPPENED in between. A use after 100 lines of comments is different from a use after 100 lines of mutations to that variable.
+
+- **Reasoning chains**: In multi-step reasoning, the intermediate steps ARE the content between premise and conclusion. Cumsum naturally encodes the chain structure — the phase at the conclusion carries the accumulated reasoning path. TAPA would only see the distance from premise to conclusion and their content similarity.
+
+- **Narrative**: Two events 500 tokens apart carry different relationships depending on what happened between them. "The hero left the castle" followed by 500 tokens of travel is different from 500 tokens of battle, even though the distance and endpoint tokens might be similar.
+
+The cumsum phase is not just noise from intervening tokens — it's **information**. The model can learn frequency patterns that respond to specific types of intervening content, creating path-dependent attention that TAPA cannot express.
+
+### The tradeoff
+
+| Property | TAPA | Cumsum |
+|----------|------|--------|
+| Long-range retrieval (needle in haystack) | Excellent (96/100 at 64K) | Poor (intervening content destroys signal) |
+| Intervening content sensitivity | None (sees only distance + endpoints) | Full (phase encodes the path) |
+| Custom kernels required | Yes (custom FlashAttention) | No (standard ops + torch.cumsum) |
+| Head dimension utilization | 50% (split A/P) | 100% (full head for Q·K) |
+| V rotation compatible | Not explored | Yes (consistent extrapolation benefit) |
+| Position indices required | Yes (|m-n|) | No (position emerges from content) |
+| Training-length PPL vs RoPE | ~0.1 PPL behind | ~0.5-1.0 PPL behind (learned freq) |
+
+TAPA is better for retrieval-heavy tasks. Cumsum is better for structure-sensitive tasks where the path between tokens carries meaning. Neither dominates across all tasks.
+
+### Open question: why does TAPA actually work?
+
+TAPA's formula: `Attn(q, k) = (q_A · k_A) · cos(2π |m-n|^α · q_P · k_P)`
+
+With α=0.1, the distance factor |m-n|^0.1 barely varies:
+
+| distance | |m-n|^0.1 |
+|----------|----------|
+| 10       | 1.26     |
+| 1000     | 2.00     |
+| 64000    | 3.31     |
+
+The rapid phase variation comes from `q_P · k_P` — different key tokens have different phase projections. This is content-dependent, not distance-dependent. The |m-n|^0.1 factor is needed for the mathematical proof (oscillatory integral convergence) but contributes almost nothing to the actual phase variation in practice.
+
+This means TAPA is effectively: **NoPE with a content-dependent cos modulation**. The attention score is the standard content similarity (q_A · k_A) multiplied by a content-dependent gating factor (cos of q_P · k_P, with a negligible distance multiplier).
+
+**The confusion**: if TAPA is essentially NoPE + cos gating, why does NoPE fail at long sequences while TAPA succeeds at 64K?
+
+NoPE fails due to attention distraction — softmax spreads probability across too many tokens at long sequences. TAPA's cos modulation must somehow prevent this, but the mechanism isn't obvious:
+
+- The cos factor can be negative, zero, or positive. After softmax, negative contributions get suppressed exponentially. This creates sharper attention than plain dot product.
+- The cos factor creates destructive interference — misaligned token pairs get cos ≈ 0, effectively removing them from the attention pool. This is more aggressive than NoPE's dot product, which merely gives them low scores.
+- The multiplicative interaction (amplitude × cos(phase)) may create a sparser effective attention pattern than additive interactions.
+
+**Both TAPA and cumsum use cos-based phase modulation** to create selective attention:
+- TAPA: `cos(content-pair-dependent phase × gentle distance factor)`
+- Cumsum: `cos(cumulative content-dependent angles)` (via rotary embedding)
+
+Both produce cos modulation of attention scores. Both enable length generalization. The mechanism may be more similar than it appears from the surface-level formulations. The key shared ingredient is **content-dependent phase modulation that creates constructive/destructive interference in attention**, rather than the specific source of the phase (explicit |m-n| vs cumsum).
+
+This remains an open question for further investigation.
+
+### What our experiments contributed
+
+Our experimental journey uncovered several key insights:
+
+1. **Zero-mean angles are essential for cumsum-based length generalization** — positive cumsum drifts like RoPE.
+2. **LayerNorm destroys multi-scale frequency structure** — the 7000x range of RoPE frequencies gets collapsed to uniform std=1.
+3. **Learned freq with random noise (lf/lfb) is the best cumsum architecture** — beats random/ALiBi at training length (32.42 PPL) while maintaining flat extrapolation.
+4. **V rotation consistently helps extrapolation** across all model types (+0.3 to +595 PPL at 8192). The benefit is largest when extrapolation is degraded and smallest when already flat.
+5. **V rotation hurts training-length PPL for learned models** — the optimization of shared angle parameters for both Q/K scoring and V rotation creates competing gradients.
+6. **Deterministic fixed signs per token overfit** — repeated tokens reinforce the same cumsum direction, creating sequence-length-dependent drift. Random noise per forward pass is essential.
+7. **Even "degraded" cumsum models beat RoPE at extrapolation** — our worst learned model (lfds at 40K: 95.76 at 8192) still beats RoPE (374.82 at 10K) and joformer_fixed (147.38 at 10K).
+8. **joformer_fixed (V rotation on RoPE angles) beats RoPE at training length** — 23.18 vs 23.54 at 200K. V rotation adds value for language modeling even without learned angles.
+9. **The fundamental limitation of cumsum**: the phase between distant tokens is determined by intervening tokens, not by the token pair itself. This prevents selective long-range attention (needle in haystack) but enables path-dependent attention (reasoning, code, narrative).

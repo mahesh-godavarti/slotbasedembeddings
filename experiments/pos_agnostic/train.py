@@ -91,7 +91,10 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, device,
     out = {}
     for split, data in [('train', train_data), ('val', val_data)]:
         rng_state = torch.random.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
         torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(42)
         losses = []
         for _ in range(eval_iters):
             x, y = get_batch(data, block_size, batch_size, device)
@@ -99,6 +102,8 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, device,
             losses.append(loss.item())
         out[split] = sum(losses) / len(losses)
         torch.random.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state)
     model.train()
     return out
 
@@ -112,12 +117,15 @@ def eval_lengths(model, val_data, lengths, batch_size, device, eval_iters=10):
     model.eval()
     results = {}
     rng_state = torch.random.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
     for length in lengths:
         if len(val_data) < length + 1:
             results[length] = {'loss': None, 'ppl': None, 'error': 'data too short'}
             continue
         try:
             torch.manual_seed(42 + length)  # deterministic per length
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(42 + length)
             losses = []
             for _ in range(eval_iters):
                 x, y = get_batch(val_data, length, batch_size, device)
@@ -136,6 +144,8 @@ def eval_lengths(model, val_data, lengths, batch_size, device, eval_iters=10):
             else:
                 raise
     torch.random.set_rng_state(rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state)
     model.train()
     return results
 
@@ -231,7 +241,8 @@ def train_model(model_name, model, train_data, val_data, args, device):
             extrap_log.append({'iter': it, 'results': {str(k): v for k, v in results.items()}})
             parts = [f"{l}:{r['ppl']}" for l, r in sorted(results.items())
                      if r.get('ppl') is not None]
-            tqdm.write(f"  [{model_name}] extrap iter {it}: {', '.join(parts)}")
+            extrap_str = ' '.join(parts)
+            pbar.set_postfix_str(f"[{model_name}] extrap iter {it}: {extrap_str}")
 
         # --- Angle lr warmup: switch on angle lr after warmup iters ---
         if angle_lr_warmup > 0 and it == angle_lr_warmup:
@@ -251,6 +262,9 @@ def train_model(model_name, model, train_data, val_data, args, device):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        # Post-step weight normalization (for fss models)
+        if hasattr(model, 'shared_angle_mlp') and getattr(model.shared_angle_mlp, 'normalize_weights', False):
+            model.shared_angle_mlp.normalize_weights_post_step()
         if scheduler:
             scheduler.step()
 
@@ -336,6 +350,21 @@ def main():
                         help='Separate learning rate for angle parameters (0=use main lr)')
     parser.add_argument('--angle_lr_warmup', type=int, default=0,
                         help='Keep angle lr at 0 for this many iters before switching on')
+    parser.add_argument('--freeze_angle_emb', action='store_true',
+                        help='Freeze angle_emb at zero (initial angles stay as pure RoPE)')
+    parser.add_argument('--angle_hidden_mult', type=int, default=4,
+                        help='Hidden layer multiplier for angle MLP (1=same as embed, 4=standard FFN)')
+    parser.add_argument('--angle_activation', type=str, default='tanh',
+                        choices=['tanh', 'tanh_freq', 'tanh_lfreq', 'ln_tanh_freq', 'ln', 'none'],
+                        help='Angle activation: tanh (tanh*pi), tanh_freq (tanh*rope_freq), ln_tanh_freq (tanh(LN)*rope_freq), ln (LayerNorm), none (raw)')
+    parser.add_argument('--angle_dropout', type=float, default=0.0,
+                        help='Dropout rate on angle outputs (0=no dropout)')
+    parser.add_argument('--uniform_random_freq', type=float, default=0.0,
+                        help='Use uniform frequency for all random angle dimensions (0=log-spaced RoPE freqs)')
+    parser.add_argument('--detach_v', action='store_true',
+                        help='Detach angles from gradient for V rotation (no gradient conflict)')
+    parser.add_argument('--rope_v', action='store_true',
+                        help='Use fixed RoPE angles for V rotation instead of cumsum angles')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device index (default: 0)')
     parser.add_argument('--smoke', action='store_true',
@@ -395,7 +424,19 @@ def main():
         model = GPTModel(vocab_size, args.n_embed, args.n_layers, args.n_heads,
                          args.block_size, args.dropout, attn_config=model_name,
                          window_size=args.window_size, use_softplus=args.softplus,
-                         split_angles=split_angles)
+                         split_angles=split_angles,
+                         angle_hidden_mult=args.angle_hidden_mult,
+                         angle_activation=args.angle_activation,
+                         angle_dropout=args.angle_dropout,
+                         uniform_random_freq=args.uniform_random_freq,
+                         detach_v=args.detach_v,
+                         rope_v=args.rope_v)
+        if args.freeze_angle_emb and hasattr(model, 'angle_emb'):
+            model.angle_emb.weight.requires_grad = False
+            model._use_random_angle_emb = True
+            if args.angle_activation in ('tanh_lfreq', 'tanh_freq', 'tanh'):
+                model._keep_rope_base = True  # keep additive rope_base in blocks
+            print(f"Frozen angle_emb, using random ±1 × rope_freq per token")
         result = train_model(model_name, model, train_data, val_data, args, device)
         all_results[model_name] = result
 
