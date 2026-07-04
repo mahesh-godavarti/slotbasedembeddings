@@ -1,5 +1,11 @@
 # -----------------------------------------------------------------------------
-# Exp 7: Native KG+Text vs Linearized KG-as-Text
+# Exp 7: Native KG+Text vs Linearized KG-as-Text (Dual-Objective variant)
+#
+# Extended with --dual_objective flag: applies BOTH MLM and causal objectives
+# to BOTH text and KG modalities each iteration (inspired by UniLM).
+#   - Text: causal NTP (existing) + bidirectional MLM (new)
+#   - KG: bidirectional MLM (existing) + causal NTP (new for A/D/F/G)
+# Without --dual_objective, behaves identically to kg_text_experiment.py.
 #
 # Tests the core claim: journey attention with native KG role operators
 # outperforms linearizing KG triples into text.
@@ -30,6 +36,7 @@
 #   Tier 7: Text-exclusive generalization (base in text only, derived nowhere)
 # -----------------------------------------------------------------------------
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,6 +68,7 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mlm_mask_prob = 0.15  # MLM masking probability
     use_softmax = False   # Use softmax attention instead of log(exp(x)+1)
+    dual_objective = False # Enable dual-objective: MLM+causal on both text and KG
 
 cfg = Config()
 
@@ -539,6 +547,38 @@ class TextDataset:
 
         return x.to(device), y.to(device)
 
+    def get_mlm_batch(self, batch_size, device, mask_prob=0.15):
+        """Get a bidirectional MLM batch from text data.
+        Randomly masks tokens and predicts them with bidirectional attention.
+
+        Returns:
+            tokens: (B, T) token ids with some positions replaced by MASK
+            targets: (B, T) original token ids at masked positions, -100 elsewhere
+        """
+        indices = torch.randint(0, len(self.encoded), (batch_size,))
+        batch = [self.encoded[i] for i in indices]
+
+        max_len = max(len(s) for s in batch)
+        tokens = torch.full((batch_size, max_len), self.vocab.PAD, dtype=torch.long)
+        targets = torch.full((batch_size, max_len), -100, dtype=torch.long)
+
+        for i, seq in enumerate(batch):
+            seq_len = len(seq)
+            tokens[i, :seq_len] = seq
+
+            mask = torch.rand(seq_len) < mask_prob
+            # Don't mask BOS (position 0)
+            mask[0] = False
+            if mask.sum() == 0 and seq_len > 1:
+                mask[torch.randint(1, seq_len, (1,))] = True
+
+            for j in range(seq_len):
+                if mask[j]:
+                    targets[i, j] = seq[j]
+                    tokens[i, j] = self.vocab.MASK
+
+        return tokens.to(device), targets.to(device)
+
 
 class KGDataset:
     """Dataset for KG training with MLM or tail-prediction."""
@@ -686,17 +726,145 @@ class KGDataset:
         negate_angles = [batch[i].get("inverse", False) for i in range(batch_size)]
         return char_tokens.to(device), targets.to(device), head_lens, rel_names, negate_angles
 
-    def get_causal_batch_native(self, batch_size, device):
-        """Get a causal (next-token prediction) batch for E/E'.
+    def get_slot_causal_batch_slotted(self, batch_size, device):
+        """Slot-causal batch for A/G: mask one slot, predict it causally.
 
-        50% of the time flips direction: (H, R, T) -> (T, R, H) with negated angle.
+        Rearranges sequence: [unmasked_slots...] [masked_slot]
+        so causal prediction within the masked slot works naturally.
 
         Returns:
-            char_tokens: (B, T) input token ids (head + tail)
-            targets: (B, T) shifted targets (-100 for padding)
-            head_lens: list of int, length of head part
+            tokens: (B, T) rearranged token ids
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL for each position
+            slot_positions: (B, T) int — position within slot for each position
             rel_names: list of relation name strings
-            negate_angles: list of bool, True if angles should be negated
+            context_lens: list of int — number of unmasked context tokens per sample
+        """
+        indices = torch.randint(0, len(self.encoded), (batch_size,))
+        batch = [self.encoded[i] for i in indices]
+
+        seqs = []
+        all_slot_assignments = []
+        all_slot_positions = []
+        context_lens = []
+        for b in batch:
+            head = b["head"]
+            rel = [b["rel_token"]]
+            tail = b["tail"]
+            # Three slots: (tokens, slot_id)
+            slots = [(head, 0), (rel, 1), (tail, 2)]
+            # Pick random slot to mask
+            masked_slot_idx = random.randint(0, 2)
+            # Rearrange: unmasked first (in original order), masked last
+            unmasked = [s for i, s in enumerate(slots) if i != masked_slot_idx]
+            masked = slots[masked_slot_idx]
+            # Build rearranged sequence
+            seq = []
+            sa = []   # slot assignments
+            sp = []   # slot positions
+            for toks, sid in unmasked:
+                for j, t in enumerate(toks):
+                    seq.append(t)
+                    sa.append(sid)
+                    sp.append(j)
+            ctx_len = len(seq)
+            context_lens.append(ctx_len)
+            toks, sid = masked
+            for j, t in enumerate(toks):
+                seq.append(t)
+                sa.append(sid)
+                sp.append(j)
+            seqs.append(seq)
+            all_slot_assignments.append(sa)
+            all_slot_positions.append(sp)
+
+        max_len = max(len(s) for s in seqs)
+
+        tokens = torch.full((batch_size, max_len), self.vocab.PAD, dtype=torch.long)
+        targets = torch.full((batch_size, max_len), -100, dtype=torch.long)
+        slot_assignments = torch.zeros(batch_size, max_len, dtype=torch.long)
+        slot_positions = torch.zeros(batch_size, max_len, dtype=torch.long)
+
+        for i, seq in enumerate(seqs):
+            seq_t = torch.tensor(seq, dtype=torch.long)
+            tokens[i, :len(seq)] = seq_t
+            slot_assignments[i, :len(seq)] = torch.tensor(all_slot_assignments[i], dtype=torch.long)
+            slot_positions[i, :len(seq)] = torch.tensor(all_slot_positions[i], dtype=torch.long)
+            # NTP targets: only within masked slot region
+            C = context_lens[i]
+            # Position C-1 predicts first masked token, each masked token predicts next
+            if C > 0 and C < len(seq):
+                targets[i, C - 1:len(seq) - 1] = seq_t[C:]
+
+        rel_names = [batch[i]["rel"] for i in range(batch_size)]
+        return (tokens.to(device), targets.to(device),
+                slot_assignments.to(device), slot_positions.to(device),
+                rel_names, context_lens)
+
+    def get_slot_causal_batch_flat(self, batch_size, device):
+        """Slot-causal batch for D/F: mask one slot, predict it causally.
+
+        Same structure as slotted but no slot_assignments/slot_positions needed
+        since D/F use position-based angles on the rearranged tokens directly.
+
+        Returns:
+            tokens: (B, T) rearranged token ids
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            rel_names: list of relation name strings
+            context_lens: list of int — number of unmasked context tokens per sample
+        """
+        indices = torch.randint(0, len(self.encoded), (batch_size,))
+        batch = [self.encoded[i] for i in indices]
+
+        seqs = []
+        context_lens = []
+        for b in batch:
+            head = b["head"]
+            rel = [b["rel_token"]]
+            tail = b["tail"]
+            slots = [head, rel, tail]
+            # Pick random slot to mask
+            masked_slot_idx = random.randint(0, 2)
+            # Rearrange: unmasked first (in original order), masked last
+            unmasked = [s for i, s in enumerate(slots) if i != masked_slot_idx]
+            masked = slots[masked_slot_idx]
+            seq = []
+            for toks in unmasked:
+                seq.extend(toks)
+            ctx_len = len(seq)
+            context_lens.append(ctx_len)
+            seq.extend(masked)
+            seqs.append(seq)
+
+        max_len = max(len(s) for s in seqs)
+
+        tokens = torch.full((batch_size, max_len), self.vocab.PAD, dtype=torch.long)
+        targets = torch.full((batch_size, max_len), -100, dtype=torch.long)
+
+        for i, seq in enumerate(seqs):
+            seq_t = torch.tensor(seq, dtype=torch.long)
+            tokens[i, :len(seq)] = seq_t
+            C = context_lens[i]
+            if C > 0 and C < len(seq):
+                targets[i, C - 1:len(seq) - 1] = seq_t[C:]
+
+        rel_names = [batch[i]["rel"] for i in range(batch_size)]
+        return tokens.to(device), targets.to(device), rel_names, context_lens
+
+    def get_slot_causal_batch_native(self, batch_size, device):
+        """Slot-causal batch for E/H/I: mask HEAD or TAIL, predict causally.
+
+        Native models have HEAD+TAIL only (2 slots, no relation token in sequence).
+        When masking HEAD: rearrange to [tail, head], negate_angles=True
+        When masking TAIL: keep as [head, tail], negate_angles=False
+
+        Returns:
+            char_tokens: (B, T) rearranged character tokens
+            targets: (B, T) NTP targets for masked slot, -100 elsewhere
+            head_lens: list of int (for angle computation in rearranged layout)
+            rel_names: list of relation name strings
+            negate_angles: list of bool
+            context_lens: list of int
         """
         indices = torch.randint(0, len(self.encoded), (batch_size,))
         batch = [self.encoded[i] for i in indices]
@@ -704,16 +872,22 @@ class KGDataset:
         seqs = []
         head_lens = []
         negate_angles = []
+        context_lens = []
         for b in batch:
-            flip = random.random() < 0.5
-            if flip:
+            mask_head = random.random() < 0.5
+            if mask_head:
+                # Rearrange to [tail, head] — tail is context, head is masked
                 seq = b["tail"] + b["head"]
-                head_lens.append(len(b["tail"]))
+                head_lens.append(len(b["tail"]))  # "head" in cumsum sense = first entity = tail
+                negate_angles.append(True)  # backward direction: tail→head
+                context_lens.append(len(b["tail"]))
             else:
+                # Keep as [head, tail] — head is context, tail is masked
                 seq = b["head"] + b["tail"]
                 head_lens.append(len(b["head"]))
+                negate_angles.append(False)  # forward direction: head→tail
+                context_lens.append(len(b["head"]))
             seqs.append(seq)
-            negate_angles.append(flip)
 
         max_len = max(len(s) for s in seqs)
 
@@ -723,11 +897,13 @@ class KGDataset:
         for i, seq in enumerate(seqs):
             seq_t = torch.tensor(seq, dtype=torch.long)
             char_tokens[i, :len(seq)] = seq_t
-            # Next-token prediction: target is shifted by 1
-            targets[i, :len(seq) - 1] = seq_t[1:]
+            C = context_lens[i]
+            if C > 0 and C < len(seq):
+                targets[i, C - 1:len(seq) - 1] = seq_t[C:]
 
         rel_names = [batch[i]["rel"] for i in range(batch_size)]
-        return char_tokens.to(device), targets.to(device), head_lens, rel_names, negate_angles
+        return (char_tokens.to(device), targets.to(device),
+                head_lens, rel_names, negate_angles, context_lens)
 
     def get_mlm_batch_native_slots(self, batch_size, device, mask_prob=0.15):
         """Get a batch for native-slot KG models (J/J'): character tokens only, no relation token.
@@ -773,6 +949,80 @@ class KGDataset:
 
         rel_names = [batch[i]["rel"] for i in range(batch_size)]
         return char_tokens.to(device), targets.to(device), head_lens, rel_names
+
+    def get_slot_causal_batch_native_slots(self, batch_size, device):
+        """Slot-causal batch for J/J': mask HEAD or TAIL, predict causally.
+
+        Native-slot models have HEAD+TAIL only (2 slots, no relation token).
+        Returns slot_assignments (0=HEAD, 1=TAIL) and slot_positions for
+        angle computation, instead of negate_angles used by E/H/I.
+
+        Returns:
+            tokens: (B, T) rearranged character tokens [context_entity | masked_entity]
+            targets: (B, T) NTP targets for masked entity only, -100 elsewhere
+            slot_assignments: (B, T) int — 0=HEAD, 1=TAIL for each position
+            slot_positions: (B, T) int — position within slot for each position
+            rel_names: list of relation name strings
+            context_lens: list of int — number of unmasked context tokens
+        """
+        indices = torch.randint(0, len(self.encoded), (batch_size,))
+        batch = [self.encoded[i] for i in indices]
+
+        seqs = []
+        all_slot_assignments = []
+        all_slot_positions = []
+        context_lens = []
+        for b in batch:
+            head = b["head"]
+            tail = b["tail"]
+            # Two slots: (tokens, slot_id)
+            slots = [(head, 0), (tail, 1)]  # 0=HEAD, 1=TAIL
+            # Pick random slot to mask
+            masked_slot_idx = random.randint(0, 1)
+            # Rearrange: unmasked first, masked last
+            unmasked = [s for i, s in enumerate(slots) if i != masked_slot_idx]
+            masked = slots[masked_slot_idx]
+            # Build rearranged sequence
+            seq = []
+            sa = []   # slot assignments
+            sp = []   # slot positions
+            for toks, sid in unmasked:
+                for j, t in enumerate(toks):
+                    seq.append(t)
+                    sa.append(sid)
+                    sp.append(j)
+            ctx_len = len(seq)
+            context_lens.append(ctx_len)
+            toks, sid = masked
+            for j, t in enumerate(toks):
+                seq.append(t)
+                sa.append(sid)
+                sp.append(j)
+            seqs.append(seq)
+            all_slot_assignments.append(sa)
+            all_slot_positions.append(sp)
+
+        max_len = max(len(s) for s in seqs)
+
+        tokens = torch.full((batch_size, max_len), self.vocab.PAD, dtype=torch.long)
+        targets = torch.full((batch_size, max_len), -100, dtype=torch.long)
+        slot_assignments = torch.zeros(batch_size, max_len, dtype=torch.long)
+        slot_positions = torch.zeros(batch_size, max_len, dtype=torch.long)
+
+        for i, seq in enumerate(seqs):
+            seq_t = torch.tensor(seq, dtype=torch.long)
+            tokens[i, :len(seq)] = seq_t
+            slot_assignments[i, :len(seq)] = torch.tensor(all_slot_assignments[i], dtype=torch.long)
+            slot_positions[i, :len(seq)] = torch.tensor(all_slot_positions[i], dtype=torch.long)
+            # NTP targets: only within masked slot region
+            C = context_lens[i]
+            if C > 0 and C < len(seq):
+                targets[i, C - 1:len(seq) - 1] = seq_t[C:]
+
+        rel_names = [batch[i]["rel"] for i in range(batch_size)]
+        return (tokens.to(device), targets.to(device),
+                slot_assignments.to(device), slot_positions.to(device),
+                rel_names, context_lens)
 
 
 # ============================================================================
@@ -842,13 +1092,14 @@ class RotaryAttention(nn.Module):
         self.use_softmax = use_softmax
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
-    def forward(self, x, angles, causal=True, pad_mask=None):
+    def forward(self, x, angles, causal=True, pad_mask=None, attn_mask=None):
         """
         Args:
             x: (B, T, C) input embeddings
             angles: (B, T, C//2) cumulative angles for rotation
             causal: whether to apply causal mask
             pad_mask: (B, T) boolean mask, True for valid positions
+            attn_mask: (B, T, T) boolean mask, True = can attend (overrides causal)
         """
         B, T, C = x.shape
         k = self.keys(x)
@@ -863,7 +1114,10 @@ class RotaryAttention(nn.Module):
 
         wei = k @ q.transpose(-1, -2) * C ** (-0.5)
 
-        if causal:
+        if attn_mask is not None:
+            # attn_mask: (B, T, T) bool, True = can attend
+            wei = wei.masked_fill(~attn_mask, float('-inf'))
+        elif causal:
             wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
 
         if pad_mask is not None:
@@ -896,10 +1150,43 @@ class TransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
 
-    def forward(self, x, angles, causal=True, pad_mask=None):
-        x = x + self.sa_head(self.ln1(x), angles, causal, pad_mask)
+    def forward(self, x, angles, causal=True, pad_mask=None, attn_mask=None):
+        x = x + self.sa_head(self.ln1(x), angles, causal, pad_mask, attn_mask)
         x = x + self.ffn(self.ln2(x))
         return x
+
+
+# ============================================================================
+# Slot-Causal Attention Mask Helper
+# ============================================================================
+
+def build_slot_causal_mask(batch_size, seq_len, context_lens, device):
+    """Build attention mask for slot-causal training.
+
+    For each sample:
+      - Context positions (0..context_len-1): bidirectional among themselves,
+        CANNOT see masked slot positions.
+      - Masked positions (context_len..seq_len-1): can see all context positions
+        + causal within the masked slot.
+
+    Args:
+        batch_size: int
+        seq_len: int
+        context_lens: list of int, number of unmasked context tokens per sample
+        device: torch device
+
+    Returns: (B, T, T) bool tensor, True = can attend
+    """
+    mask = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
+    for i in range(batch_size):
+        C = context_lens[i]
+        # Context rows: bidirectional within context only
+        mask[i, :C, :C] = True
+        # Masked rows: see all context + causal within masked slot
+        for j in range(C, seq_len):
+            mask[i, j, :C] = True       # all context
+            mask[i, j, C:j + 1] = True  # causal within masked slot
+    return mask
 
 
 # ============================================================================
@@ -946,28 +1233,61 @@ class ModelA(nn.Module):
         return angles.unsqueeze(0)  # (1, T, C//2)
 
     def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
-        """KG angles: position_in_slot * base_freq + slot_angle (vectorized).
+        """KG angles: position_in_slot * base_freq + slot_angle.
 
         Sequence layout: [head_chars] [rel_token] [tail_chars]
         - HEAD slot: positions 0..h_len-1, angle = pos * base_freq + slot_angles[0]
         - REL slot: position 0 (single token), angle = 0 * base_freq + slot_angles[1]
         - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[2]
+
+        Args:
+            head_lens: list of int, head length per sample
+            seq_len: total sequence length (head + 1 rel + tail, padded)
+            batch_size: batch size
+            rel_names: list of relation name strings
         """
-        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
-        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
+        angles = torch.zeros(batch_size, seq_len, self.n_embed // 2, device=device)
 
-        # Slot assignment: 0=HEAD, 1=REL, 2=TAIL
-        slot_ids = torch.where(positions < h_lens_t, 0,
-                   torch.where(positions == h_lens_t, 1, 2))  # (B, T)
+        for i in range(batch_size):
+            h_len = head_lens[i]
+            rel_pos = h_len        # position of the relation token
+            tail_start = h_len + 1  # first tail character position
 
-        # Position within slot
-        pos_in_slot = torch.where(slot_ids == 0, positions,
-                     torch.where(slot_ids == 1, torch.zeros_like(positions),
-                                 positions - h_lens_t - 1))  # (B, T)
+            # HEAD slot: positions 0..h_len-1
+            for j in range(h_len):
+                angles[i, j] = j * self.base_freq + self.slot_angles[0]
 
-        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
-        slot_offset = self.slot_angles[slot_ids]  # (B, T, C//2)
-        return rope + slot_offset
+            # REL slot: single token at position 0 in its slot
+            angles[i, rel_pos] = 0 * self.base_freq + self.slot_angles[1]
+
+            # TAIL slot: positions 0..t_len-1
+            for j in range(seq_len - tail_start):
+                if tail_start + j < seq_len:
+                    angles[i, tail_start + j] = j * self.base_freq + self.slot_angles[2]
+
+        return angles
+
+    def _kg_angles_slotcausal(self, slot_assignments, slot_positions, rel_names, device):
+        """KG angles for rearranged slot-causal sequences.
+
+        Each position gets: slot_position * base_freq + slot_angles[slot_id]
+
+        Args:
+            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL for each position
+            slot_positions: (B, T) int — position within slot for each position
+            rel_names: list of relation name strings (unused for A, shared slot_angles)
+            device: torch device
+        """
+        B, T = slot_assignments.shape
+        angles = torch.zeros(B, T, self.n_embed // 2, device=device)
+
+        for i in range(B):
+            for j in range(T):
+                sid = slot_assignments[i, j].item()
+                pos = slot_positions[i, j].item()
+                angles[i, j] = pos * self.base_freq + self.slot_angles[sid]
+
+        return angles
 
     def forward_text(self, idx, targets=None):
         """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
@@ -1011,6 +1331,49 @@ class ModelA(nn.Module):
         logits = self.lm_head(x)
 
         # MLM loss on masked positions only
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+        angles = self._rope_angles(T, tokens.device).expand(B, -1, -1)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, tokens, targets, slot_assignments, slot_positions,
+                          rel_names, context_lens):
+        """KG slot-causal: mask one slot, predict it with causal attention.
+
+        Args:
+            tokens: (B, T) rearranged token ids [unmasked_slots | masked_slot]
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL per position
+            slot_positions: (B, T) int — position within slot per position
+            rel_names: list of relation name strings
+            context_lens: list of int — number of unmasked context tokens
+        """
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+
+        x = self.token_embedding(tokens)
+        angles = self._kg_angles_slotcausal(slot_assignments, slot_positions,
+                                            rel_names, tokens.device)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, tokens.device)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1068,6 +1431,25 @@ class ModelB(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
+    def forward_text(self, idx, targets=None):
+        """Text mode: causal, next-token prediction (alias for forward)."""
+        return self.forward(idx, targets)
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+        angles = self._rope_angles(T, tokens.device).expand(B, -1, -1)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
     def predict_text(self, idx):
         logits, _ = self.forward(idx)
         return logits
@@ -1116,6 +1498,29 @@ class ModelC(nn.Module):
         if targets is None:
             return logits, None
 
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text(self, idx, targets=None):
+        """Text mode: causal, next-token prediction (alias for forward)."""
+        return self.forward(idx, targets)
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        x = self.expander(self.token_embedding(tokens))
+        pad_mask = (tokens != 0)
+
+        raw_angles = self.angle_embedding(tokens)
+        angles = torch.flip(raw_angles, dims=(1,))
+        angles = torch.cumsum(angles, dim=1)
+        angles = torch.flip(angles, dims=(1,))
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1204,6 +1609,44 @@ class ModelD(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.expander(self.token_embedding(tokens))
+        angles = self._cumsum_angles(tokens)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, tokens, targets, context_lens):
+        """KG slot-causal: mask one slot, predict it with causal attention.
+
+        Args:
+            tokens: (B, T) rearranged flat KG tokens [unmasked_slots | masked_slot]
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            context_lens: list of int — number of unmasked context tokens
+        """
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+
+        x = self.expander(self.token_embedding(tokens))
+        angles = self._cumsum_angles(tokens)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, tokens.device)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
     def predict_text(self, idx):
         logits, _ = self.forward_text(idx)
         return logits
@@ -1283,6 +1726,44 @@ class ModelF(nn.Module):
 
         logits = self.lm_head(x)
 
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+        angles = self._rope_angles(T, tokens.device).expand(B, -1, -1)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, tokens, targets, context_lens):
+        """KG slot-causal: mask one slot, predict it with causal attention.
+
+        Args:
+            tokens: (B, T) rearranged flat KG tokens [unmasked_slots | masked_slot]
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            context_lens: list of int — number of unmasked context tokens
+        """
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+
+        x = self.token_embedding(tokens)
+        angles = self._rope_angles(T, tokens.device).expand(B, -1, -1)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, tokens.device)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1450,17 +1931,17 @@ class ModelE(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
-    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
-        """KG mode with causal masking and next-token prediction.
-        Randomly flipped direction is handled by the batch function;
-        negate_angles tells us to negate the relation angle for flipped triples.
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names,
+                          negate_angles, context_lens):
+        """KG slot-causal: mask one entity, predict it with causal attention.
 
         Args:
-            char_tokens: (B, T) character tokens (head + tail)
-            targets: (B, T) next-token targets, -100 for padding
-            head_lens: list of head lengths
+            char_tokens: (B, T) rearranged character tokens [context_entity | masked_entity]
+            targets: (B, T) NTP targets for masked entity only, -100 elsewhere
+            head_lens: list of int (first entity length in rearranged layout)
             rel_names: list of relation strings
             negate_angles: list of bool, True if relation angle should be negated
+            context_lens: list of int — number of unmasked context tokens
         """
         B, T = char_tokens.shape
         pad_mask = (char_tokens != 0)
@@ -1468,12 +1949,28 @@ class ModelE(nn.Module):
         x = self.expander(self.token_embedding(char_tokens))
         angles = self._cumsum_angles_kg(char_tokens, head_lens, rel_names,
                                         char_tokens.device, negate_angles=negate_angles)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, char_tokens.device)
 
         for block in self.blocks:
-            x = block(x, angles, causal=True, pad_mask=pad_mask)
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
 
         logits = self.lm_head(x)
 
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.expander(self.token_embedding(tokens))
+        angles = self._cumsum_angles_text(tokens)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1536,7 +2033,7 @@ class ModelG(nn.Module):
         return angles.unsqueeze(0)  # (1, T, C//2)
 
     def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
-        """KG angles: position_in_slot * base_freq + slot_angle[rel] (vectorized).
+        """KG angles: position_in_slot * base_freq + slot_angle[rel].
 
         Like ModelA._kg_angles but slot angles are relation-dependent.
 
@@ -1545,24 +2042,50 @@ class ModelG(nn.Module):
         - REL slot: position 0 (single token), angle = 0 * base_freq + slot_angles[rel, 1]
         - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[rel, 2]
         """
-        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
-        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
+        angles = torch.zeros(batch_size, seq_len, self.n_embed // 2, device=device)
 
-        # Slot assignment: 0=HEAD, 1=REL, 2=TAIL
-        slot_ids = torch.where(positions < h_lens_t, 0,
-                   torch.where(positions == h_lens_t, 1, 2))  # (B, T)
+        for i in range(batch_size):
+            h_len = head_lens[i]
+            rel_pos = h_len        # position of the relation token
+            tail_start = h_len + 1  # first tail character position
+            rel_idx = self.rel_to_idx[rel_names[i]]
 
-        # Position within slot
-        pos_in_slot = torch.where(slot_ids == 0, positions,
-                     torch.where(slot_ids == 1, torch.zeros_like(positions),
-                                 positions - h_lens_t - 1))  # (B, T)
+            # HEAD slot: positions 0..h_len-1
+            for j in range(h_len):
+                angles[i, j] = j * self.base_freq + self.slot_angles[rel_idx, 0]
 
-        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+            # REL slot: single token at position 0 in its slot
+            angles[i, rel_pos] = 0 * self.base_freq + self.slot_angles[rel_idx, 1]
 
-        # Per-relation slot angles
-        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
-        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, seq_len), slot_ids]  # (B, T, C//2)
-        return rope + slot_offset
+            # TAIL slot: positions 0..t_len-1
+            for j in range(seq_len - tail_start):
+                if tail_start + j < seq_len:
+                    angles[i, tail_start + j] = j * self.base_freq + self.slot_angles[rel_idx, 2]
+
+        return angles
+
+    def _kg_angles_slotcausal(self, slot_assignments, slot_positions, rel_names, device):
+        """KG angles for rearranged slot-causal sequences (per-relation).
+
+        Each position gets: slot_position * base_freq + slot_angles[rel, slot_id]
+
+        Args:
+            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL for each position
+            slot_positions: (B, T) int — position within slot for each position
+            rel_names: list of relation name strings
+            device: torch device
+        """
+        B, T = slot_assignments.shape
+        angles = torch.zeros(B, T, self.n_embed // 2, device=device)
+
+        for i in range(B):
+            rel_idx = self.rel_to_idx[rel_names[i]]
+            for j in range(T):
+                sid = slot_assignments[i, j].item()
+                pos = slot_positions[i, j].item()
+                angles[i, j] = pos * self.base_freq + self.slot_angles[rel_idx, sid]
+
+        return angles
 
     def forward_text(self, idx, targets=None):
         """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
@@ -1597,6 +2120,49 @@ class ModelG(nn.Module):
         logits = self.lm_head(x)
 
         # MLM loss on masked positions only
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+        angles = self._rope_angles(T, tokens.device).expand(B, -1, -1)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_kg_causal(self, tokens, targets, slot_assignments, slot_positions,
+                          rel_names, context_lens):
+        """KG slot-causal: mask one slot, predict it with causal attention.
+
+        Args:
+            tokens: (B, T) rearranged token ids [unmasked_slots | masked_slot]
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            slot_assignments: (B, T) int — 0=HEAD, 1=REL, 2=TAIL per position
+            slot_positions: (B, T) int — position within slot per position
+            rel_names: list of relation name strings
+            context_lens: list of int — number of unmasked context tokens
+        """
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+
+        x = self.token_embedding(tokens)
+        angles = self._kg_angles_slotcausal(slot_assignments, slot_positions,
+                                            rel_names, tokens.device)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, tokens.device)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1760,17 +2326,17 @@ class ModelH(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
-    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
-        """KG mode with causal masking and next-token prediction.
-        Randomly flipped direction is handled by the batch function;
-        negate_angles tells us to negate the relation angle for flipped triples.
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names,
+                          negate_angles, context_lens):
+        """KG slot-causal: mask one entity, predict it with causal attention.
 
         Args:
-            char_tokens: (B, T) character tokens (head + tail)
-            targets: (B, T) next-token targets, -100 for padding
-            head_lens: list of head lengths
+            char_tokens: (B, T) rearranged character tokens [context_entity | masked_entity]
+            targets: (B, T) NTP targets for masked entity only, -100 elsewhere
+            head_lens: list of int (first entity length in rearranged layout)
             rel_names: list of relation strings
             negate_angles: list of bool, True if relation angle should be negated
+            context_lens: list of int — number of unmasked context tokens
         """
         B, T = char_tokens.shape
         pad_mask = (char_tokens != 0)
@@ -1778,12 +2344,28 @@ class ModelH(nn.Module):
         x = self.token_embedding(char_tokens)
         angles = self._cumsum_angles_kg(T, head_lens, rel_names, char_tokens.device,
                                         negate_angles=negate_angles)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, char_tokens.device)
 
         for block in self.blocks:
-            x = block(x, angles, causal=True, pad_mask=pad_mask)
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
 
         logits = self.lm_head(x)
 
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+        angles = self._cumsum_angles_text(T, B, tokens.device)
+
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1828,14 +2410,15 @@ class ModelI(nn.Module):
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
 
-        # Shared angle projector: single MLP used across all layers
-        # (shared is critical for V rotation — see exp7_modelI_architecture_experiments.md)
-        self.angle_projector = nn.Sequential(
-            nn.Linear(n_embed, n_embed),
-            nn.GELU(),
-            nn.Linear(n_embed, n_embed // 2),
-        )
-        self.angle_ln = nn.LayerNorm(n_embed // 2)
+        # Per-layer angle projectors: 2-layer MLP to extract angles from residual stream
+        self.angle_projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_embed, n_embed),
+                nn.GELU(),
+                nn.Linear(n_embed, n_embed // 2),
+            )
+            for _ in range(n_layers)
+        ])
 
         # Learned angle vectors for each relation type (shared across layers)
         self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
@@ -1918,7 +2501,7 @@ class ModelI(nn.Module):
         x = self.token_embedding(idx)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
+            raw_angles = self.angle_projectors[l](x)
             angles = self._cumsum_angles_text(raw_angles)
             x = block(x, angles, causal=True, pad_mask=pad_mask)
 
@@ -1947,7 +2530,7 @@ class ModelI(nn.Module):
         x = self.token_embedding(char_tokens)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
+            raw_angles = self.angle_projectors[l](x)
             angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
                                             char_tokens.device, negate_angles=negate_angles)
             x = block(x, angles, causal=False, pad_mask=pad_mask)
@@ -1958,30 +2541,47 @@ class ModelI(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
-    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names, negate_angles):
-        """KG mode with causal masking and next-token prediction.
-        Randomly flipped direction is handled by the batch function;
-        negate_angles tells us to negate the relation angle for flipped triples.
+    def forward_kg_causal(self, char_tokens, targets, head_lens, rel_names,
+                          negate_angles, context_lens):
+        """KG slot-causal: mask one entity, predict it with causal attention.
 
         Args:
-            char_tokens: (B, T) character tokens (head + tail)
-            targets: (B, T) next-token targets, -100 for padding
-            head_lens: list of head lengths
+            char_tokens: (B, T) rearranged character tokens [context_entity | masked_entity]
+            targets: (B, T) NTP targets for masked entity only, -100 elsewhere
+            head_lens: list of int (first entity length in rearranged layout)
             rel_names: list of relation strings
             negate_angles: list of bool, True if relation angle should be negated
+            context_lens: list of int — number of unmasked context tokens
         """
         B, T = char_tokens.shape
         pad_mask = (char_tokens != 0)
         x = self.token_embedding(char_tokens)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, char_tokens.device)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
+            raw_angles = self.angle_projectors[l](x)
             angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
                                             char_tokens.device, negate_angles=negate_angles)
-            x = block(x, angles, causal=True, pad_mask=pad_mask)
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
 
         logits = self.lm_head(x)
 
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
+                               ignore_index=-100)
+        return logits, loss
+
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+
+        for l, block in enumerate(self.blocks):
+            raw_angles = self.angle_projectors[l](x)
+            angles = self._cumsum_angles_text(raw_angles)
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
+
+        logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -1990,6 +2590,10 @@ class ModelI(nn.Module):
         logits, _ = self.forward_text(idx)
         return logits
 
+
+# ============================================================================
+# Model J/J': Per-Relation Named Slot Angles, Native KG (no REL token)
+# ============================================================================
 
 class ModelJ(nn.Module):
     """RoPE + per-relation named slot angles, native KG (no REL token).
@@ -2041,27 +2645,52 @@ class ModelJ(nn.Module):
         return angles.unsqueeze(0)  # (1, T, C//2)
 
     def _kg_angles(self, head_lens, seq_len, batch_size, rel_names, device):
-        """KG angles: position_in_slot * base_freq + slot_angle[rel] (vectorized).
+        """KG angles: position_in_slot * base_freq + slot_angle[rel].
 
         Native sequence layout: [head_chars] [tail_chars] (no relation token)
         - HEAD slot: positions 0..h_len-1, angle = pos * base_freq + slot_angles[rel, 0]
         - TAIL slot: positions 0..t_len-1, angle = pos * base_freq + slot_angles[rel, 1]
         """
-        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)  # (B, T)
-        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
+        angles = torch.zeros(batch_size, seq_len, self.n_embed // 2, device=device)
 
-        # Slot assignment: 0=HEAD, 1=TAIL (no REL token)
-        slot_ids = torch.where(positions < h_lens_t, 0, 1)  # (B, T)
+        for i in range(batch_size):
+            h_len = head_lens[i]
+            rel_idx = self.rel_to_idx[rel_names[i]]
 
-        # Position within slot
-        pos_in_slot = torch.where(slot_ids == 0, positions, positions - h_lens_t)  # (B, T)
+            # HEAD slot: positions 0..h_len-1
+            for j in range(h_len):
+                angles[i, j] = j * self.base_freq + self.slot_angles[rel_idx, 0]
 
-        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
+            # TAIL slot: positions 0..t_len-1
+            tail_start = h_len
+            for j in range(seq_len - tail_start):
+                if tail_start + j < seq_len:
+                    angles[i, tail_start + j] = j * self.base_freq + self.slot_angles[rel_idx, 1]
 
-        # Per-relation slot angles
-        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
-        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, seq_len), slot_ids]  # (B, T, C//2)
-        return rope + slot_offset
+        return angles
+
+    def _kg_angles_slotcausal(self, slot_assignments, slot_positions, rel_names, device):
+        """KG angles for rearranged slot-causal sequences (per-relation, 2 slots).
+
+        Each position gets: slot_position * base_freq + slot_angles[rel, slot_id]
+
+        Args:
+            slot_assignments: (B, T) int — 0=HEAD, 1=TAIL for each position
+            slot_positions: (B, T) int — position within slot for each position
+            rel_names: list of relation name strings
+            device: torch device
+        """
+        B, T = slot_assignments.shape
+        angles = torch.zeros(B, T, self.n_embed // 2, device=device)
+
+        for i in range(B):
+            rel_idx = self.rel_to_idx[rel_names[i]]
+            for j in range(T):
+                sid = slot_assignments[i, j].item()
+                pos = slot_positions[i, j].item()
+                angles[i, j] = pos * self.base_freq + self.slot_angles[rel_idx, sid]
+
+        return angles
 
     def forward_text(self, idx, targets=None):
         """Text mode: pure RoPE (slot angles = 0), causal, next-token prediction."""
@@ -2104,143 +2733,45 @@ class ModelJ(nn.Module):
                                ignore_index=-100)
         return logits, loss
 
-    def predict_text(self, idx):
-        logits, _ = self.forward_text(idx)
-        return logits
+    def forward_text_mlm(self, tokens, targets):
+        """Text mode: bidirectional attention, MLM on randomly masked tokens."""
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
+        x = self.token_embedding(tokens)
+        angles = self._rope_angles(T, tokens.device).expand(B, -1, -1)
 
-
-class ModelK(nn.Module):
-    """Per-layer projected angles + RoPE + per-relation slot angles, native KG.
-
-    Like Model J (RoPE + per-relation slot angles) but with an additional
-    per-layer projected angle from the residual stream (like Model I).
-
-    Total angle = projected_angle + RoPE + slot_angle
-
-    Journey from token i (pos p1) in slot s1 to token j (pos p2) in slot s2:
-        (proj_i + p1*freq + slot[rel,s1]) - (proj_j + p2*freq + slot[rel,s2])
-    The projected angles add per-token content-dependent geometry on top of
-    J's position+relation structure.
-
-    Text: angles = projected + RoPE (no slots). Causal mask, NTP.
-    KG: angles = projected + pos_in_slot * freq + slot_angle[rel, slot_id].
-        Native format [head_chars][tail_chars], bidirectional, MLM.
-
-    rotate_v=False -> Model K
-    rotate_v=True  -> Model K'
-    """
-
-    def __init__(self, vocab_size, n_embed, n_layers, block_size, n_relations=8,
-                 dropout=0.2, rotate_v=False, use_softmax=False):
-        super().__init__()
-        self.n_embed = n_embed
-
-        self.token_embedding = nn.Embedding(vocab_size, n_embed)  # Full dim
-
-        # Per-layer angle projectors: extract angles from residual stream (like Model I)
-        self.angle_projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(n_embed, n_embed),
-                nn.GELU(),
-                nn.Linear(n_embed, n_embed // 2),
-            )
-            for _ in range(n_layers)
-        ])
-
-        # Per-relation slot angle vectors: [n_relations, 2, n_embed//2] (like Model J)
-        # Slot 0 = HEAD, Slot 1 = TAIL (no REL slot)
-        self.slot_angles = nn.Parameter(torch.randn(n_relations, 2, n_embed // 2) * 0.1)
-
-        # RoPE base frequencies (like Model J)
-        self.register_buffer('base_freq',
-            1.0 / (10000 ** (torch.arange(0, n_embed // 2).float() / (n_embed // 2))))
-
-        self.blocks = nn.ModuleList([
-            TransformerBlock(n_embed, block_size, dropout, rotate_v, use_softmax)
-            for _ in range(n_layers)
-        ])
-
-        self.lm_head = nn.Linear(n_embed, vocab_size)
-
-        # Mapping from relation name to index
-        self.rel_to_idx = {rel: i for i, rel in enumerate(KG_RELATIONS)}
-
-    def _rope_angles(self, T, device):
-        """Standard RoPE angles: position * base_freq. Shape: (1, T, C//2)."""
-        positions = torch.arange(T, device=device, dtype=torch.float)
-        angles = torch.outer(positions, self.base_freq)  # (T, C//2)
-        return angles.unsqueeze(0)  # (1, T, C//2)
-
-    def _kg_angles(self, raw_angles, head_lens, rel_names, device):
-        """Combine projected angles + RoPE (per-slot positions) + slot angles for KG.
-
-        Args:
-            raw_angles: (B, T, C//2) from angle projector at this layer
-            head_lens: list of head lengths
-            rel_names: list of relation strings
-            device: torch device
-
-        Returns: (B, T, C//2) = projected + pos_in_slot*freq + slot_offset
-        """
-        B, T, D = raw_angles.shape
-
-        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)  # (B, T)
-        h_lens_t = torch.tensor(head_lens, device=device).unsqueeze(1)  # (B, 1)
-
-        # Slot assignment: 0=HEAD, 1=TAIL
-        slot_ids = torch.where(positions < h_lens_t, 0, 1)  # (B, T)
-
-        # Position within slot (resets for tail)
-        pos_in_slot = torch.where(slot_ids == 0, positions, positions - h_lens_t)  # (B, T)
-
-        # RoPE from position within slot
-        rope = pos_in_slot.unsqueeze(-1).float() * self.base_freq  # (B, T, C//2)
-
-        # Per-relation slot angles
-        rel_indices = torch.tensor([self.rel_to_idx[r] for r in rel_names], device=device)  # (B,)
-        slot_offset = self.slot_angles[rel_indices.unsqueeze(1).expand(-1, T), slot_ids]  # (B, T, C//2)
-
-        return raw_angles + rope + slot_offset
-
-    def forward_text(self, idx, targets=None):
-        """Text mode: projected angles + RoPE (no slots), causal, NTP."""
-        B, T = idx.shape
-        pad_mask = (idx != 0)
-        x = self.token_embedding(idx)
-        rope = self._rope_angles(T, idx.device).expand(B, -1, -1)
-
-        for l, block in enumerate(self.blocks):
-            projected = self.angle_projectors[l](x)  # (B, T, C//2)
-            angles = projected + rope
-            x = block(x, angles, causal=True, pad_mask=pad_mask)
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask)
 
         logits = self.lm_head(x)
-
-        if targets is None:
-            return logits, None
-
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
 
-    def forward_kg(self, char_tokens, targets, head_lens, rel_names, negate_angles=None):
-        """KG mode: projected + RoPE + slot angles, bidirectional, MLM.
+    def forward_kg_causal(self, tokens, targets, slot_assignments, slot_positions,
+                          rel_names, context_lens):
+        """KG slot-causal: mask one slot (HEAD or TAIL), predict it with causal attention.
 
-        Native format: [head_chars][tail_chars], no relation token in sequence.
-        negate_angles is accepted for API compatibility but ignored.
+        Args:
+            tokens: (B, T) rearranged token ids [unmasked_slot | masked_slot]
+            targets: (B, T) NTP targets for masked slot only, -100 elsewhere
+            slot_assignments: (B, T) int — 0=HEAD, 1=TAIL per position
+            slot_positions: (B, T) int — position within slot per position
+            rel_names: list of relation name strings
+            context_lens: list of int — number of unmasked context tokens
         """
-        B, T = char_tokens.shape
-        pad_mask = (char_tokens != 0)
+        B, T = tokens.shape
+        pad_mask = (tokens != 0)
 
-        x = self.token_embedding(char_tokens)
+        x = self.token_embedding(tokens)
+        angles = self._kg_angles_slotcausal(slot_assignments, slot_positions,
+                                            rel_names, tokens.device)
+        attn_mask = build_slot_causal_mask(B, T, context_lens, tokens.device)
 
-        for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_projectors[l](x)  # (B, T, C//2)
-            angles = self._kg_angles(raw_angles, head_lens, rel_names, char_tokens.device)
-            x = block(x, angles, causal=False, pad_mask=pad_mask)
+        for block in self.blocks:
+            x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
 
         logits = self.lm_head(x)
-
         loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), targets.view(-1),
                                ignore_index=-100)
         return logits, loss
@@ -2539,7 +3070,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
     with torch.no_grad():
         for (head_len, tail_len), prompt_indices in groups.items():
             # Determine sequence length for this group
-            if model_type in ("E", "H", "I", "J", "K"):
+            if model_type in ("E", "H", "I", "J"):
                 seq_len = head_len + tail_len
             else:
                 seq_len = head_len + 1 + tail_len  # +1 for relation token
@@ -2558,7 +3089,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
 
                     for bi, pi in enumerate(sb_indices):
                         ep = encoded_prompts[pi]
-                        if model_type in ("E", "H", "I", "J", "K"):
+                        if model_type in ("E", "H", "I", "J"):
                             seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
                             mask_pos = head_len + t_idx
                         else:
@@ -2578,7 +3109,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                     logits = _forward_kg_eval(model, tokens, targets, head_lens_list, rel_names_list, model_type)
 
                     # Extract results per prompt
-                    mask_pos = head_len + t_idx if model_type in ("E", "H", "I", "J", "K") else head_len + 1 + t_idx
+                    mask_pos = head_len + t_idx if model_type in ("E", "H", "I", "J") else head_len + 1 + t_idx
                     for bi, pi in enumerate(sb_indices):
                         ep = encoded_prompts[pi]
                         step_logits = logits[bi, mask_pos, :]
@@ -2606,7 +3137,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
 
                 for bi, pi in enumerate(sb_indices):
                     ep = encoded_prompts[pi]
-                    if model_type in ("E", "H", "I", "J", "K"):
+                    if model_type in ("E", "H", "I", "J"):
                         seq = list(ep["head_tokens"]) + list(ep["tail_tokens"])
                         for ti in range(tail_len):
                             pos = head_len + ti
@@ -2632,7 +3163,7 @@ def evaluate_model_kg(model, kg_eval_prompts, vocab, config, model_name="?", mod
                 for bi, pi in enumerate(sb_indices):
                     ep = encoded_prompts[pi]
                     for ti in range(tail_len):
-                        mask_pos = head_len + ti if model_type in ("E", "H", "I", "J", "K") else head_len + 1 + ti
+                        mask_pos = head_len + ti if model_type in ("E", "H", "I", "J") else head_len + 1 + ti
                         pred = torch.argmax(logits[bi, mask_pos, :]).item()
                         if pred != ep["tail_tokens"][ti]:
                             hit1s[pi] = 0
@@ -2936,8 +3467,8 @@ def _build_kg_eval_batch(head_tokens, rel_name, tail_tokens, mask_positions,
     head_len = len(head_tokens)
     tail_len = len(tail_tokens)
 
-    if model_type in ("E", "I", "J", "K"):
-        # Model E/I/J/K: char_tokens = head + tail (no relation token in sequence)
+    if model_type in ("E", "I", "J"):
+        # Model E/I/J: char_tokens = head + tail (no relation token in sequence)
         seq = list(head_tokens) + list(tail_tokens)
         seq_len = len(seq)
         tokens = torch.full((1, seq_len), vocab.PAD, dtype=torch.long)
@@ -2978,7 +3509,7 @@ def _forward_kg_eval(model, tokens, targets, head_lens, rel_names, model_type):
         logits, _ = model.forward_kg(tokens, targets, head_lens, rel_names)
     elif model_type in ("D", "F"):
         logits, _ = model.forward_kg(tokens, targets)
-    elif model_type in ("E", "H", "I", "J", "K"):
+    elif model_type in ("E", "H", "I", "J"):
         logits, _ = model.forward_kg(tokens, targets, head_lens, rel_names)
     return logits
 
@@ -2987,20 +3518,88 @@ def _forward_kg_eval(model, tokens, targets, head_lens, rel_names, model_type):
 # Training
 # ============================================================================
 
+@torch.no_grad()
+def _eval_text_ppl(model, text_dataset, config, n_batches=10):
+    """Estimate text PPL (causal) by averaging over n_batches."""
+    model.eval()
+    total_loss = 0.0
+    for _ in range(n_batches):
+        x, y = text_dataset.get_batch(config.batch_size, config.device)
+        if hasattr(model, 'forward_text'):
+            _, loss = model.forward_text(x, y)
+        else:
+            _, loss = model(x, y)
+        total_loss += loss.item()
+    model.train()
+    return math.exp(total_loss / n_batches)
+
+
+@torch.no_grad()
+def _eval_kg_ppl(model, kg_dataset, config, kg_batch_fn, n_batches=10):
+    """Estimate KG PPL (MLM) by averaging over n_batches."""
+    model.eval()
+    total_loss = 0.0
+    for _ in range(n_batches):
+        if kg_batch_fn == "slotted":
+            tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+        elif kg_batch_fn == "native":
+            ct, tgt, hl, rn, neg = kg_dataset.get_mlm_batch_native(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(ct, tgt, hl, rn, neg)
+        elif kg_batch_fn == "native_slots":
+            ct, tgt, hl, rn = kg_dataset.get_mlm_batch_native_slots(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(ct, tgt, hl, rn)
+        elif kg_batch_fn == "flat":
+            tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, loss = model.forward_kg(tokens, targets)
+        total_loss += loss.item()
+    model.train()
+    return math.exp(total_loss / n_batches)
+
+
 def train_model_text_only(model, text_dataset, config, name="?",
                           resume_optimizer_state=None):
-    """Train text-only model (B/B', C/C') with next-token prediction."""
+    """Train text-only model (B/B', C/C') with next-token prediction.
+
+    When config.dual_objective is True, randomly picks one objective per
+    iteration: text_causal or text_mlm.
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
     if resume_optimizer_state is not None:
         optimizer.load_state_dict(resume_optimizer_state)
     model.to(config.device)
     model.train()
 
-    losses_log = {"text": [], "iter": []}
+    dual = config.dual_objective
+    losses_log = {"text": [], "iter": [], "eval_text_ppl": []}
+    if dual:
+        losses_log["text_mlm"] = []
 
     for it in tqdm(range(config.max_iters), desc=f"Model {name}"):
-        x, y = text_dataset.get_batch(config.batch_size, config.device)
-        _, loss = model(x, y)
+        if dual:
+            obj = random.choice(["text_causal", "text_mlm"])
+        else:
+            obj = "text_causal"
+
+        causal_loss = torch.tensor(0.0)
+        mlm_loss = torch.tensor(0.0)
+
+        if obj == "text_causal":
+            x, y = text_dataset.get_batch(config.batch_size, config.device)
+            if hasattr(model, 'forward_text'):
+                _, causal_loss = model.forward_text(x, y)
+            else:
+                _, causal_loss = model(x, y)
+            loss = causal_loss
+        else:  # text_mlm
+            mlm_tokens, mlm_targets = text_dataset.get_mlm_batch(
+                config.batch_size, config.device, config.mlm_mask_prob)
+            _, mlm_loss = model.forward_text_mlm(mlm_tokens, mlm_targets)
+            loss = mlm_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -3009,23 +3608,35 @@ def train_model_text_only(model, text_dataset, config, name="?",
 
         if it % config.eval_interval == 0:
             losses_log["iter"].append(it)
-            losses_log["text"].append(loss.item())
-            print(f"  [{name}] iter {it}, loss: {loss.item():.4f}")
+            losses_log["text"].append(causal_loss.item())
+            train_ppl = math.exp(loss.item())
+            eval_text_ppl = _eval_text_ppl(model, text_dataset, config)
+            losses_log["eval_text_ppl"].append(round(eval_text_ppl, 2))
+            if dual:
+                losses_log["text_mlm"].append(mlm_loss.item())
+                print(f"  [{name}] iter {it} [{obj}], train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}")
+            else:
+                print(f"  [{name}] iter {it}, train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}")
 
     return losses_log, optimizer.state_dict()
 
 
 def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
                       kg_batch_fn="native", resume_optimizer_state=None,
-                      kg_only=False, causal_kg=False):
-    """Train mixed text+KG model (A/A', D/D', E/E').
+                      kg_only=False):
+    """Train mixed text+KG model (A/A', D/D', E/E', F/F', G/G', H/H', I/I', J/J').
 
     Each iteration: text batch (causal, NTP) + KG batch (bidir, MLM).
+    When config.dual_objective is True, randomly picks one objective per
+    iteration from {text_causal, text_mlm, kg_mlm, kg_causal}.
 
     Args:
-        kg_batch_fn: "slotted" for A/A' (get_mlm_batch_slotted),
-                     "native" for E/E' (get_mlm_batch_native),
-                     "flat" for D/D' (get_mlm_batch_flat)
+        kg_batch_fn: "slotted" for A/A',G/G' (get_mlm_batch_slotted),
+                     "native" for E/E',H/H',I/I' (get_mlm_batch_native),
+                     "native_slots" for J/J' (get_mlm_batch_native_slots),
+                     "flat" for D/D',F/F' (get_mlm_batch_flat)
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
     if resume_optimizer_state is not None:
@@ -3033,45 +3644,120 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
     model.to(config.device)
     model.train()
 
-    losses_log = {"text": [], "kg": [], "iter": []}
+    dual = config.dual_objective
+
+    losses_log = {"text": [], "kg": [], "iter": [],
+                  "eval_text_ppl": [], "eval_kg_ppl": []}
+    if dual:
+        losses_log["text_mlm"] = []
+        losses_log["kg_causal"] = []
+
+    # Build the pool of objectives for random selection
+    if dual:
+        if kg_only:
+            objectives = ["kg_mlm", "kg_causal"]
+        else:
+            objectives = ["text_causal", "text_mlm", "kg_mlm", "kg_causal"]
 
     for it in tqdm(range(config.max_iters), desc=f"Model {name}"):
-        # --- Text batch ---
-        if not kg_only:
-            x, y = text_dataset.get_batch(config.batch_size, config.device)
-            if hasattr(model, 'forward_text'):
-                _, text_loss = model.forward_text(x, y)
-            else:
-                _, text_loss = model(x, y)
+        text_loss = torch.tensor(0.0)
+        text_mlm_loss = torch.tensor(0.0)
+        kg_loss = torch.tensor(0.0)
+        kg_causal_loss = torch.tensor(0.0)
 
-        # --- KG batch ---
-        if kg_batch_fn == "slotted":
-            tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
-        elif kg_batch_fn == "native" and causal_kg:
-            char_tokens, targets, head_lens, rel_names, negate = kg_dataset.get_causal_batch_native(
-                config.batch_size, config.device)
-            _, kg_loss = model.forward_kg_causal(char_tokens, targets, head_lens, rel_names, negate)
-        elif kg_batch_fn == "native":
-            char_tokens, targets, head_lens, rel_names, negate = kg_dataset.get_mlm_batch_native(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names, negate)
-        elif kg_batch_fn == "flat":
-            tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(tokens, targets)
-        elif kg_batch_fn == "native_slots":
-            char_tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_native_slots(
-                config.batch_size, config.device, config.mlm_mask_prob)
-            _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names)
-
-        # Combined loss
-        if kg_only:
-            loss = kg_loss
-            text_loss = torch.tensor(0.0)
+        if dual:
+            obj = random.choice(objectives)
         else:
-            loss = text_loss + kg_loss
+            obj = None  # non-dual: always do text_causal + kg_mlm
+
+        if not dual:
+            # --- Original behavior: text causal + KG MLM ---
+            if not kg_only:
+                x, y = text_dataset.get_batch(config.batch_size, config.device)
+                if hasattr(model, 'forward_text'):
+                    _, text_loss = model.forward_text(x, y)
+                else:
+                    _, text_loss = model(x, y)
+
+            if kg_batch_fn == "slotted":
+                tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+            elif kg_batch_fn == "native":
+                char_tokens, targets, head_lens, rel_names, negate = kg_dataset.get_mlm_batch_native(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names, negate)
+            elif kg_batch_fn == "flat":
+                tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(tokens, targets)
+            elif kg_batch_fn == "native_slots":
+                char_tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_native_slots(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names)
+
+            if kg_only:
+                loss = kg_loss
+            else:
+                loss = text_loss + kg_loss
+
+        else:
+            # --- Dual: randomly picked single objective ---
+            if obj == "text_causal":
+                x, y = text_dataset.get_batch(config.batch_size, config.device)
+                if hasattr(model, 'forward_text'):
+                    _, text_loss = model.forward_text(x, y)
+                else:
+                    _, text_loss = model(x, y)
+                loss = text_loss
+
+            elif obj == "text_mlm":
+                mlm_tokens, mlm_targets = text_dataset.get_mlm_batch(
+                    config.batch_size, config.device, config.mlm_mask_prob)
+                _, text_mlm_loss = model.forward_text_mlm(mlm_tokens, mlm_targets)
+                loss = text_mlm_loss
+
+            elif obj == "kg_mlm":
+                if kg_batch_fn == "slotted":
+                    tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_slotted(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(tokens, targets, head_lens, rel_names)
+                elif kg_batch_fn == "native":
+                    char_tokens, targets, head_lens, rel_names, negate = kg_dataset.get_mlm_batch_native(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names, negate)
+                elif kg_batch_fn == "flat":
+                    tokens, targets, rel_names = kg_dataset.get_mlm_batch_flat(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(tokens, targets)
+                elif kg_batch_fn == "native_slots":
+                    char_tokens, targets, head_lens, rel_names = kg_dataset.get_mlm_batch_native_slots(
+                        config.batch_size, config.device, config.mlm_mask_prob)
+                    _, kg_loss = model.forward_kg(char_tokens, targets, head_lens, rel_names)
+                loss = kg_loss
+
+            elif obj == "kg_causal":
+                if kg_batch_fn == "slotted":
+                    c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_slotted(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx)
+                elif kg_batch_fn == "native":
+                    c_tokens, c_targets, c_hlens, c_rels, c_neg, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_native(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_hlens, c_rels, c_neg, c_ctx)
+                elif kg_batch_fn == "flat":
+                    c_tokens, c_targets, c_rels, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_flat(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_ctx)
+                elif kg_batch_fn == "native_slots":
+                    c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx = \
+                        kg_dataset.get_slot_causal_batch_native_slots(config.batch_size, config.device)
+                    _, kg_causal_loss = model.forward_kg_causal(
+                        c_tokens, c_targets, c_sa, c_sp, c_rels, c_ctx)
+                loss = kg_causal_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -3082,8 +3768,19 @@ def train_model_mixed(model, text_dataset, kg_dataset, config, name="?",
             losses_log["iter"].append(it)
             losses_log["text"].append(text_loss.item())
             losses_log["kg"].append(kg_loss.item())
-            print(f"  [{name}] iter {it}, text_loss: {text_loss.item():.4f}, "
-                  f"kg_loss: {kg_loss.item():.4f}")
+            train_ppl = math.exp(loss.item())
+            eval_text_ppl = _eval_text_ppl(model, text_dataset, config) if not kg_only else 0.0
+            eval_kg_ppl = _eval_kg_ppl(model, kg_dataset, config, kg_batch_fn)
+            losses_log["eval_text_ppl"].append(round(eval_text_ppl, 2))
+            losses_log["eval_kg_ppl"].append(round(eval_kg_ppl, 2))
+            if dual:
+                losses_log["text_mlm"].append(text_mlm_loss.item())
+                losses_log["kg_causal"].append(kg_causal_loss.item())
+                print(f"  [{name}] iter {it} [{obj}], train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}, eval_kg_ppl: {eval_kg_ppl:.2f}")
+            else:
+                print(f"  [{name}] iter {it}, train_ppl: {train_ppl:.2f}, "
+                      f"eval_text_ppl: {eval_text_ppl:.2f}, eval_kg_ppl: {eval_kg_ppl:.2f}")
 
     return losses_log, optimizer.state_dict()
 
@@ -3287,14 +3984,14 @@ def evaluate_model(model, eval_prompts, vocab, config, model_name="?"):
 # Model Factory
 # ============================================================================
 
-MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'", "F", "F'", "G", "G'", "H", "H'", "I", "I'", "J", "J'", "K", "K'"]
+MODEL_NAMES = ["A", "A'", "B", "B'", "C", "C'", "D", "D'", "E", "E'", "F", "F'", "G", "G'", "H", "H'", "I", "I'", "J", "J'"]
 
 # Which models use linearized text (B/C family) vs structured KG (A/D/E family)
 LINEARIZED_MODELS = {"B", "B'", "C", "C'"}
 SLOTTED_KG_MODELS = {"A", "A'", "G", "G'"}    # use get_mlm_batch_slotted (3 slots: HEAD/REL/TAIL)
 NATIVE_KG_MODELS = {"E", "E'", "H", "H'", "I", "I'"}  # use get_mlm_batch_native (rel as angle operator only)
+NATIVE_SLOTS_KG_MODELS = {"J", "J'"}           # use get_mlm_batch_native_slots (2 slots: HEAD/TAIL, no rel token)
 FLAT_KG_MODELS = {"D", "D'", "F", "F'"}       # use get_mlm_batch_flat (rel as token)
-NATIVE_SLOTS_KG_MODELS = {"J", "J'", "K", "K'"}  # use get_mlm_batch_native_slots (2 slots: HEAD/TAIL, no rel token)
 
 
 def create_model(name, vocab_size, config):
@@ -3345,10 +4042,6 @@ def create_model(name, vocab_size, config):
         return ModelJ(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
     elif name == "J'":
         return ModelJ(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
-    elif name == "K":
-        return ModelK(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=False, use_softmax=sm)
-    elif name == "K'":
-        return ModelK(vocab_size, n_e, n_l, bs, n_relations=len(KG_RELATIONS), dropout=d, rotate_v=True, use_softmax=sm)
     else:
         raise ValueError(f"Unknown model name: {name}")
 
@@ -3364,7 +4057,7 @@ def count_parameters(model):
 def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
                    checkpoint_dir=None, load_checkpoints=False,
                    resume_training=False, expanded_names=False,
-                   one_to_one=False, kg_only=False, causal_kg=False,
+                   one_to_one=False, kg_only=False,
                    inverse_kg=False, kg_as_text=False):
     """Run one sub-experiment (7a or 7b) with a given seed.
 
@@ -3413,6 +4106,7 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
+    training_curves = {}
     for name in models_to_run:
         model = create_model(name, vocab.size, cfg)
         # Store vocab reference on model for pad_mask in forward_kg
@@ -3454,35 +4148,37 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
             cfg.max_iters = remaining
             print(f"--- Training Model {name} ---")
             opt_state = None
+            curves = {}
             if name in LINEARIZED_MODELS:
                 text_ds = text_linearized
-                _, opt_state = train_model_text_only(
+                curves, opt_state = train_model_text_only(
                     model, text_ds, cfg, name=name,
                     resume_optimizer_state=resume_opt)
             elif name in SLOTTED_KG_MODELS:
-                _, opt_state = train_model_mixed(
+                curves, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="slotted",
                     resume_optimizer_state=resume_opt,
                     kg_only=kg_only)
             elif name in NATIVE_KG_MODELS:
-                _, opt_state = train_model_mixed(
+                curves, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="native",
                     resume_optimizer_state=resume_opt,
-                    kg_only=kg_only, causal_kg=causal_kg)
+                    kg_only=kg_only)
             elif name in FLAT_KG_MODELS:
-                _, opt_state = train_model_mixed(
+                curves, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="flat",
                     resume_optimizer_state=resume_opt,
                     kg_only=kg_only)
             elif name in NATIVE_SLOTS_KG_MODELS:
-                _, opt_state = train_model_mixed(
+                curves, opt_state = train_model_mixed(
                     model, text_base, kg_dataset, cfg,
                     name=name, kg_batch_fn="native_slots",
                     resume_optimizer_state=resume_opt,
                     kg_only=kg_only)
+            training_curves[name] = curves
             cfg.max_iters = orig_max_iters
             total_iters = iters_done + remaining
 
@@ -3516,13 +4212,9 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
 
         # KG evaluation for A/D/E models (skip in kg_as_text mode)
         base_name = name.replace("'", "")
-        if not kg_as_text and base_name in ("A", "D", "E", "F", "G", "H", "I", "J", "K"):
-            if causal_kg and base_name in ("E", "H", "I"):
-                kg_summary, kg_rel_summary, _ = evaluate_model_kg_causal(
-                    model, kg_eval_prompts, vocab, cfg, model_name=name)
-            else:
-                kg_summary, kg_rel_summary, _ = evaluate_model_kg(
-                    model, kg_eval_prompts, vocab, cfg, model_name=name, model_type=base_name)
+        if not kg_as_text and base_name in ("A", "D", "E", "F", "G", "H", "I", "J"):
+            kg_summary, kg_rel_summary, _ = evaluate_model_kg(
+                model, kg_eval_prompts, vocab, cfg, model_name=name, model_type=base_name)
             kg_results[name] = kg_summary
             kg_relation_results[name] = kg_rel_summary
 
@@ -3532,7 +4224,7 @@ def run_experiment(generous_linearization=True, seed=42, models_to_run=None,
             torch.cuda.empty_cache()
 
     return (results, relation_results, kg_results, kg_relation_results,
-            linearized_results, linearized_relation_results)
+            linearized_results, linearized_relation_results, training_curves)
 
 
 def print_comparison_table(results, exp_name, models):
@@ -3597,7 +4289,7 @@ def print_relation_table(relation_results, exp_name, models):
 
 def print_kg_comparison_table(kg_results, exp_name, models):
     """Print KG evaluation comparison table (A/D/E models only)."""
-    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
+    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I", "J")]
     if not kg_models:
         return
 
@@ -3629,7 +4321,7 @@ def print_kg_comparison_table(kg_results, exp_name, models):
 
 def print_kg_relation_table(kg_relation_results, exp_name, models):
     """Print per-relation KG evaluation table (A/D/E models only)."""
-    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
+    kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I", "J")]
     if not kg_models:
         return
 
@@ -3690,14 +4382,14 @@ def main():
                         help="1:1 KG-text correspondence (one text variation per fact)")
     parser.add_argument("--kg_only", action="store_true",
                         help="Train on KG data only (skip text loss for mixed models)")
-    parser.add_argument("--causal_kg", action="store_true",
-                        help="Use causal masking for KG (next-token prediction with random direction flip)")
     parser.add_argument("--inverse_kg", action="store_true",
                         help="Add inverse KG triples (swapped head/tail with negated relation angle)")
     parser.add_argument("--kg_as_text", action="store_true",
                         help="Convert KG triples to linearized text with relation tokens for B/C models")
     parser.add_argument("--softmax", action="store_true",
                         help="Use softmax attention instead of log(exp(x)+1)")
+    parser.add_argument("--dual_objective", action="store_true",
+                        help="Enable dual-objective training: MLM+causal on text, MLM+causal on KG")
     args = parser.parse_args()
 
     if args.n_embed is not None:
@@ -3706,6 +4398,8 @@ def main():
         cfg.n_layers = args.n_layers
     if args.softmax:
         cfg.use_softmax = True
+    if args.dual_objective:
+        cfg.dual_objective = True
 
     if args.smoke:
         cfg.max_iters = 50
@@ -3732,9 +4426,10 @@ def main():
     print("  Exp 7: Native KG+Text vs Linearized KG-as-Text")
     print("=" * 70)
     attn_type = "softmax" if cfg.use_softmax else "log(exp+1)"
+    dual_str = ", dual_objective=True" if cfg.dual_objective else ""
     print(f"\nConfig: n_embed={cfg.n_embed}, n_layers={cfg.n_layers}, "
           f"max_iters={cfg.max_iters}, batch_size={cfg.batch_size}, "
-          f"lr={cfg.lr}, device={cfg.device}, attention={attn_type}")
+          f"lr={cfg.lr}, device={cfg.device}, attention={attn_type}{dual_str}")
     print(f"Models: {models}")
 
     experiments = []
@@ -3753,10 +4448,11 @@ def main():
         seed_kg_relation_results = []
         seed_linearized_results = []
         seed_linearized_relation_results = []
+        all_training_curves = {}
 
         for seed in range(cfg.n_seeds):
             (results, rel_results, kg_res, kg_rel_res,
-             lin_res, lin_rel_res) = run_experiment(
+             lin_res, lin_rel_res, curves) = run_experiment(
                 generous_linearization=generous, seed=seed,
                 models_to_run=models,
                 checkpoint_dir=args.checkpoint_dir,
@@ -3765,7 +4461,6 @@ def main():
                 expanded_names=args.expanded_names,
                 one_to_one=args.one_to_one,
                 kg_only=args.kg_only,
-                causal_kg=args.causal_kg,
                 inverse_kg=args.inverse_kg,
                 kg_as_text=args.kg_as_text)
             seed_results.append(results)
@@ -3774,6 +4469,8 @@ def main():
             seed_kg_relation_results.append(kg_rel_res)
             seed_linearized_results.append(lin_res)
             seed_linearized_relation_results.append(lin_rel_res)
+            for m, c in curves.items():
+                all_training_curves.setdefault(m, []).append(c)
 
         # Average tier-level text results across seeds
         avg_results = {}
@@ -3817,7 +4514,7 @@ def main():
 
         # Average KG results across seeds (A/D/E models only)
         avg_kg_results = {}
-        kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I")]
+        kg_models = [m for m in models if m.replace("'", "") in ("A", "D", "E", "F", "G", "H", "I", "J")]
         for model_name in kg_models:
             avg_kg_results[model_name] = {}
             for tier in ALL_TIERS:
@@ -3956,7 +4653,7 @@ def main():
     # Save results to JSON
     results_dir = os.path.dirname(os.path.abspath(__file__))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = os.path.join(results_dir, f"exp7_nondual_results_{timestamp}.json")
+    results_file = os.path.join(results_dir, f"exp7_results_{timestamp}.json")
 
     # Convert numpy floats to Python floats for JSON serialization
     def to_serializable(obj):
@@ -3979,6 +4676,7 @@ def main():
             "models": models,
         },
         "results": to_serializable(all_results),
+        "training_curves": to_serializable(all_training_curves),
         "timestamp": timestamp,
     }
 
@@ -3987,7 +4685,7 @@ def main():
     print(f"\nResults saved to: {results_file}")
 
     # Also save a latest symlink/copy for easy access
-    latest_file = os.path.join(results_dir, "exp7_nondual_results_latest.json")
+    latest_file = os.path.join(results_dir, "exp7_results_latest.json")
     with open(latest_file, "w") as f:
         json.dump(save_data, f, indent=2)
     print(f"Latest results: {latest_file}")

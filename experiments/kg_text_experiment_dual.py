@@ -2371,15 +2371,14 @@ class ModelI(nn.Module):
         self.n_embed = n_embed
         self.token_embedding = nn.Embedding(vocab_size, n_embed)
 
-        # Per-layer angle projectors: 2-layer MLP to extract angles from residual stream
-        self.angle_projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(n_embed, n_embed),
-                nn.GELU(),
-                nn.Linear(n_embed, n_embed // 2),
-            )
-            for _ in range(n_layers)
-        ])
+        # Shared angle projector: single MLP used across all layers
+        # (shared is critical for V rotation — see exp7_modelI_architecture_experiments.md)
+        self.angle_projector = nn.Sequential(
+            nn.Linear(n_embed, n_embed),
+            nn.GELU(),
+            nn.Linear(n_embed, n_embed // 2),
+        )
+        self.angle_ln = nn.LayerNorm(n_embed // 2)
 
         # Learned angle vectors for each relation type (shared across layers)
         self.relation_angles = nn.Parameter(torch.randn(n_relations, n_embed // 2) * 0.1)
@@ -2462,7 +2461,7 @@ class ModelI(nn.Module):
         x = self.token_embedding(idx)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_projectors[l](x)
+            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
             angles = self._cumsum_angles_text(raw_angles)
             x = block(x, angles, causal=True, pad_mask=pad_mask)
 
@@ -2491,7 +2490,7 @@ class ModelI(nn.Module):
         x = self.token_embedding(char_tokens)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_projectors[l](x)
+            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
             angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
                                             char_tokens.device, negate_angles=negate_angles)
             x = block(x, angles, causal=False, pad_mask=pad_mask)
@@ -2520,7 +2519,7 @@ class ModelI(nn.Module):
         attn_mask = build_slot_causal_mask(B, T, context_lens, char_tokens.device)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_projectors[l](x)
+            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
             angles = self._cumsum_angles_kg(raw_angles, head_lens, rel_names,
                                             char_tokens.device, negate_angles=negate_angles)
             x = block(x, angles, causal=False, pad_mask=pad_mask, attn_mask=attn_mask)
@@ -2538,7 +2537,7 @@ class ModelI(nn.Module):
         x = self.token_embedding(tokens)
 
         for l, block in enumerate(self.blocks):
-            raw_angles = self.angle_projectors[l](x)
+            raw_angles = self.angle_ln(self.angle_projector(x))  # shared MLP + LN
             angles = self._cumsum_angles_text(raw_angles)
             x = block(x, angles, causal=False, pad_mask=pad_mask)
 
