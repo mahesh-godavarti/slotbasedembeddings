@@ -228,6 +228,65 @@ angles = cumsum(raw_angles)
 I (unprimed): Per-layer is slightly better.
 I' (V rotation): Shared is dramatically better — .819 vs .681 KG, .313 vs .139 text.
 
+## Full Grid Sweep Results (Exp 3: shared MLP + LN, 15 configs)
+
+All 15 grid points completed with zero divergence. The old architecture diverged at
+n250_l8, n500_l2, and n500_l4.
+
+### KG memorization h@5 / PPL
+
+| Config | I h@5 | I PPL | I' h@5 | I' PPL |
+|--------|-------|-------|--------|--------|
+| n50_l2 | .124 | 5.21 | .166 | 4.70 |
+| n50_l4 | .165 | 4.68 | .197 | 4.25 |
+| n50_l8 | .199 | 4.22 | .200 | 4.09 |
+| n50_l16 | .202 | 4.08 | .202 | 4.03 |
+| n50_l20 | .202 | 4.04 | .214 | 4.01 |
+| n100_l2 | .194 | 4.43 | .199 | 4.07 |
+| n100_l4 | .200 | 4.14 | .217 | 4.03 |
+| n100_l8 | .204 | 4.06 | .322 | 3.82 |
+| n100_l16 | .225 | 4.01 | .447 | 3.40 |
+| n100_l20 | .258 | 3.94 | .491 | 3.29 |
+| n250_l2 | .204 | 4.22 | .329 | 3.82 |
+| n250_l4 | .209 | 4.06 | .599 | 3.01 |
+| n250_l8 | .236 | 4.02 | .819 | 2.12 |
+| n500_l2 | .194 | 4.27 | .676 | 2.76 |
+| **n500_l4** | .202 | 4.14 | **.933** | **1.63** |
+
+### Text memorization h@5 / PPL
+
+| Config | I h@5 | I PPL | I' h@5 | I' PPL |
+|--------|-------|-------|--------|--------|
+| n50_l2 | .087 | 5.92 | .095 | 5.64 |
+| n50_l4 | .095 | 5.54 | .098 | 5.35 |
+| n50_l8 | .104 | 5.24 | .099 | 5.20 |
+| n50_l16 | .100 | 5.19 | .101 | 5.13 |
+| n50_l20 | .098 | 5.13 | .100 | 5.14 |
+| n100_l2 | .104 | 5.37 | .102 | 5.17 |
+| n100_l4 | .099 | 5.17 | .102 | 5.14 |
+| n100_l8 | .103 | 5.13 | .104 | 5.11 |
+| n100_l16 | .111 | 5.11 | .150 | 5.03 |
+| n100_l20 | .124 | 5.11 | .122 | 5.10 |
+| n250_l2 | .101 | 5.17 | .112 | 5.10 |
+| n250_l4 | .113 | 5.12 | .266 | 4.68 |
+| n250_l8 | .139 | 5.12 | .313 | 4.46 |
+| n500_l2 | .104 | 5.16 | .205 | 4.86 |
+| **n500_l4** | .106 | 5.15 | **.322** | **4.46** |
+
+### Scaling Patterns
+
+**I (unprimed)**: Flat at ~.200 KG h@5 regardless of scale. Width and depth don't help
+without V rotation. Text h@5 also flat at ~.100.
+
+**I' (V rotation)**: Scales dramatically with width:
+- n50: .166-.214 KG h@5 (V rotation can't help at low capacity)
+- n100: .199-.491 (V rotation starts to separate at l8+)
+- n250: .329-.819 (strong scaling with depth)
+- n500: .676-.933 (best results, where old architecture completely diverged)
+
+**Width > Depth for I'**: n500_l4 (.933) > n250_l8 (.819) > n500_l2 (.676) > n250_l4 (.599).
+Width matters more than depth for V rotation's KG performance.
+
 ## Key Findings
 
 1. **LayerNorm alone fixes divergence** in both per-layer and shared MLP variants.
@@ -237,14 +296,16 @@ I' (V rotation): Shared is dramatically better — .819 vs .681 KG, .313 vs .139
    Per-layer MLPs give each layer different angles, which V rotation can't leverage.
 4. **Per-layer is slightly better for unprimed (I)**: .249 vs .236 KG, .153 vs .139 text.
    Without V rotation, depth-dependent angle strategies help marginally.
-5. **I' (shared + LN) is the new best model** at n250_l8:
-   - KG: .819 h@5 / 2.12 PPL (beats E' .777 / 2.34)
-   - Text: .313 h@5 / 4.46 PPL (beats E' .215 / 4.84)
+5. **I' (shared + LN) is the new best model overall**:
+   - n500_l4: KG .933 h@5 / 1.63 PPL, Text .322 h@5 / 4.46 PPL
+   - n250_l8: KG .819 h@5 / 2.12 PPL, Text .313 h@5 / 4.46 PPL
+   - Both configs previously diverged with the old architecture.
+6. **Width > Depth for I'**: V rotation benefits more from wider embeddings than deeper networks.
 
 ## Architecture Summary
 
-| Variant | Shared MLP | LayerNorm | abs() | I stable | I' stable | I' KG h@5 | I' Text h@5 |
-|---------|-----------|-----------|-------|----------|-----------|-----------|-------------|
+| Variant | Shared MLP | LayerNorm | abs() | I stable | I' stable | I' KG h@5 (n250_l8) | I' Text h@5 |
+|---------|-----------|-----------|-------|----------|-----------|---------------------|-------------|
 | Old (per-layer, no LN) | No | No | No | No (9K) | No (13K) | diverged | diverged |
 | Exp 1: shared+abs | Yes | No | Yes | Yes | No (45K) | diverged | diverged |
 | Exp 2: shared+LN+abs | Yes | Yes | Yes | Yes* | Yes | .767 | .285 |
