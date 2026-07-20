@@ -1,0 +1,157 @@
+Device: cuda
+
+Loading data...
+
+Architecture: n_embed=80, n_layers=8, hop=80, tie_layers=True
+
+  MelCumsumFixed:   24,812 params  (window=10)
+  MelScanFixed:     25,132 params  (learned decay)
+  Difference:         +320 params (8 layers × 40 decay scalars)
+
+============================================================
+Training (40 epochs, bs=128, lr=0.001)
+============================================================
+
+MelCumsumFixed (cumsum + window=10):
+  [Cumsum] Epoch 1/40  loss=3.1790  train=0.1795  val=0.4245  16.6s
+  [Cumsum] Epoch 2/40  loss=1.4569  train=0.5148  val=0.6986  16.1s
+  [Cumsum] Epoch 3/40  loss=0.9854  train=0.6775  val=0.7961  16.1s
+  [Cumsum] Epoch 4/40  loss=0.7604  train=0.7544  val=0.8287  16.1s
+  [Cumsum] Epoch 5/40  loss=0.6722  train=0.7825  val=0.8479  16.1s
+  [Cumsum] Epoch 6/40  loss=0.6071  train=0.8059  val=0.8782  16.3s
+  [Cumsum] Epoch 7/40  loss=0.5562  train=0.8208  val=0.8848  16.3s
+  [Cumsum] Epoch 8/40  loss=0.5244  train=0.8340  val=0.8931  16.2s
+  [Cumsum] Epoch 9/40  loss=0.4850  train=0.8437  val=0.8805  16.2s
+  [Cumsum] Epoch 10/40  loss=0.4495  train=0.8544  val=0.9025  16.2s
+  [Cumsum] Epoch 11/40  loss=0.4388  train=0.8598  val=0.8987  16.2s
+  [Cumsum] Epoch 12/40  loss=0.4059  train=0.8702  val=0.9217  16.2s
+  [Cumsum] Epoch 13/40  loss=0.4019  train=0.8712  val=0.9196  16.2s
+  [Cumsum] Epoch 14/40  loss=0.3973  train=0.8719  val=0.9199  16.2s
+  [Cumsum] Epoch 15/40  loss=0.3764  train=0.8791  val=0.9190  16.1s
+  [Cumsum] Epoch 16/40  loss=0.3518  train=0.8881  val=0.9212  16.1s
+  [Cumsum] Epoch 17/40  loss=0.3573  train=0.8839  val=0.9136  16.2s
+  [Cumsum] Epoch 18/40  loss=0.3363  train=0.8921  val=0.9287  16.2s
+  [Cumsum] Epoch 19/40  loss=0.3338  train=0.8938  val=0.9242  16.2s
+  [Cumsum] Epoch 20/40  loss=0.3331  train=0.8923  val=0.9223  16.2s
+  [Cumsum] Epoch 21/40  loss=0.3120  train=0.8997  val=0.9309  16.3s
+  [Cumsum] Epoch 22/40  loss=0.3089  train=0.8998  val=0.9307  16.2s
+  [Cumsum] Epoch 23/40  loss=0.2954  train=0.9049  val=0.9424  16.2s
+  [Cumsum] Epoch 24/40  loss=0.2952  train=0.9043  val=0.9345  16.2s
+  [Cumsum] Epoch 25/40  loss=0.2896  train=0.9062  val=0.9395  16.2s
+  [Cumsum] Epoch 26/40  loss=0.2789  train=0.9106  val=0.9370  16.2s
+  [Cumsum] Epoch 27/40  loss=0.2683  train=0.9144  val=0.9370  16.2s
+  [Cumsum] Epoch 28/40  loss=0.2664  train=0.9128  val=0.9386  16.2s
+  [Cumsum] Epoch 29/40  loss=0.2630  train=0.9148  val=0.9451  16.2s
+  [Cumsum] Epoch 30/40  loss=0.2549  train=0.9165  val=0.9442  16.2s
+  [Cumsum] Epoch 31/40  loss=0.2599  train=0.9155  val=0.9415  16.2s
+  [Cumsum] Epoch 32/40  loss=0.2573  train=0.9176  val=0.9480  16.2s
+  [Cumsum] Epoch 33/40  loss=0.2591  train=0.9160  val=0.9446  16.2s
+  [Cumsum] Epoch 34/40  loss=0.2366  train=0.9236  val=0.9404  16.2s
+  [Cumsum] Epoch 35/40  loss=0.2436  train=0.9202  val=0.9453  16.3s
+  [Cumsum] Epoch 36/40  loss=0.2445  train=0.9197  val=0.9453  16.2s
+  [Cumsum] Epoch 37/40  loss=0.2492  train=0.9192  val=0.9458  16.2s
+  [Cumsum] Epoch 38/40  loss=0.2375  train=0.9228  val=0.9462  16.2s
+  [Cumsum] Epoch 39/40  loss=0.2453  train=0.9211  val=0.9471  16.2s
+  [Cumsum] Epoch 40/40  loss=0.2459  train=0.9198  val=0.9440  16.3s
+
+MelScanFixed (scan + learned decay):
+  [Scan] Epoch 1/40  loss=3.0863  train=0.1965  val=0.4855  18.1s
+  [Scan] Epoch 2/40  loss=1.5238  train=0.5024  val=0.7007  17.3s
+  [Scan] Epoch 3/40  loss=1.0276  train=0.6618  val=0.7810  17.3s
+  [Scan] Epoch 4/40  loss=0.8135  train=0.7364  val=0.8154  17.3s
+  [Scan] Epoch 5/40  loss=0.7201  train=0.7676  val=0.8292  17.3s
+  [Scan] Epoch 6/40  loss=0.6211  train=0.8008  val=0.8517  17.4s
+  [Scan] Epoch 7/40  loss=0.5685  train=0.8196  val=0.8726  17.4s
+  [Scan] Epoch 8/40  loss=0.5334  train=0.8312  val=0.8877  17.3s
+  [Scan] Epoch 9/40  loss=0.4987  train=0.8417  val=0.8877  17.5s
+  [Scan] Epoch 10/40  loss=0.4906  train=0.8432  val=0.8841  17.3s
+  [Scan] Epoch 11/40  loss=0.4444  train=0.8587  val=0.8879  17.3s
+  [Scan] Epoch 12/40  loss=0.4430  train=0.8572  val=0.8976  17.3s
+  [Scan] Epoch 13/40  loss=0.4145  train=0.8663  val=0.9052  17.4s
+  [Scan] Epoch 14/40  loss=0.4063  train=0.8701  val=0.9055  17.4s
+  [Scan] Epoch 15/40  loss=0.3805  train=0.8773  val=0.9091  17.4s
+  [Scan] Epoch 16/40  loss=0.3785  train=0.8783  val=0.9165  17.3s
+  [Scan] Epoch 17/40  loss=0.3554  train=0.8852  val=0.9169  17.4s
+  [Scan] Epoch 18/40  loss=0.3464  train=0.8878  val=0.9124  17.3s
+  [Scan] Epoch 19/40  loss=0.3397  train=0.8898  val=0.9235  17.5s
+  [Scan] Epoch 20/40  loss=0.3359  train=0.8916  val=0.9172  17.4s
+  [Scan] Epoch 21/40  loss=0.3235  train=0.8942  val=0.9266  17.3s
+  [Scan] Epoch 22/40  loss=0.3155  train=0.8976  val=0.9196  17.3s
+  [Scan] Epoch 23/40  loss=0.3094  train=0.9004  val=0.9174  17.5s
+  [Scan] Epoch 24/40  loss=0.3016  train=0.9027  val=0.9296  17.3s
+  [Scan] Epoch 25/40  loss=0.3026  train=0.9010  val=0.9323  17.2s
+  [Scan] Epoch 26/40  loss=0.2897  train=0.9076  val=0.9338  17.3s
+  [Scan] Epoch 27/40  loss=0.2806  train=0.9100  val=0.9356  17.3s
+  [Scan] Epoch 28/40  loss=0.2778  train=0.9109  val=0.9350  17.3s
+  [Scan] Epoch 29/40  loss=0.2763  train=0.9105  val=0.9381  17.3s
+  [Scan] Epoch 30/40  loss=0.2682  train=0.9139  val=0.9383  17.2s
+  [Scan] Epoch 31/40  loss=0.2629  train=0.9145  val=0.9352  17.3s
+  [Scan] Epoch 32/40  loss=0.2659  train=0.9144  val=0.9401  17.3s
+  [Scan] Epoch 33/40  loss=0.2519  train=0.9183  val=0.9410  17.3s
+  [Scan] Epoch 34/40  loss=0.2543  train=0.9171  val=0.9406  17.4s
+  [Scan] Epoch 35/40  loss=0.2485  train=0.9199  val=0.9424  17.3s
+  [Scan] Epoch 36/40  loss=0.2443  train=0.9209  val=0.9410  17.4s
+  [Scan] Epoch 37/40  loss=0.2508  train=0.9187  val=0.9401  17.3s
+  [Scan] Epoch 38/40  loss=0.2429  train=0.9219  val=0.9406  17.3s
+  [Scan] Epoch 39/40  loss=0.2409  train=0.9231  val=0.9424  17.2s
+  [Scan] Epoch 40/40  loss=0.2452  train=0.9194  val=0.9419  17.3s
+
+============================================================
+Test Accuracy
+============================================================
+  MelCumsumFixed:  94.82%
+  MelScanFixed:    94.33%
+
+============================================================
+Training Summary
+============================================================
+
+  Model                 Params   Wall Time   Per Epoch   Val Acc  Test Acc
+  -------------------- -------  ----------  ----------  --------  --------
+  MelCumsumFixed        24,812     648.2s      16.2s    94.8%    94.8%
+  MelScanFixed          25,132     694.4s      17.4s    94.2%    94.3%
+
+  Cumsum speedup: 1.07x
+
+============================================================
+Inference Latency (single sample)
+============================================================
+
+  MelCumsumFixed:  5.01 ms  (200 seq/s)
+  MelScanFixed:    7.09 ms  (141 seq/s)
+  Cumsum speedup:  1.42x
+
+============================================================
+Primitive: torch.cumsum vs Triton scan (T=200, N=40 = mel config)
+============================================================
+
+  Batch     T     N      cumsum   triton_scan     ratio
+  -----  ----  ----  ----------  ------------  --------
+      1   200    40      84.9us       270.6us     3.2x
+      8   200    40      84.9us       273.6us     3.2x
+     32   200    40      73.4us       331.8us     4.5x
+    128   200    40     140.5us       514.5us     3.7x
+
+============================================================
+Learned Decay (sigmoid(param)) per Layer
+============================================================
+  Layer 0: decay mean=0.789  range=[0.709, 0.947]  effective window=[3, 19]
+  Layer 1: decay mean=0.768  range=[0.683, 0.946]  effective window=[3, 18]
+  Layer 2: decay mean=0.755  range=[0.645, 0.950]  effective window=[3, 20]
+  Layer 3: decay mean=0.749  range=[0.629, 0.953]  effective window=[3, 21]
+  Layer 4: decay mean=0.745  range=[0.622, 0.951]  effective window=[3, 20]
+  Layer 5: decay mean=0.744  range=[0.624, 0.946]  effective window=[3, 18]
+  Layer 6: decay mean=0.746  range=[0.641, 0.941]  effective window=[3, 17]
+  Layer 7: decay mean=0.751  range=[0.669, 0.936]  effective window=[3, 16]
+
+============================================================
+Key Takeaway
+============================================================
+  Same mel front-end, same layers, same params (~24,812).
+  Only difference: cumsum+window vs scan+lambda.
+  cumsum = torch.cumsum (parallel prefix sum, single CUDA kernel)
+  scan   = Triton fused sequential scan (h[t] = λ·h[t-1] + x[t])
+  Training speedup:  1.07x
+  Inference speedup: 1.42x
+  Accuracy: cumsum 94.8% vs scan 94.3%
+

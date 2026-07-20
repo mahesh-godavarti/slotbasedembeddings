@@ -3401,17 +3401,24 @@ class CumsumEndToEnd(nn.Module):
         B_batch, T = x.shape
 
         # === Layer 1: scalar → windowed cumsum → stride ===
+        # Work in (B, n_freqs, T) layout so cumsum runs along contiguous dim
         freqs = self.log_freqs.exp()
         t_idx = torch.arange(T, device=x.device, dtype=freqs.dtype)
-        phases = torch.exp(1j * t_idx.unsqueeze(1) * freqs)  # (T, n_freqs)
-        x_complex = x.to(torch.complex64).unsqueeze(-1)  # (B, T, 1)
-        rotated = x_complex * phases.conj().unsqueeze(0)  # (B, T, n_freqs)
-        cs = rotated.cumsum(dim=1)
-        cs_shifted = F.pad(cs[:, :-self.window_l1], (0, 0, self.window_l1, 0))
-        d = cs - cs_shifted
-        d = d * phases.unsqueeze(0)  # unrotate
-        h = torch.cat([d.real, d.imag], dim=-1)  # (B, T, 2*n_freqs)
-        h = h[:, ::self.stride_l1]  # stride → T frames
+        phases_t = torch.exp(1j * t_idx.unsqueeze(0) * freqs.unsqueeze(1))  # (n_freqs, T)
+        x_complex = x.to(torch.complex64).unsqueeze(1)  # (B, 1, T)
+        rotated = x_complex * phases_t.conj().unsqueeze(0)  # (B, n_freqs, T) — contiguous
+        cs = rotated.cumsum(dim=2)  # fast: scan along contiguous dim
+
+        # Window subtraction + unrotation at stride positions only
+        out_idx = torch.arange(0, T, self.stride_l1, device=x.device)  # 100 positions
+        cs_out = cs[:, :, out_idx]                                       # (B, n_freqs, 100)
+        delay_idx = (out_idx - self.window_l1).clamp(min=0)
+        cs_delayed = cs[:, :, delay_idx]                                 # (B, n_freqs, 100)
+        mask = (out_idx >= self.window_l1).unsqueeze(0).unsqueeze(0)     # zero where t < window
+        cs_delayed = cs_delayed * mask
+        d = (cs_out - cs_delayed) * phases_t[:, out_idx].unsqueeze(0)    # unrotate
+        d = d.transpose(1, 2)                                            # (B, 100, n_freqs)
+        h = torch.cat([d.real, d.imag], dim=-1)                          # (B, 100, 2*n_freqs)
         h = h + self.glu1(self.bn1(h))
 
         # === Layers 2+: windowed cumsum, no downsampling ===
@@ -3849,6 +3856,99 @@ class MelCumsumFixed(nn.Module):
                 h = self.embed(x_phase)
                 outputs.append(self._process_seq(h))
             return torch.stack(outputs, dim=0).max(dim=0).values
+
+    def param_count(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class MelScanFixed(nn.Module):
+    """Mel spectrogram front-end → scan (exponential decay) layers.
+    Identical to MelCumsumFixed but replaces cumsum+window with parallel_scan+lambda.
+    Apples-to-apples comparison: same mel front-end, same proj, same BN, same GLU,
+    same frequencies. Only the sequence operation differs:
+      cumsum: d[t] = sum(rotated[t-W:t])     (hard window, FIR)
+      scan:   d[t] = λ·d[t-1] + rotated[t]   (exponential decay, IIR)
+    Extra params: one decay scalar per frequency per layer."""
+    def __init__(self, n_embed=80, n_layers=4, hop_length=160, tie_layers=False, num_classes=NUM_CLASSES, dropout=0.1):
+        super().__init__()
+        self.n_layers = n_layers
+        self.tie_layers = tie_layers
+        n_freqs = n_embed // 2
+
+        # Mel front-end (identical to MelCumsumFixed)
+        self.mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=SAMPLE_RATE, n_fft=400, hop_length=hop_length,
+            n_mels=40, power=2.0,
+        )
+        self.spec_aug = SpecAugment()
+        self.embed = nn.Linear(40, n_embed)
+
+        # Scan layers (same structure as cumsum, but with decay instead of window)
+        if tie_layers:
+            self.shared_proj = nn.Linear(n_embed, n_embed)
+            self.shared_glu = GLU(n_embed, dropout)
+        else:
+            self.proj_layers = nn.ModuleList()
+            self.glu_layers = nn.ModuleList()
+        self.freq_params = nn.ParameterList()
+        self.decay_params = nn.ParameterList()
+        self.bn_layers = nn.ModuleList()
+        for i in range(n_layers):
+            if not tie_layers:
+                self.proj_layers.append(nn.Linear(n_embed, n_embed))
+                self.glu_layers.append(GLU(n_embed, dropout))
+            self.freq_params.append(nn.Parameter(
+                torch.linspace(0.1, math.pi * 0.9, n_freqs)))
+            # sigmoid(2.2) ≈ 0.9, effective window ≈ 10 (matches cumsum W=10)
+            self.decay_params.append(nn.Parameter(
+                torch.full((n_freqs,), 2.2)))
+            self.bn_layers.append(TransposedBN(n_embed))
+
+        self.fc = nn.Linear(n_freqs, num_classes)
+
+    def _process_seq(self, h):
+        """Process mel sequence through scan layers → magnitude."""
+        for i in range(self.n_layers):
+            B_batch, T_cur, _ = h.shape
+            proj_layer = self.shared_proj if self.tie_layers else self.proj_layers[i]
+            glu_layer = self.shared_glu if self.tie_layers else self.glu_layers[i]
+
+            proj = proj_layer(h)
+            z_re, z_im = proj.chunk(2, dim=-1)
+            z = torch.complex(z_re, z_im)
+
+            # Same rotation as cumsum
+            layer_freqs = self.freq_params[i]
+            t_idx = torch.arange(T_cur, device=h.device, dtype=layer_freqs.dtype)
+            layer_phases = torch.exp(1j * t_idx.unsqueeze(1) * layer_freqs)
+            rotated = z * layer_phases.conj().unsqueeze(0)
+
+            # SCAN with exponential decay (replaces cumsum+window)
+            decay = torch.sigmoid(self.decay_params[i])  # (n_freqs,) in (0, 1)
+            gates = torch.complex(decay, torch.zeros_like(decay))
+            gates = gates.unsqueeze(0).unsqueeze(0).expand(B_batch, T_cur, -1)
+            d = parallel_scan(gates, rotated)
+
+            d = d * layer_phases.unsqueeze(0)  # unrotate
+            out = torch.cat([d.real, d.imag], dim=-1)
+            h = h + glu_layer(self.bn_layers[i](out))
+
+        # Magnitude maxpool readout
+        h_re, h_im = h.chunk(2, dim=-1)
+        mag = torch.sqrt(h_re ** 2 + h_im ** 2 + 1e-8)
+        mag = mag.max(dim=1).values
+        return self.fc(mag)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.mel_spec(x)
+        x = x.squeeze(1)
+        x = (x + 1e-8).log()
+        if self.training:
+            x = self.spec_aug(x)
+        x = x.transpose(1, 2)
+        h = self.embed(x)
+        return self._process_seq(h)
 
     def param_count(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -5235,26 +5335,177 @@ class WindowS5Input(nn.Module):
 # Uses the doubling technique: O(L log L) work in O(log L) sequential steps,
 # each step being a fully parallel tensor operation. No Python for-loops over L.
 
-def parallel_scan(gates, values):
-    """Parallel prefix scan for h[t] = gates[t]*h[t-1] + values[t].
-    Uses associative operator (a1,b1)∘(a2,b2) = (a1*a2, a2*b1+b2).
-    O(log2 L) sequential steps, each fully parallel on GPU.
-    gates, values: (B, L, D) — real or complex. Returns h: (B, L, D).
-    """
+def _parallel_scan_pytorch(gates, values):
+    """Fallback parallel scan in pure PyTorch (log2 L kernel launches)."""
     a = gates
     b = values
     L = a.shape[1]
-
     for step in range(int(math.ceil(math.log2(max(L, 2))))):
         stride = 1 << step
         if stride >= L:
             break
-        padding = (0, 0, stride, 0)  # pad time dimension on left
+        padding = (0, 0, stride, 0)
         a_shift = F.pad(a[:, :-stride], padding, value=1.0)
         b_shift = F.pad(b[:, :-stride], padding, value=0.0)
         a, b = a * a_shift, a * b_shift + b
-
     return b
+
+
+# ─── Triton-fused parallel scan ────────────────────────────────────────────
+# Single kernel launch, fully parallel across (batch, feature) pairs.
+# Complex arithmetic done as real/imag pairs.
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _scan_fwd_kernel(
+        gates_r_ptr, gates_i_ptr, vals_r_ptr, vals_i_ptr,
+        out_r_ptr, out_i_ptr,
+        B, L, D,
+        stride_b, stride_l, stride_d,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Forward scan: h[t] = gate[t]*h[t-1] + val[t] (complex)."""
+        bid = tl.program_id(0)  # batch index
+        did = tl.program_id(1)  # feature block index
+        d_offs = did * BLOCK_D + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+
+        h_r = tl.zeros([BLOCK_D], dtype=tl.float32)
+        h_i = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        for t in range(L):
+            off = bid * stride_b + t * stride_l + d_offs * stride_d
+            a_r = tl.load(gates_r_ptr + off, mask=d_mask, other=1.0)
+            a_i = tl.load(gates_i_ptr + off, mask=d_mask, other=0.0)
+            b_r = tl.load(vals_r_ptr + off, mask=d_mask, other=0.0)
+            b_i = tl.load(vals_i_ptr + off, mask=d_mask, other=0.0)
+            # h = a * h + b  (complex multiply)
+            new_h_r = a_r * h_r - a_i * h_i + b_r
+            new_h_i = a_r * h_i + a_i * h_r + b_i
+            h_r = new_h_r
+            h_i = new_h_i
+            tl.store(out_r_ptr + off, h_r, mask=d_mask)
+            tl.store(out_i_ptr + off, h_i, mask=d_mask)
+
+    @triton.jit
+    def _scan_bwd_kernel(
+        gates_r_ptr, gates_i_ptr, out_r_ptr, out_i_ptr,
+        dout_r_ptr, dout_i_ptr,
+        dgates_r_ptr, dgates_i_ptr, dvals_r_ptr, dvals_i_ptr,
+        B, L, D,
+        stride_b, stride_l, stride_d,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Backward scan: propagate gradients in reverse."""
+        bid = tl.program_id(0)
+        did = tl.program_id(1)
+        d_offs = did * BLOCK_D + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+
+        # dh accumulates gradient flowing back through time
+        dh_r = tl.zeros([BLOCK_D], dtype=tl.float32)
+        dh_i = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        for t in range(L - 1, -1, -1):
+            off = bid * stride_b + t * stride_l + d_offs * stride_d
+            # dout for this timestep
+            do_r = tl.load(dout_r_ptr + off, mask=d_mask, other=0.0)
+            do_i = tl.load(dout_i_ptr + off, mask=d_mask, other=0.0)
+            dh_r = dh_r + do_r
+            dh_i = dh_i + do_i
+
+            # d_val = dh (complex)
+            tl.store(dvals_r_ptr + off, dh_r, mask=d_mask)
+            tl.store(dvals_i_ptr + off, dh_i, mask=d_mask)
+
+            # d_gate = dh * conj(h[t-1])... actually d_gate = dh * h[t-1]
+            # For complex: d(a*h) w.r.t. a = h (Wirtinger derivative)
+            # d_gate_r = dh_r * h_prev_r + dh_i * h_prev_i
+            # d_gate_i = -dh_r * h_prev_i + dh_i * h_prev_r
+            if t > 0:
+                prev_off = bid * stride_b + (t - 1) * stride_l + d_offs * stride_d
+                hp_r = tl.load(out_r_ptr + prev_off, mask=d_mask, other=0.0)
+                hp_i = tl.load(out_i_ptr + prev_off, mask=d_mask, other=0.0)
+            else:
+                hp_r = tl.zeros([BLOCK_D], dtype=tl.float32)
+                hp_i = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dg_r = dh_r * hp_r + dh_i * hp_i
+            dg_i = -dh_r * hp_i + dh_i * hp_r
+            tl.store(dgates_r_ptr + off, dg_r, mask=d_mask)
+            tl.store(dgates_i_ptr + off, dg_i, mask=d_mask)
+
+            # Propagate: dh_prev = conj(gate[t]) * dh
+            a_r = tl.load(gates_r_ptr + off, mask=d_mask, other=1.0)
+            a_i = tl.load(gates_i_ptr + off, mask=d_mask, other=0.0)
+            # conj(a) * dh = (a_r - a_i*j)(dh_r + dh_i*j)
+            new_dh_r = a_r * dh_r + a_i * dh_i
+            new_dh_i = a_r * dh_i - a_i * dh_r
+            dh_r = new_dh_r
+            dh_i = new_dh_i
+
+    class _TritonScanFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, gates_r, gates_i, vals_r, vals_i):
+            B, L, D = gates_r.shape
+            out_r = torch.empty_like(gates_r)
+            out_i = torch.empty_like(gates_i)
+            BLOCK_D = triton.next_power_of_2(D)
+            grid = (B, triton.cdiv(D, BLOCK_D))
+            _scan_fwd_kernel[grid](
+                gates_r, gates_i, vals_r, vals_i, out_r, out_i,
+                B, L, D,
+                gates_r.stride(0), gates_r.stride(1), gates_r.stride(2),
+                BLOCK_D=BLOCK_D,
+            )
+            ctx.save_for_backward(gates_r, gates_i, out_r, out_i)
+            ctx.shape = (B, L, D)
+            return out_r, out_i
+
+        @staticmethod
+        def backward(ctx, dout_r, dout_i):
+            gates_r, gates_i, out_r, out_i = ctx.saved_tensors
+            B, L, D = ctx.shape
+            dgates_r = torch.empty_like(gates_r)
+            dgates_i = torch.empty_like(gates_i)
+            dvals_r = torch.empty_like(gates_r)
+            dvals_i = torch.empty_like(gates_i)
+            BLOCK_D = triton.next_power_of_2(D)
+            grid = (B, triton.cdiv(D, BLOCK_D))
+            _scan_bwd_kernel[grid](
+                gates_r, gates_i, out_r, out_i,
+                dout_r.contiguous(), dout_i.contiguous(),
+                dgates_r, dgates_i, dvals_r, dvals_i,
+                B, L, D,
+                gates_r.stride(0), gates_r.stride(1), gates_r.stride(2),
+                BLOCK_D=BLOCK_D,
+            )
+            return dgates_r, dgates_i, dvals_r, dvals_i
+
+    def _triton_scan_complex(gates, values):
+        """Fused Triton scan for complex gates/values with autograd."""
+        g_r, g_i = gates.real.contiguous(), gates.imag.contiguous()
+        v_r, v_i = values.real.contiguous(), values.imag.contiguous()
+        h_r, h_i = _TritonScanFn.apply(g_r, g_i, v_r, v_i)
+        return torch.complex(h_r, h_i)
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+
+def parallel_scan(gates, values):
+    """Parallel prefix scan for h[t] = gates[t]*h[t-1] + values[t].
+
+    Uses a fused Triton kernel (single launch, full autograd) when available,
+    otherwise falls back to PyTorch implementation (log2 L kernel launches).
+    gates, values: (B, L, D) — real or complex. Returns h: (B, L, D).
+    """
+    if _HAS_TRITON and gates.is_complex() and gates.is_cuda:
+        return _triton_scan_complex(gates, values)
+    return _parallel_scan_pytorch(gates, values)
 
 
 # Keep old name as alias
